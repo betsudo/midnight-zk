@@ -283,6 +283,23 @@ where
     F: Copy,
     I: IntoIterator<Item = Polynomial<F, B>>,
 {
+    spill_iter_to_disk_with_reservation(spill_dir, polys, n_polys, n_per_poly, reserve_spill_file)
+}
+
+// The reservation seam lets a test reject backing-store allocation after a
+// tempfile has opened, without changing process limits or filling a volume.
+fn spill_iter_to_disk_with_reservation<F, B, I, R>(
+    spill_dir: Option<&std::path::Path>,
+    polys: I,
+    n_polys: usize,
+    n_per_poly: usize,
+    reserve: R,
+) -> io::Result<MmappedPolys<F, B>>
+where
+    F: Copy,
+    I: IntoIterator<Item = Polynomial<F, B>>,
+    R: FnOnce(&mut std::fs::File, usize) -> io::Result<()>,
+{
     let elem_size = std::mem::size_of::<F>();
     if elem_size == 0 || n_per_poly == 0 {
         return Err(io::Error::new(
@@ -307,7 +324,7 @@ where
         });
     }
 
-    reserve_spill_file(&mut tmp, total_bytes)?;
+    reserve(&mut tmp, total_bytes)?;
     // SAFETY: the file is exclusively owned and has exactly `total_bytes`.
     #[allow(unsafe_code)]
     let mut mmap = unsafe { memmap2::MmapOptions::new().len(total_bytes).map_mut(&tmp)? };
@@ -449,6 +466,25 @@ mod test {
                 "poly {i} values survived the round trip"
             );
         }
+    }
+
+    #[test]
+    fn reservation_failure_returns_error_without_exposing_a_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = spill_iter_to_disk_with_reservation(
+            Some(dir.path()),
+            vec![poly(&[1, 2, 3, 4])],
+            1,
+            4,
+            |file, bytes| {
+                assert_eq!(bytes, 4 * std::mem::size_of::<Fp>());
+                assert_eq!(file.metadata().unwrap().len(), 0);
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0);
     }
 
     #[test]
