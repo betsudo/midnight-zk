@@ -1154,4 +1154,98 @@ fn test_create_proof() {
         assert!(cancelled.join().expect("cancelled proof thread panicked"));
         assert!(live.join().expect("live proof thread panicked"));
     });
+
+    // Pause after the proof has crossed trace.start, then cancel it while a
+    // separate request uses the same parameters and key. The next checkpoint
+    // must observe only the paused request's token.
+    #[derive(Clone)]
+    struct PausingCircuit {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl<F: Field> Circuit<F> for PausingCircuit {
+        type Config = ();
+        type FloorPlanner = SimpleFloorPlanner;
+        #[cfg(feature = "circuit-params")]
+        type Params = ();
+
+        fn without_witnesses(&self) -> Self {
+            self.clone()
+        }
+
+        fn configure(_meta: &mut ConstraintSystem<F>) -> Self::Config {}
+
+        fn synthesize(
+            &self,
+            _config: Self::Config,
+            _layouter: impl crate::circuit::Layouter<F>,
+        ) -> Result<(), Error> {
+            self.entered.send(()).expect("proof test receiver disappeared");
+            self.release
+                .lock()
+                .expect("proof test release mutex poisoned")
+                .recv()
+                .expect("proof test release sender disappeared");
+            Ok(())
+        }
+    }
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let pausing_circuit = PausingCircuit {
+        entered: entered_tx,
+        release: std::sync::Arc::new(std::sync::Mutex::new(release_rx)),
+    };
+    let in_flight_token = CancelToken::new();
+    let in_flight_context =
+        ProverContext::new(ProverConfig::heap()).with_cancel(in_flight_token.clone());
+    std::thread::scope(|scope| {
+        let paused = scope.spawn(|| {
+            let mut transcript = CircuitTranscript::<_>::init();
+            create_proof_with_context(
+                &in_flight_context,
+                &params,
+                &pk,
+                &pausing_circuit,
+                #[cfg(feature = "committed-instances")]
+                0,
+                &[],
+                &mut transcript,
+                OsRng,
+            )
+        });
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let live = scope.spawn(|| {
+            let mut transcript = CircuitTranscript::<_>::init();
+            create_proof_with_context(
+                &live_context,
+                &params,
+                &pk,
+                &MyCircuit,
+                #[cfg(feature = "committed-instances")]
+                0,
+                &[],
+                &mut transcript,
+                OsRng,
+            )
+        });
+        if entered.is_ok() {
+            in_flight_token.cancel();
+        }
+        release_tx.send(()).expect("paused proof thread disappeared");
+        assert!(
+            entered.is_ok(),
+            "proof never entered synthesis: {entered:?}"
+        );
+        assert!(matches!(
+            paused.join().expect("paused proof thread panicked"),
+            Err(Error::Cancelled {
+                phase: "trace.lookup_multiplicities"
+            })
+        ));
+        live.join()
+            .expect("independent proof thread panicked")
+            .expect("independent proof must complete");
+    });
 }
