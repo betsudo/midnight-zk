@@ -50,6 +50,18 @@ before considering a Ledger9 0.8.3 consumer. The released Ledger9 0.8.2 pin
 remains in place. The temporary ZKIR lockfile and build target were removed
 after this check.
 
+The 0.8.3 parameter type now supports the missing seekable
+`ParamsKZG::read_custom_lazy` boundary. It skips the serialized affine
+Lagrange block and derives that basis from `g` only on first use; ordinary
+`read_custom` and mapped companions still initialize it eagerly. `max_k` and
+downsizing do not force a lazy basis, and downsizing clears all derived caches.
+All three serialization modes round-tripped byte-for-byte after lazy reading;
+the malformed truncated stream was rejected. Nine opt-in parameter tests, six
+default-feature parameter tests, and the opt-in PLONK API proof test passed.
+This restores an API expected by the local Ledger9 parameter loader but does
+not yet port its other 0.8.3 stdlib and safety differences or establish a
+large-k memory benefit.
+
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
 3. Port streamed coset construction to each new 0.8.3 trace/evaluation owner. Force spill at a known `k`, assert that the spill arm ran, inject storage failures at creation and reservation, and verify both normal and fallback proofs. Measure disk bytes and RSS as well as time. The local code, fault injection, and small-circuit proof gates are in place; measurements remain.

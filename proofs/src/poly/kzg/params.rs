@@ -29,7 +29,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct ParamsKZG<E: Engine> {
     pub(crate) g: BasesStorage<E::G1Affine>,
-    pub(crate) g_lagrange: BasesStorage<E::G1Affine>,
+    /// May be absent after a lazy read; derive it from `g` on first use.
+    pub(crate) g_lagrange: OnceLock<BasesStorage<E::G1Affine>>,
     /// Suffix-sum of `g_lagrange`:
     /// `g_lagrange_delta[i] = sum_{j=i}^{n-1} g_lagrange[j]`.
     pub(crate) g_lagrange_delta: OnceLock<Vec<E::G1Affine>>,
@@ -106,17 +107,24 @@ impl<E: Engine + Debug> ParamsKZG<E>
 where
     E::G1Affine: CurveAffine,
 {
+    fn g_lagrange_slice(&self) -> &[E::G1Affine] {
+        self.g_lagrange
+            .get_or_init(|| BasesStorage::owned(g_to_lagrange(&self.g, self.max_k())))
+    }
+
     /// Return the SRS bases corresponding to the polynomial representation `B`.
     pub fn bases<B: PolynomialRepresentation>(&self) -> &[E::G1Affine] {
         match B::BASIS {
             PolynomialBasis::Coeff => &self.g,
-            PolynomialBasis::Lagrange => &self.g_lagrange,
+            PolynomialBasis::Lagrange => self.g_lagrange_slice(),
             PolynomialBasis::LagrangeDelta => {
-                self.g_lagrange_delta.get_or_init(|| suffix_sum(&self.g_lagrange))
+                self.g_lagrange_delta.get_or_init(|| suffix_sum(self.g_lagrange_slice()))
             }
             PolynomialBasis::LagrangeDoubleDelta => {
                 self.g_lagrange_double_delta.get_or_init(|| {
-                    suffix_sum(self.g_lagrange_delta.get_or_init(|| suffix_sum(&self.g_lagrange)))
+                    suffix_sum(
+                        self.g_lagrange_delta.get_or_init(|| suffix_sum(self.g_lagrange_slice())),
+                    )
                 })
             }
             PolynomialBasis::ExtendedLagrange => {
@@ -177,8 +185,10 @@ where
     /// Returns the size of the SRS, expressed as the exponent `k` such that it
     /// has `2^k` elements.
     pub fn max_k(&self) -> u32 {
-        assert_eq!(self.g.len(), self.g_lagrange.len());
-        self.g_lagrange.len().ilog2()
+        if let Some(lagrange) = self.g_lagrange.get() {
+            assert_eq!(self.g.len(), lagrange.len());
+        }
+        self.g.len().ilog2()
     }
 
     /// Downsize the current parameters to match a smaller `k`.
@@ -188,9 +198,9 @@ where
         }
 
         let n = 1 << new_k;
-        assert!(n < self.g_lagrange.len());
+        assert!(n < self.g.len());
         self.g.truncate_into_owned(n);
-        self.g_lagrange = BasesStorage::owned(g_to_lagrange(&self.g, new_k));
+        self.g_lagrange = OnceLock::new();
         self.g_lagrange_delta = OnceLock::new();
         self.g_lagrange_double_delta = OnceLock::new();
         self.residue_bases = Default::default();
@@ -245,7 +255,7 @@ where
 
         Self {
             g: BasesStorage::owned(g_affine),
-            g_lagrange: BasesStorage::owned(g_lagrange_affine),
+            g_lagrange: OnceLock::from(BasesStorage::owned(g_lagrange_affine)),
             g_lagrange_delta: OnceLock::new(),
             g_lagrange_double_delta: OnceLock::new(),
             g2,
@@ -276,7 +286,7 @@ where
         };
         Self {
             g: BasesStorage::owned(g_affine),
-            g_lagrange: BasesStorage::owned(g_lagrange_affine),
+            g_lagrange: OnceLock::from(BasesStorage::owned(g_lagrange_affine)),
             g_lagrange_delta: OnceLock::new(),
             g_lagrange_double_delta: OnceLock::new(),
             g2,
@@ -287,7 +297,7 @@ where
 
     /// Returns the committed lagrange polynomials of these KZG params.
     pub fn g_lagrange(&self) -> &[E::G1Affine] {
-        &self.g_lagrange
+        self.g_lagrange_slice()
     }
 
     /// Returns generator on G2
@@ -313,7 +323,7 @@ where
                 _ => el.write_raw(writer)?,
             }
         }
-        for el in self.g_lagrange.iter() {
+        for el in self.g_lagrange_slice().iter() {
             match format {
                 SerdeFormat::Processed => writer.write_all(el.to_bytes().as_ref())?,
                 _ => el.write_raw(writer)?,
@@ -382,7 +392,105 @@ where
 
         Ok(Self {
             g: BasesStorage::owned(g),
-            g_lagrange: BasesStorage::owned(g_lagrange),
+            g_lagrange: OnceLock::from(BasesStorage::owned(g_lagrange)),
+            g_lagrange_delta: OnceLock::new(),
+            g_lagrange_double_delta: OnceLock::new(),
+            g2,
+            s_g2,
+            residue_bases: Default::default(),
+        })
+    }
+
+    /// Read a seekable parameter stream without materialising its on-disk
+    /// Lagrange basis. The basis is derived from `g` when first requested.
+    /// The serialized format is identical to [`Self::read_custom`].
+    pub fn read_custom_lazy<R: io::Read + io::Seek>(
+        reader: &mut R,
+        format: SerdeFormat,
+    ) -> io::Result<Self>
+    where
+        E::G1Affine: SerdeObject,
+        E::G2: ProcessedSerdeObject,
+    {
+        let mut k = [0u8; 4];
+        reader.read_exact(&mut k)?;
+        let k = u32::from_le_bytes(k);
+        if k > E::Fr::S {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid SRS k"));
+        }
+        let n = 1usize
+            .checked_shl(k)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS size overflows"))?;
+        let before_g = reader.stream_position()?;
+        // The unchecked point readers panic on a short stream. They are only
+        // appropriate for trusted parameter files, but a truncated file must
+        // still return an I/O error before any unchecked read begins.
+        if matches!(format, SerdeFormat::RawBytesUnchecked) {
+            let point_bytes = E::G1Affine::identity().to_raw_bytes().len();
+            let primary_bytes = n
+                .checked_mul(point_bytes)
+                .and_then(|size| size.checked_mul(2))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?;
+            let required = primary_bytes
+                .checked_add(
+                    E::G2::identity().byte_length(format).checked_mul(2).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "SRS too large")
+                    })?,
+                )
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?;
+            let required = u64::try_from(required)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?;
+            let end = reader.seek(io::SeekFrom::End(0))?;
+            reader.seek(io::SeekFrom::Start(before_g))?;
+            if end.saturating_sub(before_g) < required {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated SRS",
+                ));
+            }
+        }
+        let g = match format {
+            SerdeFormat::Processed => {
+                let mut encoded = vec![<E::G1Affine as GroupEncoding>::Repr::default(); n];
+                for point in &mut encoded {
+                    reader.read_exact(point.as_mut())?;
+                }
+                let mut points = vec![Option::<E::G1Affine>::None; n];
+                parallelize(&mut points, |points, start| {
+                    for (i, point) in points.iter_mut().enumerate() {
+                        *point = Option::from(E::G1Affine::from_bytes(&encoded[start + i]));
+                    }
+                });
+                points
+                    .into_iter()
+                    .map(|point| point.ok_or_else(|| io::Error::other("invalid point encoding")))
+                    .collect::<io::Result<Vec<_>>>()?
+            }
+            SerdeFormat::RawBytes => {
+                (0..n).map(|_| E::G1Affine::read_raw(reader)).collect::<io::Result<Vec<_>>>()?
+            }
+            SerdeFormat::RawBytesUnchecked => {
+                (0..n).map(|_| E::G1Affine::read_raw_unchecked(reader)).collect()
+            }
+        };
+
+        // Both primary bases have the same point count and encoding. Seek
+        // past the second block before reading the two G2 elements.
+        let g_bytes = reader.stream_position()?.checked_sub(before_g).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SRS reader position moved backwards",
+            )
+        })?;
+        let skip = i64::try_from(g_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SRS block too large"))?;
+        reader.seek(io::SeekFrom::Current(skip))?;
+        let g2 = E::G2::read(reader, format)?;
+        let s_g2 = E::G2::read(reader, format)?;
+
+        Ok(Self {
+            g: BasesStorage::owned(g),
+            g_lagrange: OnceLock::new(),
             g_lagrange_delta: OnceLock::new(),
             g_lagrange_double_delta: OnceLock::new(),
             g2,
@@ -468,7 +576,7 @@ where
         debug_assert_eq!(header.len(), HEADER_LEN);
         writer.write_all(&header)?;
         writer.write_all(&[0u8; G_OFFSET - HEADER_LEN])?;
-        for points in [&self.g[..], &self.g_lagrange[..]] {
+        for points in [&self.g[..], self.g_lagrange_slice()] {
             // SAFETY: PlainBytes guarantees no padding or invalid Rust bit
             // patterns; these are live, initialized affine points.
             let bytes = unsafe {
@@ -591,7 +699,7 @@ where
         let g_lagrange = unsafe { BasesStorage::mapped(mmap, gl_offset, expected) };
         Ok(Self {
             g,
-            g_lagrange,
+            g_lagrange: OnceLock::from(g_lagrange),
             g_lagrange_delta: OnceLock::new(),
             g_lagrange_double_delta: OnceLock::new(),
             g2,
@@ -794,10 +902,10 @@ mod test {
         assert!(params1.g_lagrange_double_delta.get().is_none());
 
         assert_eq!(params0.g.len(), params1.g.len());
-        assert_eq!(params0.g_lagrange.len(), params1.g_lagrange.len());
+        assert_eq!(params0.g_lagrange().len(), params1.g_lagrange().len());
 
         assert_eq!(params0.g, params1.g);
-        assert_eq!(params0.g_lagrange, params1.g_lagrange);
+        assert_eq!(params0.g_lagrange(), params1.g_lagrange());
         assert_eq!(params0.g2, params1.g2);
         assert_eq!(params0.s_g2, params1.s_g2);
         assert_eq!(
@@ -807,6 +915,61 @@ mod test {
         assert_eq!(
             params0.bases::<LagrangeDoubleDeltaCoeff>(),
             params1.bases::<LagrangeDoubleDeltaCoeff>()
+        );
+    }
+
+    #[test]
+    fn test_lazy_parameter_read_preserves_wire_and_derives_lagrange_on_use() {
+        use midnight_curves::Bls12;
+        use std::io::Cursor;
+
+        let original: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(4, OsRng);
+        for format in [
+            SerdeFormat::Processed,
+            SerdeFormat::RawBytes,
+            SerdeFormat::RawBytesUnchecked,
+        ] {
+            let mut bytes = Vec::new();
+            original.write_custom(&mut bytes, format).unwrap();
+            let mut reader = Cursor::new(&bytes);
+            let lazy = ParamsKZG::<Bls12>::read_custom_lazy(&mut reader, format).unwrap();
+            assert_eq!(reader.position() as usize, bytes.len());
+            assert!(lazy.g_lagrange.get().is_none(), "{format:?}");
+            assert_eq!(lazy.max_k(), 4);
+            assert!(
+                lazy.g_lagrange.get().is_none(),
+                "max_k materialised {format:?}"
+            );
+            assert_eq!(lazy.g, original.g);
+            assert_eq!(lazy.g2, original.g2);
+            assert_eq!(lazy.s_g2, original.s_g2);
+            assert_eq!(lazy.g_lagrange(), original.g_lagrange(), "{format:?}");
+            assert!(lazy.g_lagrange.get().is_some());
+            let mut rewritten = Vec::new();
+            lazy.write_custom(&mut rewritten, format).unwrap();
+            assert_eq!(rewritten, bytes, "wire changed for {format:?}");
+        }
+
+        let mut bytes = Vec::new();
+        original.write_custom(&mut bytes, SerdeFormat::RawBytes).unwrap();
+        bytes.truncate(bytes.len() - 1);
+        assert!(
+            ParamsKZG::<Bls12>::read_custom_lazy(&mut Cursor::new(bytes), SerdeFormat::RawBytes)
+                .is_err(),
+            "truncated lazy parameter stream was accepted"
+        );
+        let mut unchecked = Vec::new();
+        original.write_custom(&mut unchecked, SerdeFormat::RawBytesUnchecked).unwrap();
+        unchecked.truncate(unchecked.len() - 1);
+        assert_eq!(
+            ParamsKZG::<Bls12>::read_custom_lazy(
+                &mut Cursor::new(unchecked),
+                SerdeFormat::RawBytesUnchecked,
+            )
+            .err()
+            .unwrap()
+            .kind(),
+            std::io::ErrorKind::UnexpectedEof,
         );
     }
 
@@ -824,7 +987,7 @@ mod test {
         assert!(params.g_lagrange_double_delta.get().is_none());
         assert_eq!(
             params.bases::<LagrangeDeltaCoeff>(),
-            super::suffix_sum(&params.g_lagrange)
+            super::suffix_sum(params.g_lagrange())
         );
         assert_eq!(
             params.bases::<LagrangeDoubleDeltaCoeff>(),
@@ -848,9 +1011,9 @@ mod test {
         // SAFETY: the test owns the immutable companion for every clone.
         let mut mapped = unsafe { ParamsKZG::<Bls12>::read_mmap_arc(mmap) }.unwrap();
         assert!(mapped.g.is_mapped());
-        assert!(mapped.g_lagrange.is_mapped());
+        assert!(mapped.g_lagrange.get().unwrap().is_mapped());
         assert_eq!(params.g, mapped.g);
-        assert_eq!(params.g_lagrange, mapped.g_lagrange);
+        assert_eq!(params.g_lagrange(), mapped.g_lagrange());
         assert_eq!(params.g2, mapped.g2);
         assert_eq!(params.s_g2, mapped.s_g2);
         let cloned = mapped.clone();
@@ -862,7 +1025,7 @@ mod test {
 
         mapped.downsize(3);
         assert!(!mapped.g.is_mapped());
-        assert!(!mapped.g_lagrange.is_mapped());
+        assert!(mapped.g_lagrange.get().is_none());
         assert_eq!(mapped.max_k(), 3);
         assert_eq!(cloned.max_k(), 4);
     }
