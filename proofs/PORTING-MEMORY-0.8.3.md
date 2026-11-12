@@ -79,6 +79,28 @@ reason to change the released Ledger9 0.8.2 pin. Reproduce it with the local
 `cargo test -p midnight-proof-server --features zkir3-context --test
 zkir3_mapped_params zkir3_heap_and_mapped_params_produce_the_same_valid_proof`.
 
+Ledger9 branch `sync/ledger9-proofs-083-v2-compat` subsequently fixed the
+in-tree v2 API break and passed three fixture-free v2 proofs plus an opt-in v3
+HTTP proof with forced coset spill. The broader server test still cannot
+compile because 0.8.3 has no mapped proving-key policy. In 0.8.3,
+`ProvingKey` owns `fixed_values`, `sigmas.values`, and the phase-0 coefficient
+group as separate polynomial collections. The existing `mmap_pk::MmappedPolys`
+provides checked read-only views over an unnamed mapping for proof-time
+cosets, but no key field uses it. The earlier 0.8.2 key mapper's forged `Vec`
+views must not be copied into this layout.
+
+The opening-query path now carries read-only `PolynomialView` descriptors
+through both KZG and fflonk while preserving `ProverQuery::new` for owned
+callers. This is a prerequisite for mapping the phase-0 group; it does not
+itself map a proving key. The remaining port must move all three key
+collections behind owned-or-mapped storage, adapt serialization, permutation,
+evaluation, and opening reads to the same views, and choose the policy before
+building derived cosets. An opted-in key mapping failure must reject the load
+so no partially converted key or silent heap result is reported. Prove and
+verify with mapped and heap keys, check a wrong statement, inject file creation
+and reservation failures, and measure load/proof peak memory and disk bytes
+before claiming the 0.8.3 key policy is qualified.
+
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
 3. Port streamed coset construction to each new 0.8.3 trace/evaluation owner. Force spill at a known `k`, assert that the spill arm ran, inject storage failures at creation and reservation, and verify both normal and fallback proofs. Measure disk bytes and RSS as well as time. The local code, fault injection, and small-circuit proof gates are in place; measurements remain.

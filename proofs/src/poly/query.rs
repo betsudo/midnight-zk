@@ -2,7 +2,9 @@ use std::fmt::{self, Debug};
 
 use ff::PrimeField;
 
-use crate::poly::{Coeff, Polynomial, commitment::PolynomialCommitmentScheme};
+use crate::poly::{
+    Coeff, Polynomial, PolynomialView, commitment::PolynomialCommitmentScheme, polynomial_views,
+};
 
 /// A structured label for polynomial commitments in verifier queries.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -91,7 +93,7 @@ pub struct ProverQuery<'com, F: PrimeField> {
     /// Labels of every polynomial committed to together with the queried one.
     pub(crate) group_labels: &'com [PolynomialLabel],
     /// The polynomials of `group_labels`, in the same order.
-    pub(crate) group_polys: &'com [Polynomial<F, Coeff>],
+    pub(crate) group_polys: Vec<PolynomialView<'com, F, Coeff>>,
     /// Point at which polynomial is queried
     pub(crate) point: F,
     /// Label identifying which polynomial within the group is queried.
@@ -107,7 +109,19 @@ impl<'com, F: PrimeField> ProverQuery<'com, F> {
         point: F,
         label: PolynomialLabel,
     ) -> Self {
-        ProverQuery {
+        Self::new_views(group_labels, polynomial_views(group_polys), point, label)
+    }
+
+    /// Query a group already held as read-only polynomial views. The views
+    /// borrow their backing storage; moving this small descriptor vector
+    /// never copies field elements.
+    pub(crate) fn new_views(
+        group_labels: &'com [PolynomialLabel],
+        group_polys: Vec<PolynomialView<'com, F, Coeff>>,
+        point: F,
+        label: PolynomialLabel,
+    ) -> Self {
+        Self {
             group_labels,
             group_polys,
             point,
@@ -120,10 +134,10 @@ impl<'com, F: PrimeField> ProverQuery<'com, F> {
     /// # Panics
     ///
     /// Panics if the group holds no polynomial under the query label.
-    pub(crate) fn poly(&self) -> &'com Polynomial<F, Coeff> {
+    pub(crate) fn poly(&self) -> PolynomialView<'com, F, Coeff> {
         let i = (self.group_labels.iter().position(|l| *l == self.label))
             .expect("the queried group has no polynomial under the query label");
-        &self.group_polys[i]
+        self.group_polys[i]
     }
 }
 
