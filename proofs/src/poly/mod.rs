@@ -19,6 +19,8 @@ use crate::utils::{SerdeFormat, arithmetic::parallelize};
 
 mod domain;
 mod query;
+mod view;
+pub(crate) use view::{PolynomialRead, PolynomialView, polynomial_views};
 
 /// KZG commitment scheme
 pub mod kzg;

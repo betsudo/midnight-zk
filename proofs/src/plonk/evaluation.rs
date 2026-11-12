@@ -1,12 +1,14 @@
 use ff::{PrimeField, WithSmallOrderMulGroup};
 use group::ff::Field;
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::ParallelIterator;
 
 use super::{ConstraintSystem, Expression};
 use crate::{
-    plonk::{Any, argument},
+    config::ProverConfig,
+    plonk::{Any, argument, cosets::build_cosets},
     poly::{
-        Coeff, EvaluationDomain, Polynomial, PolynomialLabel, PolynomialRepresentation, Rotation,
+        Coeff, EvaluationDomain, ExtendedLagrangeCoeff as B, Polynomial, PolynomialLabel,
+        PolynomialRepresentation, PolynomialView, Rotation,
     },
     utils::arithmetic::parallelize,
 };
@@ -479,9 +481,9 @@ impl<F: PrimeField> FlatGraphEvaluator<F> {
     pub fn evaluate<B: PolynomialRepresentation>(
         &self,
         values: &mut [F],
-        fixed: &[Polynomial<F, B>],
-        advice: &[Polynomial<F, B>],
-        instance: &[Polynomial<F, B>],
+        fixed: &[impl std::ops::Deref<Target = [F]>],
+        advice: &[impl std::ops::Deref<Target = [F]>],
+        instance: &[impl std::ops::Deref<Target = [F]>],
         rotations: &[usize],
         previous_value: &F,
     ) -> F {
@@ -534,9 +536,9 @@ impl<F: PrimeField> FlatGraphEvaluator<F> {
         template_buf: &[F],
         output: &mut [F],
         start: usize,
-        fixed: &[Polynomial<F, Repr>],
-        advice: &[Polynomial<F, Repr>],
-        instance: &[Polynomial<F, Repr>],
+        fixed: &[impl std::ops::Deref<Target = [F]>],
+        advice: &[impl std::ops::Deref<Target = [F]>],
+        instance: &[impl std::ops::Deref<Target = [F]>],
         log_scale: u32,
         log_n: u32,
     ) {
@@ -817,13 +819,13 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
     /// processing, `previous_value` is always `F::ZERO` and the leading
     /// `Add(prev, 0)` flat op is dead.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn evaluate_numerator<B: PolynomialRepresentation>(
+    pub(crate) fn evaluate_numerator(
         &self,
         domain: &EvaluationDomain<F>,
         cs: &ConstraintSystem<F>,
-        advice: &[Polynomial<F, B>],
-        instance: &[Polynomial<F, B>],
-        fixed: &[Polynomial<F, B>],
+        advice: &[PolynomialView<'_, F, B>],
+        instance: &[PolynomialView<'_, F, B>],
+        fixed: &[PolynomialView<'_, F, B>],
         y: F,
         beta: F,
         gamma: F,
@@ -834,7 +836,8 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
         l0: &Polynomial<F, B>,
         l_last: &Polynomial<F, B>,
         l_active_row: &Polynomial<F, B>,
-        permutation_cosets: &[Polynomial<F, B>],
+        permutation_cosets: &[PolynomialView<'_, F, B>],
+        config: &ProverConfig,
     ) -> Polynomial<F, B> {
         let log_scale = B::k(domain) - domain.k();
         let omega = B::omega(domain);
@@ -867,16 +870,19 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
 
             let num_sets = cs.permutation().num_sets(cs.degree());
 
-            let permutation_product_cosets: Vec<Polynomial<F, B>> = (0..num_sets)
-                .into_par_iter()
+            let permutation_product_coeffs: Vec<_> = (0..num_sets)
                 .map(|i| {
-                    let poly =
-                        phase2_committed.poly(&PolynomialLabel::PermutationAccumulator(i)).expect(
-                            "the phase-2 group has no polynomial for a permutation accumulator",
-                        );
-                    B::coeff_to_self(domain, poly.clone())
+                    let poly = phase2_committed
+                        .poly(&PolynomialLabel::PermutationAccumulator(i))
+                        .expect("the phase-2 group has no permutation accumulator");
+                    PolynomialView::<F, Coeff>::new(poly)
                 })
                 .collect();
+            let permutation_product_cosets =
+                build_cosets(&permutation_product_coeffs, domain.k(), config, |poly| {
+                    B::coeff_to_self(domain, poly.materialise())
+                });
+            let permutation_product_cosets = permutation_product_cosets.views();
 
             let first_set_permutation_product_coset = permutation_product_cosets.first().unwrap();
             let last_set_permutation_product_coset = permutation_product_cosets.last().unwrap();
@@ -951,15 +957,15 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
             });
         }
 
-        // Pre-compute all lookup cosets in parallel. This trades peak memory
-        // for parallelism: the FFTs for different lookups can now overlap.
+        // Keep each lookup's extended-domain polynomials in one spill holder.
+        // Within a holder, the transform writes one polynomial at a time.
         let all_lookup_cosets: Vec<_> = cs
             .lookups
             .iter()
             .map(|l| l.chunk_by_degree(cs.degree()))
             .enumerate()
             .collect::<Vec<_>>()
-            .par_iter()
+            .iter()
             .map(|(argument_index, lookup)| {
                 let multiplicities_poly = phase1_committed
                     .poly(&PolynomialLabel::LogupMultiplicities(*argument_index))
@@ -977,28 +983,38 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
                     .poly(&PolynomialLabel::LogupAggregator(*argument_index))
                     .unwrap();
 
-                // Compute cosets
-
-                let multiplicities_coset = B::coeff_to_self(domain, multiplicities_poly.clone());
-
-                let helper_cosets: Vec<_> =
-                    helper_polys.into_iter().map(|h| B::coeff_to_self(domain, h.clone())).collect();
-
-                let aggregator_poly = B::coeff_to_self(domain, aggregator_poly.clone());
-
-                (helper_cosets, aggregator_poly, multiplicities_coset)
+                let helper_count = helper_polys.len();
+                let coeffs: Vec<_> = helper_polys
+                    .into_iter()
+                    .chain([aggregator_poly, multiplicities_poly])
+                    .map(|poly| PolynomialView::<F, Coeff>::new(poly))
+                    .collect();
+                (
+                    build_cosets(&coeffs, domain.k(), config, |poly| {
+                        B::coeff_to_self(domain, poly.materialise())
+                    }),
+                    helper_count,
+                )
             })
+            .collect();
+        let all_lookup_views: Vec<_> = all_lookup_cosets
+            .iter()
+            .map(|(cosets, helper_count)| (cosets.views(), *helper_count))
             .collect();
 
         // Pre-compute all trash cosets in parallel (lookup cosets
         // are already pre-computed above).
-        let trash_cosets: Vec<_> = phase2_committed
+        let trash_coeffs: Vec<_> = phase2_committed
             .par_polys()
             .filter_map(|(label, trash_poly)| match label {
-                PolynomialLabel::Trash(_) => Some(B::coeff_to_self(domain, trash_poly.clone())),
+                PolynomialLabel::Trash(_) => Some(PolynomialView::<F, Coeff>::new(trash_poly)),
                 _ => None,
             })
             .collect();
+        let trash_cosets = build_cosets(&trash_coeffs, domain.k(), config, |poly| {
+            B::coeff_to_self(domain, poly.materialise())
+        });
+        let trash_cosets = trash_cosets.views();
 
         // Pre-resolve lookup output indices for the flat evaluator.
         let lookup_output_indices: Vec<Vec<(usize, usize, usize, usize)>> = self
@@ -1070,9 +1086,10 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
                 let r_next = get_rotation_idx(idx, 1, log_scale, log_n);
 
                 // --- Lookup constraints ---
-                for (n, (helper_cosets, aggregator_coset, multiplicities_coset)) in
-                    all_lookup_cosets.iter().enumerate()
-                {
+                for (n, (lookup_cosets, helper_count)) in all_lookup_views.iter().enumerate() {
+                    let helper_cosets = &lookup_cosets[..*helper_count];
+                    let aggregator_coset = &lookup_cosets[*helper_count];
+                    let multiplicities_coset = &lookup_cosets[*helper_count + 1];
                     *value = *value * y + aggregator_coset[idx] * (l0[idx] + l_last[idx]);
 
                     let mut sum_helpers = F::ZERO;

@@ -462,10 +462,10 @@ where
     let nu_poly = {
         group.bench_function("Compute numerator poly", |b| {
             b.iter(|| {
-                let _ = compute_nu_poly(pk, &trace);
+                let _ = compute_nu_poly(pk, &trace, crate::config::ProverConfig::process());
             })
         });
-        compute_nu_poly(pk, &trace)
+        compute_nu_poly(pk, &trace, crate::config::ProverConfig::process())
     };
 
     // Construct the quotient polynomial h(X) = nu(X)/(X^n-1), split it into

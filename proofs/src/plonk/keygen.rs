@@ -15,6 +15,7 @@ use super::{
 };
 use crate::{
     circuit::Value,
+    config::ProverConfig,
     dev::cost_model::cost_model_options,
     poly::{
         EvaluationDomain, ExtendedLagrangeCoeff, batch_invert_rational,
@@ -291,11 +292,27 @@ where
     CS: PolynomialCommitmentScheme<F>,
     ConcreteCircuit: Circuit<F>,
 {
+    keygen_pk_with(vk, circuit, ProverConfig::process())
+}
+
+/// Generate a proving key with a policy for its cached extended cosets.
+/// When spilling is enabled for this circuit size, the key keeps phase-0
+/// coefficients and omits the large extended-domain caches.
+pub fn keygen_pk_with<F, CS, ConcreteCircuit>(
+    vk: VerifyingKey<F, CS>,
+    circuit: &ConcreteCircuit,
+    policy: &ProverConfig,
+) -> Result<ProvingKey<F, CS>, Error>
+where
+    F: WithSmallOrderMulGroup<3>,
+    CS: PolynomialCommitmentScheme<F>,
+    ConcreteCircuit: Circuit<F>,
+{
     let mut cs = ConstraintSystem::default();
     #[cfg(feature = "circuit-params")]
-    let config = ConcreteCircuit::configure_with_params(&mut cs, circuit.params());
+    let circuit_config = ConcreteCircuit::configure_with_params(&mut cs, circuit.params());
     #[cfg(not(feature = "circuit-params"))]
-    let config = ConcreteCircuit::configure(&mut cs);
+    let circuit_config = ConcreteCircuit::configure(&mut cs);
 
     let cs = cs;
 
@@ -314,7 +331,7 @@ where
     let region_starts = ConcreteCircuit::FloorPlanner::synthesize_capturing_regions(
         &mut assembly,
         circuit,
-        config,
+        circuit_config,
         cs.constants.clone(),
     )?;
 
@@ -323,8 +340,14 @@ where
     fixed.extend(selector_polys.into_iter().map(|poly| vk.domain.lagrange_from_vec(poly)));
 
     let permutations = assembly.permutation.into_permutations::<F>(&vk.domain, &cs.permutation);
-    let (phase0_polys, fixed_cosets, sigmas) =
-        super::build_phase0_polys(&vk.domain, &cs, vk.transcript_repr, &fixed, permutations);
+    let (phase0_polys, fixed_cosets, sigmas) = super::build_phase0_polys(
+        &vk.domain,
+        &cs,
+        vk.transcript_repr,
+        &fixed,
+        permutations,
+        policy,
+    );
 
     let [l0, l_last, l_active_row] = compute_lagrange_polys(&vk, &cs);
     // Compute the optimized evaluation data structure

@@ -555,6 +555,65 @@ fn plonk_api() {
         &proof[..],
     );
 
+    #[cfg(feature = "disk-spill")]
+    {
+        use midnight_proofs::{
+            config::ProverConfig,
+            plonk::{create_proof_with, keygen_pk_with},
+            utils::SerdeFormat,
+        };
+
+        let (a, instance, lookup_table) = common!(Scalar);
+        let circuit = MyCircuit {
+            a: Value::known(a),
+            lookup_table,
+        };
+        let mut spill_policy = ProverConfig::spilled();
+        spill_policy.coset_spill_floor_k = 0;
+        let empty_circuit = MyCircuit {
+            a: Value::unknown(),
+            lookup_table: circuit.lookup_table.clone(),
+        };
+        let spill_vk = keygen_vk::<Scalar, Scheme, _>(&mut params, &empty_circuit).unwrap();
+        let spill_pk = keygen_pk_with(spill_vk, &empty_circuit, &spill_policy).unwrap();
+        let serialized_key = spill_pk.to_bytes(SerdeFormat::Processed);
+        let loaded_pk = ProvingKey::<Scalar, Scheme>::read_with_policy::<_, MyCircuit<Scalar>>(
+            &mut &serialized_key[..],
+            SerdeFormat::Processed,
+            #[cfg(feature = "circuit-params")]
+            (),
+            &spill_policy,
+        )
+        .unwrap();
+        for (key, policy) in [&spill_pk, &loaded_pk].into_iter().zip([
+            spill_policy.clone(),
+            ProverConfig {
+                spill_dir: Some("/nonexistent-midnight-spill-dir/for-this-test".into()),
+                ..spill_policy
+            },
+        ]) {
+            let mut transcript = CircuitTranscript::<State>::init();
+            create_proof_with(
+                &params,
+                key,
+                &policy,
+                &circuit,
+                #[cfg(feature = "committed-instances")]
+                0,
+                &[&[instance]],
+                &mut transcript,
+                OsRng,
+            )
+            .expect("mapped cosets and heap fallback must both prove");
+            let proof = transcript.finalize();
+            verify_proof::<_, _, CircuitTranscript<State>>(
+                &params.verifier_params(),
+                key.get_vk(),
+                &proof,
+            );
+        }
+    }
+
     #[cfg(feature = "mmap")]
     {
         let mut companion = Vec::new();

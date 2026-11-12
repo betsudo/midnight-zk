@@ -111,6 +111,11 @@ pub(crate) struct KeyGroup<F: PrimeField> {
 }
 
 impl<F: PrimeField> KeyGroup<F> {
+    /// Borrow a consecutive run of phase-0 coefficient polynomials.
+    pub(crate) fn polys_of(&self, labels: &[PolynomialLabel]) -> &[Polynomial<F, Coeff>] {
+        self.committed.polys_of(labels)
+    }
+
     /// The group of `polys_map`, whose commitment is held by the verifying key
     /// of `transcript_repr` `vk_repr`.
     pub(crate) fn new(

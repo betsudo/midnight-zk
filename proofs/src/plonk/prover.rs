@@ -22,10 +22,12 @@ use super::{
 };
 use crate::{
     circuit::Value,
-    plonk::{argument, traces::ProverTrace},
+    config::ProverConfig,
+    plonk::{argument, cosets::build_cosets, traces::ProverTrace},
     poly::{
         Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, PolynomialLabel,
         ProverQuery, Rotation, batch_invert_rational, commitment::PolynomialCommitmentScheme,
+        polynomial_views,
     },
     transcript::{Hashable, Sampleable, Transcript},
     utils::{
@@ -304,6 +306,7 @@ pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transc
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     trace: ProverTrace<'a, F>,
     transcript: &mut T,
+    config: &ProverConfig,
 ) -> Result<(), Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -317,7 +320,7 @@ where
     #[cfg(not(feature = "committed-instances"))]
     let nb_committed_instances: usize = 0;
 
-    let nu_poly = compute_nu_poly(pk, &trace);
+    let nu_poly = compute_nu_poly(pk, &trace, config);
 
     // Construct the quotient polynomial h(X) = nu(X)/(X^n-1), split it into limbs,
     // and commit to the limbs as one group
@@ -401,6 +404,47 @@ pub fn create_proof<
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     instances: &[&[F]],
     transcript: &mut T,
+    rng: impl RngCore + CryptoRng,
+) -> Result<(), Error>
+where
+    CS::Commitment: Hashable<T::Hash>,
+    F: WithSmallOrderMulGroup<3>
+        + Sampleable<T::Hash>
+        + Hashable<T::Hash>
+        + Hash
+        + Ord
+        + FromUniformBytes<64>,
+{
+    create_proof_with(
+        params,
+        pk,
+        ProverConfig::process(),
+        circuit,
+        #[cfg(feature = "committed-instances")]
+        nb_committed_instances,
+        instances,
+        transcript,
+        rng,
+    )
+}
+
+/// Create a proof with a request-scoped extended-coset storage policy.
+///
+/// The existing [`create_proof`] entry point retains its original signature.
+/// With `disk-spill` disabled, this policy takes the heap path.
+pub fn create_proof_with<
+    F,
+    CS: PolynomialCommitmentScheme<F>,
+    T: Transcript,
+    ConcreteCircuit: Circuit<F>,
+>(
+    params: &CS::Parameters,
+    pk: &ProvingKey<F, CS>,
+    config: &ProverConfig,
+    circuit: &ConcreteCircuit,
+    #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
+    instances: &[&[F]],
+    transcript: &mut T,
     mut rng: impl RngCore + CryptoRng,
 ) -> Result<(), Error>
 where
@@ -429,6 +473,7 @@ where
         nb_committed_instances,
         trace,
         transcript,
+        config,
     )
 }
 
@@ -568,6 +613,7 @@ where
 pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>>(
     pk: &ProvingKey<F, CS>,
     trace: &ProverTrace<'_, F>,
+    config: &ProverConfig,
 ) -> Polynomial<F, ExtendedLagrangeCoeff> {
     let ProverTrace {
         instance_polys,
@@ -582,25 +628,51 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
     } = &trace;
     let domain = pk.vk.get_domain();
     // Calculate the advice and instance cosets
-    let advice_cosets: Vec<Polynomial<F, ExtendedLagrangeCoeff>> = phase1_committed
-        .polys_of(&pk.vk.cs.advice_labels())
-        .par_iter()
-        .map(|poly| domain.coeff_to_extended(poly.clone()))
-        .collect();
-    let instance_cosets: Vec<Polynomial<F, ExtendedLagrangeCoeff>> = instance_polys
-        .par_iter()
-        .map(|poly| domain.coeff_to_extended(poly.clone()))
-        .collect();
+    let advice_cosets = build_cosets(
+        phase1_committed.polys_of(&pk.vk.cs.advice_labels()),
+        domain.k(),
+        config,
+        |poly| domain.coeff_to_extended(poly.materialise()),
+    );
+    let instance_cosets = build_cosets(instance_polys, domain.k(), config, |poly| {
+        domain.coeff_to_extended(poly.materialise())
+    });
+    let advice_views = advice_cosets.views();
+    let instance_views = instance_cosets.views();
+    let fixed_cosets = pk.fixed_cosets.is_empty().then(|| {
+        build_cosets(
+            pk.phase0_polys.polys_of(&pk.vk.cs.fixed_polys_labels()),
+            domain.k(),
+            config,
+            |poly| domain.coeff_to_extended(poly.materialise()),
+        )
+    });
+    let permutation_cosets = pk.sigmas.cosets.is_empty().then(|| {
+        build_cosets(
+            pk.phase0_polys.polys_of(&pk.vk.cs.permutation.polynomial_labels()),
+            domain.k(),
+            config,
+            |poly| domain.coeff_to_extended(poly.materialise()),
+        )
+    });
+    let fixed_views = fixed_cosets
+        .as_ref()
+        .map(|cosets| cosets.views())
+        .unwrap_or_else(|| polynomial_views(&pk.fixed_cosets));
+    let permutation_views = permutation_cosets
+        .as_ref()
+        .map(|cosets| cosets.views())
+        .unwrap_or_else(|| polynomial_views(&pk.sigmas.cosets));
 
     // Evaluate the numerator polynomial nu(X) of the quotient polynomial
     // h(X) = nu(X) / (X^n-1): nu(X) is a random linear combination of all
     // independent identities
-    pk.ev.evaluate_numerator::<ExtendedLagrangeCoeff>(
+    pk.ev.evaluate_numerator(
         &pk.vk.domain,
         &pk.vk.cs,
-        &advice_cosets,
-        &instance_cosets,
-        &pk.fixed_cosets,
+        &advice_views,
+        &instance_views,
+        &fixed_views,
         *y,
         *beta,
         *gamma,
@@ -611,7 +683,8 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
         &pk.l0,
         &pk.l_last,
         &pk.l_active_row,
-        &pk.sigmas.cosets,
+        &permutation_views,
+        config,
     )
 }
 

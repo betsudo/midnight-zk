@@ -9,6 +9,7 @@ use blake2b_simd::Params as Blake2bParams;
 use group::ff::FromUniformBytes;
 
 use crate::{
+    config::ProverConfig,
     plonk::permutation::expressions,
     poly::{
         EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, PinnedEvaluationDomain, Polynomial,
@@ -26,10 +27,13 @@ use crate::{
 mod absorbed_vk;
 pub(crate) mod argument;
 mod circuit;
+mod cosets;
 mod error;
 pub(crate) mod evaluation;
 mod keygen;
 pub(crate) mod logup;
+#[cfg(feature = "disk-spill")]
+mod mmap_pk;
 pub mod permutation;
 pub(crate) mod traces;
 pub(crate) mod trash;
@@ -360,6 +364,7 @@ pub(in crate::plonk) fn build_phase0_polys<F: WithSmallOrderMulGroup<3>>(
     vk_repr: F,
     fixed_values: &[Polynomial<F, LagrangeCoeff>],
     sigmas: Vec<Polynomial<F, LagrangeCoeff>>,
+    policy: &ProverConfig,
 ) -> (
     argument::prover::KeyGroup<F>,
     Vec<Polynomial<F, ExtendedLagrangeCoeff>>,
@@ -376,10 +381,15 @@ pub(in crate::plonk) fn build_phase0_polys<F: WithSmallOrderMulGroup<3>>(
         .par_iter()
         .map(|poly| domain.lagrange_to_coeff(poly.clone()))
         .collect();
-    let fixed_cosets = fixed_coeffs
-        .par_iter()
-        .map(|poly| domain.coeff_to_extended(poly.clone()))
-        .collect();
+    let cache_cosets = !cfg!(feature = "disk-spill") || !policy.spills_cosets_at(domain.k());
+    let fixed_cosets = if cache_cosets {
+        fixed_coeffs
+            .par_iter()
+            .map(|poly| domain.coeff_to_extended(poly.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut group: BTreeMap<_, _> = fixed_coeffs
         .into_iter()
@@ -387,8 +397,12 @@ pub(in crate::plonk) fn build_phase0_polys<F: WithSmallOrderMulGroup<3>>(
         .map(|(i, poly)| (PolynomialLabel::Fixed(i), poly))
         .collect();
 
-    let (sigma_coeffs, sigma_cosets) =
-        permutation::keygen::compute_polys_and_cosets(domain, &cs.permutation, &sigmas);
+    let (sigma_coeffs, sigma_cosets) = permutation::keygen::compute_polys_and_cosets(
+        domain,
+        &cs.permutation,
+        &sigmas,
+        cache_cosets,
+    );
     group.extend(sigma_labels.into_iter().zip(sigma_coeffs));
 
     (
@@ -464,6 +478,23 @@ where
         format: SerdeFormat,
         #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
     ) -> io::Result<Self> {
+        Self::read_with_policy::<R, ConcreteCircuit>(
+            reader,
+            format,
+            #[cfg(feature = "circuit-params")]
+            params,
+            ProverConfig::process(),
+        )
+    }
+
+    /// Read a proving key while selecting whether to cache extended cosets.
+    /// The serialized key format is identical to [`Self::read`].
+    pub fn read_with_policy<R: io::Read, ConcreteCircuit: Circuit<F>>(
+        reader: &mut R,
+        format: SerdeFormat,
+        #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
+        policy: &ProverConfig,
+    ) -> io::Result<Self> {
         let vk = VerifyingKey::<F, CS>::read::<R, ConcreteCircuit>(
             reader,
             format,
@@ -489,6 +520,7 @@ where
             vk.transcript_repr,
             &fixed_values,
             permutations,
+            policy,
         );
         let ev = Evaluator::new(vk.cs());
         Ok(Self {
