@@ -62,6 +62,23 @@ This restores an API expected by the local Ledger9 parameter loader but does
 not yet port its other 0.8.3 stdlib and safety differences or establish a
 large-k memory benefit.
 
+The local 0.8.3 adapter stack (`midnight-proofs` `3aff69f9`, Ledger9
+`transient-crypto` `c21aeb5a`, and ZKIR v3 `ead311c`) passed all 53 ZKIR
+library tests and three focused heap/mmap/spill proof and cost tests after
+rebasing ZKIR onto upstream `zkir-v3` `f7b433d` (3.2.1). A subsequent
+Ledger9 proof-server build with those three local sources exposed the remaining
+consumer boundary. After patching *all* ZKIR v3 references to the adapted local
+crate, Cargo compiled v3 but failed in Ledger9's in-tree ZKIR v2 2.2.0 with 15
+errors: the new stdlib requires a `PCS` generic for `MidnightPK` and `prove`,
+adds an argument to `cost_model`, removes the ECC coordinate methods used by
+the v2 VM, and adds `nb_arith_cols` to `ZkStdLibArch`. The focused server proof
+test therefore did not run. Betsudo Ledger issue #30 already requires the v2
+route to stay green; this is a future 0.8.3 consumer migration gate, not a
+reason to change the released Ledger9 0.8.2 pin. Reproduce it with the local
+0.8.3 proofs, stdlib, circuits, transient-crypto, and ZKIR v3 path patches and
+`cargo test -p midnight-proof-server --features zkir3-context --test
+zkir3_mapped_params zkir3_heap_and_mapped_params_produce_the_same_valid_proof`.
+
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
 3. Port streamed coset construction to each new 0.8.3 trace/evaluation owner. Force spill at a known `k`, assert that the spill arm ran, inject storage failures at creation and reservation, and verify both normal and fallback proofs. Measure disk bytes and RSS as well as time. The local code, fault injection, and small-circuit proof gates are in place; measurements remain.
