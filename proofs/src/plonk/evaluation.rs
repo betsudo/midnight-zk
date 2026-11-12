@@ -1,11 +1,11 @@
 use ff::{PrimeField, WithSmallOrderMulGroup};
 use group::ff::Field;
-use rayon::iter::ParallelIterator;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use super::{ConstraintSystem, Expression};
 use crate::{
     config::ProverConfig,
-    plonk::{Any, argument, cosets::build_cosets},
+    plonk::{Any, argument, cosets::build_cosets, logup},
     poly::{
         Coeff, EvaluationDomain, ExtendedLagrangeCoeff as B, Polynomial, PolynomialLabel,
         PolynomialRepresentation, PolynomialView, Rotation,
@@ -958,57 +958,60 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
         }
 
         // Keep each lookup's extended-domain polynomials in one spill holder.
-        // Within a holder, the transform writes one polynomial at a time.
-        let all_lookup_cosets: Vec<_> = cs
-            .lookups
-            .iter()
-            .map(|l| l.chunk_by_degree(cs.degree()))
-            .enumerate()
-            .collect::<Vec<_>>()
-            .iter()
-            .map(|(argument_index, lookup)| {
-                let multiplicities_poly = phase1_committed
-                    .poly(&PolynomialLabel::LogupMultiplicities(*argument_index))
-                    .unwrap();
+        // Spilling runs one lookup at a time to bound transient heap; the
+        // default heap path retains upstream's parallel lookup scheduling.
+        let lookup_jobs: Vec<_> =
+            cs.lookups.iter().map(|l| l.chunk_by_degree(cs.degree())).enumerate().collect();
+        let build_lookup = |(argument_index, lookup): &(usize, logup::ChunkedArgument<F>)| {
+            let multiplicities_poly = phase1_committed
+                .poly(&PolynomialLabel::LogupMultiplicities(*argument_index))
+                .unwrap();
 
-                let helper_polys: Vec<_> = (0..lookup.input_expression_chunks.len())
-                    .map(|j| {
-                        phase2_committed
-                            .poly(&PolynomialLabel::LogupHelper(*argument_index, j))
-                            .unwrap()
-                    })
-                    .collect();
+            let helper_polys: Vec<_> = (0..lookup.input_expression_chunks.len())
+                .map(|j| {
+                    phase2_committed
+                        .poly(&PolynomialLabel::LogupHelper(*argument_index, j))
+                        .unwrap()
+                })
+                .collect();
 
-                let aggregator_poly = phase2_committed
-                    .poly(&PolynomialLabel::LogupAggregator(*argument_index))
-                    .unwrap();
+            let aggregator_poly = phase2_committed
+                .poly(&PolynomialLabel::LogupAggregator(*argument_index))
+                .unwrap();
 
-                let helper_count = helper_polys.len();
-                let coeffs: Vec<_> = helper_polys
-                    .into_iter()
-                    .chain([aggregator_poly, multiplicities_poly])
-                    .map(|poly| PolynomialView::<F, Coeff>::new(poly))
-                    .collect();
-                (
-                    build_cosets(&coeffs, domain.k(), config, |poly| {
-                        B::coeff_to_self(domain, poly.materialise())
-                    }),
-                    helper_count,
-                )
-            })
-            .collect();
+            let helper_count = helper_polys.len();
+            let coeffs: Vec<_> = helper_polys
+                .into_iter()
+                .chain([aggregator_poly, multiplicities_poly])
+                .map(|poly| PolynomialView::<F, Coeff>::new(poly))
+                .collect();
+            (
+                build_cosets(&coeffs, domain.k(), config, |poly| {
+                    B::coeff_to_self(domain, poly.materialise())
+                }),
+                helper_count,
+            )
+        };
+        let all_lookup_cosets: Vec<_> =
+            if cfg!(feature = "disk-spill") && config.spills_cosets_at(domain.k()) {
+                lookup_jobs.iter().map(build_lookup).collect()
+            } else {
+                lookup_jobs.par_iter().map(build_lookup).collect()
+            };
         let all_lookup_views: Vec<_> = all_lookup_cosets
             .iter()
             .map(|(cosets, helper_count)| (cosets.views(), *helper_count))
             .collect();
 
-        // Pre-compute all trash cosets in parallel (lookup cosets
-        // are already pre-computed above).
-        let trash_coeffs: Vec<_> = phase2_committed
-            .par_polys()
-            .filter_map(|(label, trash_poly)| match label {
-                PolynomialLabel::Trash(_) => Some(PolynomialView::<F, Coeff>::new(trash_poly)),
-                _ => None,
+        // Preserve the constraint system's trash argument order explicitly.
+        let trash_coeffs: Vec<_> = cs
+            .trashcans
+            .iter()
+            .map(|argument| {
+                let poly = phase2_committed
+                    .poly(&PolynomialLabel::Trash(argument.argument_index))
+                    .expect("the phase-2 group has no trash polynomial");
+                PolynomialView::<F, Coeff>::new(poly)
             })
             .collect();
         let trash_cosets = build_cosets(&trash_coeffs, domain.k(), config, |poly| {

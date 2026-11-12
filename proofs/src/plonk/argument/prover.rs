@@ -1,9 +1,7 @@
 use std::collections::BTreeMap;
 
 use ff::{PrimeField, WithSmallOrderMulGroup};
-use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
-};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
     plonk::{
@@ -53,13 +51,6 @@ impl<F: PrimeField, B: PolynomialRepresentation> Committed<F, B> {
             "the labels are not a run of consecutive labels of the group"
         );
         &self.polys[start..end]
-    }
-
-    /// The group's labeled polynomials, in parallel.
-    pub(crate) fn par_polys(
-        &self,
-    ) -> impl ParallelIterator<Item = (&PolynomialLabel, &Polynomial<F, B>)> {
-        self.labels.par_iter().zip(self.polys.par_iter())
     }
 }
 
