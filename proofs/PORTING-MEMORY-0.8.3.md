@@ -22,6 +22,10 @@ Upstream's [proofs changelog](CHANGELOG.md) says #513 changed the challenge and 
 
 ## Implementation sequence and acceptance gates
 
+### Local implementation status
+
+The `sync/proofs-0.8.3-memory` code branch begins with lazy materialization of the two derived affine bases (`LagrangeDelta` and `LagrangeDoubleDelta`). `ParamsKZG` now builds them on first use, while parameter generation, deserialization, and downsizing keep both caches empty. This avoids allocating those two full-size bases during an ordinary parameter read that does not use them. The serialized parameter format and commitment values are unchanged. The parameter round-trip, downsize invalidation, and both delta commitment identity tests passed. This is a first memory-policy step, **not** mmap or streamed spill. It does not qualify the new branch as a Ledger9 consumer.
+
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
 3. Port streamed coset construction to each new 0.8.3 trace/evaluation owner. Force spill at a known `k`, assert that the spill arm ran, inject storage failures, and verify both normal and fallback proofs. Measure disk bytes and RSS as well as time.

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     io,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
 use ff::{Field, PrimeField};
@@ -29,14 +29,14 @@ pub struct ParamsKZG<E: Engine> {
     pub(crate) g_lagrange: Vec<E::G1Affine>,
     /// Suffix-sum of `g_lagrange`:
     /// `g_lagrange_delta[i] = sum_{j=i}^{n-1} g_lagrange[j]`.
-    pub(crate) g_lagrange_delta: Vec<E::G1Affine>,
+    pub(crate) g_lagrange_delta: OnceLock<Vec<E::G1Affine>>,
     /// Suffix-sum of `g_lagrange_delta`:
     /// `g_lagrange_double_delta[i] = sum_{j=i}^{n-1} g_lagrange_delta[j]`.
     /// Used as the SRS for the `LagrangeDoubleDelta` basis. Same derivation
     /// as `g_lagrange_delta`, applied a second time:
     /// `sum_j a_j · L_j = sum_i c_i · g_lagrange_double_delta[i]`,
     /// where `c_i = b_i - b_{i-1}` and `b_i = a_i - a_{i-1}`.
-    pub(crate) g_lagrange_double_delta: Vec<E::G1Affine>,
+    pub(crate) g_lagrange_double_delta: OnceLock<Vec<E::G1Affine>>,
     pub(crate) g2: E::G2,
     pub(crate) s_g2: E::G2,
     /// The bases of every [`Residue`] committed to so far.
@@ -108,8 +108,14 @@ where
         match B::BASIS {
             PolynomialBasis::Coeff => &self.g,
             PolynomialBasis::Lagrange => &self.g_lagrange,
-            PolynomialBasis::LagrangeDelta => &self.g_lagrange_delta,
-            PolynomialBasis::LagrangeDoubleDelta => &self.g_lagrange_double_delta,
+            PolynomialBasis::LagrangeDelta => {
+                self.g_lagrange_delta.get_or_init(|| suffix_sum(&self.g_lagrange))
+            }
+            PolynomialBasis::LagrangeDoubleDelta => {
+                self.g_lagrange_double_delta.get_or_init(|| {
+                    suffix_sum(self.g_lagrange_delta.get_or_init(|| suffix_sum(&self.g_lagrange)))
+                })
+            }
             PolynomialBasis::ExtendedLagrange => {
                 unimplemented!("KZG does not support extended Lagrange bases")
             }
@@ -182,8 +188,8 @@ where
         assert!(n < self.g_lagrange.len());
         self.g.truncate(n);
         self.g_lagrange = g_to_lagrange(&self.g, new_k);
-        self.g_lagrange_delta = suffix_sum(&self.g_lagrange);
-        self.g_lagrange_double_delta = suffix_sum(&self.g_lagrange_delta);
+        self.g_lagrange_delta = OnceLock::new();
+        self.g_lagrange_double_delta = OnceLock::new();
         self.residue_bases = Default::default();
     }
 
@@ -231,17 +237,14 @@ where
         let mut g_lagrange_affine = vec![E::G1Affine::identity(); n as usize];
         E::G1::batch_normalize(&g_lagrange, &mut g_lagrange_affine);
 
-        let g_lagrange_delta = suffix_sum(&g_lagrange_affine);
-        let g_lagrange_double_delta = suffix_sum(&g_lagrange_delta);
-
         let g2 = E::G2::generator();
         let s_g2 = g2 * s;
 
         Self {
             g: g_affine,
             g_lagrange: g_lagrange_affine,
-            g_lagrange_delta,
-            g_lagrange_double_delta,
+            g_lagrange_delta: OnceLock::new(),
+            g_lagrange_double_delta: OnceLock::new(),
             g2,
             s_g2,
             residue_bases: Default::default(),
@@ -268,13 +271,11 @@ where
             }
             None => g_to_lagrange(&g_affine, k),
         };
-        let g_lagrange_delta = suffix_sum(&g_lagrange_affine);
-        let g_lagrange_double_delta = suffix_sum(&g_lagrange_delta);
         Self {
             g: g_affine,
             g_lagrange: g_lagrange_affine,
-            g_lagrange_delta,
-            g_lagrange_double_delta,
+            g_lagrange_delta: OnceLock::new(),
+            g_lagrange_double_delta: OnceLock::new(),
             g2,
             s_g2,
             residue_bases: Default::default(),
@@ -376,13 +377,11 @@ where
         let g2 = E::G2::read(reader, format)?;
         let s_g2 = E::G2::read(reader, format)?;
 
-        let g_lagrange_delta = suffix_sum(&g_lagrange);
-        let g_lagrange_double_delta = suffix_sum(&g_lagrange_delta);
         Ok(Self {
             g,
             g_lagrange,
-            g_lagrange_delta,
-            g_lagrange_double_delta,
+            g_lagrange_delta: OnceLock::new(),
+            g_lagrange_double_delta: OnceLock::new(),
             g2,
             s_g2,
             residue_bases: Default::default(),
@@ -450,7 +449,7 @@ mod test {
 
     use crate::{
         poly::{
-            PolynomialLabel,
+            LagrangeDeltaCoeff, LagrangeDoubleDeltaCoeff, PolynomialLabel,
             commitment::PolynomialCommitmentScheme,
             kzg::{KZGCommitmentScheme, params::ParamsKZG},
         },
@@ -572,11 +571,15 @@ mod test {
         use midnight_curves::Bls12;
 
         let params0: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(K, OsRng);
+        assert!(params0.g_lagrange_delta.get().is_none());
+        assert!(params0.g_lagrange_double_delta.get().is_none());
         let mut data = vec![];
         ParamsKZG::write_custom(&params0, &mut data, SerdeFormat::RawBytesUnchecked).unwrap();
         let params1 =
             ParamsKZG::<Bls12>::read_custom::<_>(&mut &data[..], SerdeFormat::RawBytesUnchecked)
                 .unwrap();
+        assert!(params1.g_lagrange_delta.get().is_none());
+        assert!(params1.g_lagrange_double_delta.get().is_none());
 
         assert_eq!(params0.g.len(), params1.g.len());
         assert_eq!(params0.g_lagrange.len(), params1.g_lagrange.len());
@@ -585,5 +588,35 @@ mod test {
         assert_eq!(params0.g_lagrange, params1.g_lagrange);
         assert_eq!(params0.g2, params1.g2);
         assert_eq!(params0.s_g2, params1.s_g2);
+        assert_eq!(
+            params0.bases::<LagrangeDeltaCoeff>(),
+            params1.bases::<LagrangeDeltaCoeff>()
+        );
+        assert_eq!(
+            params0.bases::<LagrangeDoubleDeltaCoeff>(),
+            params1.bases::<LagrangeDoubleDeltaCoeff>()
+        );
+    }
+
+    #[test]
+    fn test_downsize_invalidates_derived_bases() {
+        use midnight_curves::Bls12;
+
+        let mut params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(5, OsRng);
+        let _ = params.bases::<LagrangeDoubleDeltaCoeff>();
+        assert!(params.g_lagrange_delta.get().is_some());
+        assert!(params.g_lagrange_double_delta.get().is_some());
+
+        params.downsize(4);
+        assert!(params.g_lagrange_delta.get().is_none());
+        assert!(params.g_lagrange_double_delta.get().is_none());
+        assert_eq!(
+            params.bases::<LagrangeDeltaCoeff>(),
+            super::suffix_sum(&params.g_lagrange)
+        );
+        assert_eq!(
+            params.bases::<LagrangeDoubleDeltaCoeff>(),
+            super::suffix_sum(params.bases::<LagrangeDeltaCoeff>())
+        );
     }
 }
