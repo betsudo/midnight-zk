@@ -22,7 +22,7 @@ use super::{
 };
 use crate::{
     circuit::Value,
-    config::ProverConfig,
+    config::{ProverConfig, ProverContext},
     plonk::{argument, cosets::build_cosets, traces::ProverTrace},
     poly::{
         Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, PolynomialLabel,
@@ -78,6 +78,7 @@ pub(crate) fn compute_trace<
     instances: &[&[F]],
     transcript: &mut T,
     mut rng: impl RngCore + CryptoRng,
+    context: &ProverContext,
 ) -> Result<ProverTrace<'a, F>, Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -88,6 +89,7 @@ where
         + Ord
         + FromUniformBytes<64>,
 {
+    checkpoint(context, "trace.start")?;
     #[cfg(not(feature = "committed-instances"))]
     let nb_committed_instances: usize = 0;
 
@@ -104,6 +106,7 @@ where
 
     let instance = compute_instances(params, pk, instances, nb_committed_instances, transcript)?;
 
+    checkpoint(context, "trace.advice")?;
     let advice_polys = parse_advices(pk, circuit, instances, &mut rng)?;
 
     // Helper: sample `num_sets` blinding vectors, each of length `inner_len`.
@@ -121,6 +124,7 @@ where
 
     // Compute the multiplicities columns in parallel. They are committed to
     // below, as the phase1 argument group.
+    checkpoint(context, "trace.lookup_multiplicities")?;
     let logup_multiplicities: Vec<logup::prover::ComputedMultiplicities<F>> = {
         let logup_args: Vec<_> =
             pk.vk.cs.lookups.iter().map(|l| l.chunk_by_degree(pk.vk.cs.degree())).collect();
@@ -161,6 +165,7 @@ where
         }
     }
 
+    checkpoint(context, "trace.phase1_commit")?;
     let phase1_committed = argument::prover::Committed::commit::<CS, T, _>(
         params,
         phase1_polys_map,
@@ -188,6 +193,7 @@ where
     let mut phase2_polys_map: BTreeMap<PolynomialLabel, Polynomial<F, LagrangeCoeff>> =
         BTreeMap::new();
 
+    checkpoint(context, "trace.permutation")?;
     let perm_z_polys = pk.vk.cs.permutation.compute_z_polys::<F, CS>(
         pk,
         phase1_committed.polys_of(&advice_labels),
@@ -207,6 +213,7 @@ where
         }
     }
 
+    checkpoint(context, "trace.lookup_logderivative")?;
     let logup_polys_maps = logup_multiplicities
         .into_par_iter()
         .zip(logup_blindings.into_par_iter())
@@ -245,6 +252,7 @@ where
     }
 
     for (i, trash) in pk.vk.cs.trashcans.iter().enumerate() {
+        checkpoint(context, "trace.trash")?;
         let p = trash.compute_trash_poly(
             domain,
             trash_challenge,
@@ -258,6 +266,7 @@ where
         }
     }
 
+    checkpoint(context, "trace.phase2_commit")?;
     let phase2_committed = argument::prover::Committed::commit::<CS, T, _>(
         params,
         phase2_polys_map,
@@ -306,7 +315,7 @@ pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transc
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     trace: ProverTrace<'a, F>,
     transcript: &mut T,
-    config: &ProverConfig,
+    context: &ProverContext,
 ) -> Result<(), Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -320,10 +329,12 @@ where
     #[cfg(not(feature = "committed-instances"))]
     let nb_committed_instances: usize = 0;
 
-    let nu_poly = compute_nu_poly(pk, &trace, config);
+    checkpoint(context, "finalise.nu")?;
+    let nu_poly = compute_nu_poly(pk, &trace, &context.config);
 
     // Construct the quotient polynomial h(X) = nu(X)/(X^n-1), split it into limbs,
     // and commit to the limbs as one group
+    checkpoint(context, "finalise.quotient")?;
     let quotient_committed =
         compute_h_poly::<F, CS, T>(params, pk.get_vk().get_domain(), nu_poly, transcript)?;
 
@@ -344,6 +355,7 @@ where
         .map(|rotation| (rotation, domain.rotate_omega(x, rotation)))
         .collect();
 
+    checkpoint(context, "finalise.instance_evaluations")?;
     write_instance_evals_to_transcript(
         pk,
         nb_committed_instances,
@@ -352,12 +364,16 @@ where
         transcript,
     )?;
 
+    checkpoint(context, "finalise.phase0_evaluations")?;
     let phase0_evaluated = phase0_committed.evaluate(cs, &x_rotations, transcript)?;
 
+    checkpoint(context, "finalise.phase1_evaluations")?;
     let phase1_evaluated = phase1_committed.evaluate(cs, &x_rotations, transcript)?;
 
+    checkpoint(context, "finalise.phase2_evaluations")?;
     let phase2_evaluated = phase2_committed.evaluate(cs, &x_rotations, transcript)?;
 
+    checkpoint(context, "finalise.quotient_evaluations")?;
     let mut quotient_evaluated = quotient_committed.evaluate(cs, &x_rotations, transcript)?;
 
     // h_0(x) is not written to the proof, the verifier derives it.
@@ -382,7 +398,15 @@ where
         &x_rotations,
     );
 
+    checkpoint(context, "finalise.multi_open")?;
     CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure)
+}
+
+fn checkpoint(context: &ProverContext, phase: &'static str) -> Result<(), Error> {
+    if context.is_cancelled() {
+        return Err(Error::Cancelled { phase });
+    }
+    Ok(())
 }
 
 /// This creates a proof for the provided `circuit` when given the public
@@ -445,6 +469,48 @@ pub fn create_proof_with<
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     instances: &[&[F]],
     transcript: &mut T,
+    rng: impl RngCore + CryptoRng,
+) -> Result<(), Error>
+where
+    CS::Commitment: Hashable<T::Hash>,
+    F: WithSmallOrderMulGroup<3>
+        + Sampleable<T::Hash>
+        + Hashable<T::Hash>
+        + Hash
+        + Ord
+        + FromUniformBytes<64>,
+{
+    create_proof_with_context(
+        &ProverContext::new(config.clone()),
+        params,
+        pk,
+        circuit,
+        #[cfg(feature = "committed-instances")]
+        nb_committed_instances,
+        instances,
+        transcript,
+        rng,
+    )
+}
+
+/// Create a proof under an explicit memory policy and request-owned cancellation token.
+///
+/// The policy-only [`create_proof_with`] and original [`create_proof`] entry
+/// points retain their signatures. Cancellation is checked between the main
+/// trace and finalisation stages; an in-progress stage runs to its next check.
+pub fn create_proof_with_context<
+    F,
+    CS: PolynomialCommitmentScheme<F>,
+    T: Transcript,
+    ConcreteCircuit: Circuit<F>,
+>(
+    context: &ProverContext,
+    params: &CS::Parameters,
+    pk: &ProvingKey<F, CS>,
+    circuit: &ConcreteCircuit,
+    #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
+    instances: &[&[F]],
+    transcript: &mut T,
     mut rng: impl RngCore + CryptoRng,
 ) -> Result<(), Error>
 where
@@ -465,6 +531,7 @@ where
         instances,
         transcript,
         &mut rng,
+        context,
     )?;
     finalise_proof(
         params,
@@ -473,7 +540,7 @@ where
         nb_committed_instances,
         trace,
         transcript,
-        config,
+        context,
     )
 }
 
@@ -980,6 +1047,7 @@ fn test_create_proof() {
 
     use crate::{
         circuit::SimpleFloorPlanner,
+        config::{CancelToken, ProverConfig, ProverContext},
         plonk::{keygen_pk, keygen_vk_with_k},
         poly::kzg::{KZGCommitmentScheme, params::ParamsKZG},
         transcript::CircuitTranscript,
@@ -1041,4 +1109,49 @@ fn test_create_proof() {
         OsRng,
     )
     .expect("proof generation should not fail");
+
+    // A cancelled request must not poison a concurrent request using the
+    // same parameters and key. Each call owns its transcript and RNG.
+    let cancelled_token = CancelToken::new();
+    cancelled_token.cancel();
+    let cancelled_context = ProverContext::new(ProverConfig::heap()).with_cancel(cancelled_token);
+    let live_context = ProverContext::new(ProverConfig::heap());
+    std::thread::scope(|scope| {
+        let cancelled = scope.spawn(|| {
+            let mut transcript = CircuitTranscript::<_>::init();
+            matches!(
+                create_proof_with_context(
+                    &cancelled_context,
+                    &params,
+                    &pk,
+                    &MyCircuit,
+                    #[cfg(feature = "committed-instances")]
+                    0,
+                    &[],
+                    &mut transcript,
+                    OsRng,
+                ),
+                Err(Error::Cancelled {
+                    phase: "trace.start"
+                })
+            )
+        });
+        let live = scope.spawn(|| {
+            let mut transcript = CircuitTranscript::<_>::init();
+            create_proof_with_context(
+                &live_context,
+                &params,
+                &pk,
+                &MyCircuit,
+                #[cfg(feature = "committed-instances")]
+                0,
+                &[],
+                &mut transcript,
+                OsRng,
+            )
+            .is_ok()
+        });
+        assert!(cancelled.join().expect("cancelled proof thread panicked"));
+        assert!(live.join().expect("live proof thread panicked"));
+    });
 }

@@ -44,6 +44,11 @@ pub enum Error {
     /// Completeness failure due to bad luck in random sampling.
     /// This error is expected to be almost impossible to trigger.
     CompletenessFailure,
+    /// The caller cancelled this proof at a stage boundary.
+    Cancelled {
+        /// The stage at which cancellation was observed.
+        phase: &'static str,
+    },
 }
 
 impl From<io::Error> for Error {
@@ -94,6 +99,7 @@ impl fmt::Display for Error {
                 f,
                 "Completeness failure due to bad luck in random sampling. This error is expected to be almost impossible to trigger."
             ),
+            Self::Cancelled { phase } => write!(f, "Proof cancelled at phase {phase}"),
         }
     }
 }

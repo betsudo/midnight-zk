@@ -20,10 +20,11 @@ use midnight_circuits::types::ComposableChip;
 use midnight_curves::{Bls12, G1Projective};
 use midnight_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
+    config::{ProverConfig, ProverContext},
     dev::cost_model::{CircuitModel, circuit_model},
     plonk::{
-        self, Circuit, ConstraintSystem, Error, ProvingKey, VerifyingKey, create_proof, keygen_pk,
-        keygen_vk_with_k, prepare,
+        self, Circuit, ConstraintSystem, Error, ProvingKey, VerifyingKey,
+        create_proof_with_context, keygen_pk, keygen_vk_with_k, prepare,
     },
     poly::{
         commitment::Guard,
@@ -571,6 +572,32 @@ where
     G1Projective: Hashable<H>,
     F: Hashable<H> + Sampleable<H>,
 {
+    prove_with_context::<R, H, PCS>(
+        &ProverContext::new(ProverConfig::process().clone()),
+        params,
+        pk,
+        relation,
+        instance,
+        witness,
+        rng,
+    )
+}
+
+/// Produce a proof under an explicit memory and cancellation context.
+/// The original [`prove`] entry point keeps its signature and process policy.
+pub fn prove_with_context<R: Relation, H: TranscriptHash, PCS: MidnightPCS>(
+    context: &ProverContext,
+    params: &ParamsKZG<Bls12>,
+    pk: &MidnightPK<R, PCS>,
+    relation: &R,
+    instance: &R::Instance,
+    witness: R::Witness,
+    rng: impl RngCore + CryptoRng,
+) -> Result<Vec<u8>, R::Error>
+where
+    G1Projective: Hashable<H>,
+    F: Hashable<H> + Sampleable<H>,
+{
     let pi = R::format_instance(instance)?;
     let com_inst = R::format_committed_instances(&witness);
     // Without a committed instance, its column is an empty instance column,
@@ -583,7 +610,8 @@ where
         Some(pk.k as u32),
     );
     let mut transcript = CircuitTranscript::<H>::init();
-    create_proof::<F, PCS, _, _>(
+    create_proof_with_context::<F, PCS, _, _>(
+        context,
         params,
         &pk.pk,
         &circuit,

@@ -1,6 +1,12 @@
 //! Per-proof policy for extended-domain polynomial storage.
 
-use std::{path::PathBuf, sync::OnceLock};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 /// Small circuits usually prove faster with heap-resident cosets.
 pub const DEFAULT_COSET_SPILL_FLOOR_K: u32 = 18;
@@ -65,6 +71,57 @@ impl ProverConfig {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
         })
+    }
+}
+
+/// A cancellation request shared only by the caller and proofs holding its clones.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    /// Create a token that has not been cancelled.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask a proof to stop at its next context checkpoint.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Memory policy and optional cancellation for one proof invocation.
+#[derive(Clone, Debug, Default)]
+pub struct ProverContext {
+    /// Storage policy for extended-domain cosets.
+    pub config: ProverConfig,
+    /// Cancellation handle, if the caller wants to interrupt this proof.
+    pub cancel: Option<CancelToken>,
+}
+
+impl ProverContext {
+    /// Use a policy without cancellation.
+    pub fn new(config: ProverConfig) -> Self {
+        Self {
+            config,
+            cancel: None,
+        }
+    }
+
+    /// Attach a request-owned cancellation token.
+    pub fn with_cancel(mut self, token: CancelToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
+    /// Whether this invocation has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
     }
 }
 
