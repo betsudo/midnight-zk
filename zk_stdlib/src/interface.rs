@@ -223,6 +223,16 @@ impl<Rel: Relation, PCS: MidnightPCS> MidnightPK<Rel, PCS> {
     /// Fails if the key was written under a commitment scheme other than
     /// `PCS`.
     pub fn read<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self> {
+        Self::read_with_policy(reader, format, ProverConfig::process())
+    }
+
+    /// Read a proving key under an explicit memory policy. The serialized
+    /// format and commitment-scheme check are identical to [`Self::read`].
+    pub fn read_with_policy<R: io::Read>(
+        reader: &mut R,
+        format: SerdeFormat,
+        policy: &ProverConfig,
+    ) -> io::Result<Self> {
         let mut byte = [0u8; 1];
         reader.read_exact(&mut byte)?;
         if byte[0] != PCS::ID {
@@ -235,7 +245,7 @@ impl<Rel: Relation, PCS: MidnightPCS> MidnightPK<Rel, PCS> {
 
         let relation = Rel::read_relation(reader)?;
 
-        let pk = ProvingKey::read::<R, MidnightCircuit<Rel>>(
+        let pk = ProvingKey::read_with_policy::<R, MidnightCircuit<Rel>>(
             reader,
             format,
             MidnightCircuit::new(
@@ -245,6 +255,7 @@ impl<Rel: Relation, PCS: MidnightPCS> MidnightPK<Rel, PCS> {
                 Some(k as u32),
             )
             .params(),
+            policy,
         )?;
 
         Ok(MidnightPK { k, relation, pk })
