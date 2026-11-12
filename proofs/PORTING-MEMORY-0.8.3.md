@@ -1,0 +1,30 @@
+# Memory optimization port from proofs 0.8.2 to 0.8.3
+
+This is the future upstreaming track for [betsudo/midnight-zk#5](https://github.com/betsudo/midnight-zk/issues/5). It does **not** change the released Ledger9 consumer. Ledger 9.1.0.1 and the current `ledger-9` integration use the optimized proofs 0.8.2 source at betsudo SHA `397b2424b972b3ec338722839c109f01c2fcf9f1`. This plan starts from upstream `main` `20b10959d918528e93c5482503762d3dcb889f39`, whose proofs manifest says 0.8.3. Recheck that head before implementation. Ledger8 and proofs 0.7 are out of scope.
+
+## Compatibility boundary
+
+Upstream's [proofs changelog](CHANGELOG.md) says #513 changed the challenge and commitment order for **every** proof; pre-change proofs no longer verify. The 0.8.2 and 0.8.3 `VerifyingKey` code both use version byte `0x03`, but the serialized payload and transcript representation have changed. That byte alone is not a compatibility check. The 0.8.3 `ParamsKZG` also stores four affine bases (`g`, `g_lagrange`, delta, double delta), plus cached residue bases, where the 0.8.2 patched line stores two projective bases (`g`, lazily initialized `g_lagrange`). Its ordinary parameter file still writes the two primary bases, but their point representation differs. Treat proving keys, verifying keys, proofs, and mmap companion files as version-specific. Do not repin released Ledger9 to 0.8.3 or reuse a 0.8.2 companion. Test cross-version rejection explicitly before a consumer migration.
+
+## Patch disposition
+
+| 0.8.2 patched commits | Disposition on 0.8.3 | Reason and gate |
+| --- | --- | --- |
+| `eb5cb8b6`, `8c22138e`, `f8d59793`, `1c6c3153` (SRS mapping, polynomial views, companion safety, heap keygen) | Redesign and port | `params.rs` now owns four affine bases and a residue cache. Map only immutable, layout-checked affine blocks; derive or cache secondary bases under a documented memory policy. Preserve trusted-directory, no-clobber publication and malformed/truncated companion tests. Recheck default heap keygen against #2. |
+| `f3848297` (mapped proving-key loader) | Redesign and port | `ProvingKey` has new phase-0 storage and is no longer `Clone`; the old serialized-key offsets are invalid. Keep mapped views behind an explicit trusted-file API and test keygen, read, prove, and verification under heap and mapped policies. |
+| `51b79fab`, `bbf1ef79`, `535dd7b9`, `1bb7f303` (streamed cosets and spill errors) | Redesign and port | The new `ProverTrace` and generic argument/logup/permutation groups replace the old fixed/advice/instance loops. Stream each required extended-domain polynomial at its new owner, keep spill files alive through evaluation, reserve blocks before mapping, and fall back to heap with an explicit warning on recoverable file failure. Inject failure at both spill stages. |
+| `2ffcab7a`, `a1a8c1c2` (typed policy and request cancellation) | Port additive API | Keep the compatibility proving entry point, add explicit per-request context, and thread it through all new trace/evaluation phases. Cancel one concurrent proof without affecting another. Ledger's external ZKIR 3.2.1 and stdlib 2.4.0 currently call the compatibility entry point, so their boundary needs a separate API decision before claiming request isolation through v3. |
+| `c082a96d`, `d967b2dc` (memory phases and parallel loops) | Rebase by phase, then measure | Old phase names and loops do not match 0.8.3. Instrument actual new phases and compare k/rows, peak RSS, spill bytes, and latency on the same circuit and host. Avoid a timing-only success claim. |
+| `9aa3730a`, `072413ad`, `166efcfb`, `397b2424` (MSM thresholds and chunking) | Re-evaluate, do not copy thresholds blindly | Upstream now uses affine `msm_specific` and has its own fix #544. Preserve exact group results and the x86 fast-path correction from #2; benchmark the aarch64 and x86 gates before selecting them. |
+| `e0386785`, `0e8de81b`, `56475e2c` (capability features and CI) | Port | Keep `mmap` and `disk-spill` opt-in, reject unsupported wasm capability requests, and run default, each feature, both features, and wasm gates at the exact new head. |
+
+`main-patched` at `8132af48` is an older upstreaming vehicle (68 upstream commits behind this baseline), not the Ledger9 consumer. It contains related concepts but is not a sound merge base for these structural changes. Preserve it and the optimized 0.8.2 head until a separate reviewed replacement passes the gates below.
+
+## Implementation sequence and acceptance gates
+
+1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
+2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
+3. Port streamed coset construction to each new 0.8.3 trace/evaluation owner. Force spill at a known `k`, assert that the spill arm ran, inject storage failures, and verify both normal and fallback proofs. Measure disk bytes and RSS as well as time.
+4. Add explicit request context without breaking the compatibility `prove` entry point. Test cancellation of one concurrent proof while another completes. Decide the ZKIR/stdlib API boundary from a failing integration test before forking either repository.
+5. Compare 0.8.2 and 0.8.3 proof/VK/key/parameter wire behavior with fixtures and reject unsupported cross-version combinations. Keep Ledger9 pinned to 0.8.2 until its own release line selects and qualifies a newer proof stack.
+6. Run native and browser-wasm feature gates, formatting, and exact-head CI. Record host, circuit/compiler version, commits, k/rows, latency, peak RSS, spill bytes, and cleanup of disposable targets. A local result is not current-head CI.
