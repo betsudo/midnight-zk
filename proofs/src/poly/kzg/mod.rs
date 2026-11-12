@@ -18,6 +18,8 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
+/// Owned and mapped affine-basis storage contracts.
+pub mod bases;
 /// KZG commitment type
 pub mod commitment;
 /// Multiscalar multiplication engines

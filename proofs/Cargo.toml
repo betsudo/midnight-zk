@@ -45,6 +45,9 @@ serde_derive = { workspace = true }
 rayon = { workspace = true }
 criterion = { version = "0.8", optional = true }
 rustc-hash = "2"
+memmap2 = { version = "0.9", optional = true }
+tempfile = { version = "3", optional = true }
+libc = { version = "0.2", optional = true }
 
 # Developer tooling dependencies
 tabbycat = { version = "0.1", features = ["attributes"], optional = true }
@@ -52,6 +55,7 @@ num-bigint = { workspace = true }
 
 [dev-dependencies]
 assert_matches = "1.5"
+tempfile = "3"
 proptest = "1"
 serde_json = { workspace = true }
 midnight-circuits = { path = "../circuits" }
@@ -70,6 +74,10 @@ midnight-curves = { version = "0.3.0", features = ["portable"] }
 default = ["committed-instances"]
 circuit-params = []
 dev-curves = ["midnight-curves/dev-curves"]
+# Native-only capabilities. The mmap companion is a local trusted cache,
+# while disk-spill additionally requires writable backing storage.
+mmap = ["dep:memmap2", "dep:tempfile"]
+disk-spill = ["mmap", "dep:libc"]
 
 # This feature adds a new argument to prover and verifier functions, which
 # represents instances in committed form (e.g. in the form of a polynomial

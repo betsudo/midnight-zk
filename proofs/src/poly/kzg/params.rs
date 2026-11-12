@@ -14,7 +14,10 @@ use midnight_curves::{
 use rand_core::RngCore;
 
 use crate::{
-    poly::{Coeff, LagrangeCoeff, LagrangeDeltaCoeff, PolynomialBasis, PolynomialRepresentation},
+    poly::{
+        Coeff, LagrangeCoeff, LagrangeDeltaCoeff, PolynomialBasis, PolynomialRepresentation,
+        kzg::bases::BasesStorage,
+    },
     utils::{
         SerdeFormat,
         arithmetic::{CurveAffine, g_to_lagrange, parallelize},
@@ -25,8 +28,8 @@ use crate::{
 /// These are the public parameters for the polynomial commitment scheme.
 #[derive(Debug, Clone)]
 pub struct ParamsKZG<E: Engine> {
-    pub(crate) g: Vec<E::G1Affine>,
-    pub(crate) g_lagrange: Vec<E::G1Affine>,
+    pub(crate) g: BasesStorage<E::G1Affine>,
+    pub(crate) g_lagrange: BasesStorage<E::G1Affine>,
     /// Suffix-sum of `g_lagrange`:
     /// `g_lagrange_delta[i] = sum_{j=i}^{n-1} g_lagrange[j]`.
     pub(crate) g_lagrange_delta: OnceLock<Vec<E::G1Affine>>,
@@ -186,8 +189,8 @@ where
 
         let n = 1 << new_k;
         assert!(n < self.g_lagrange.len());
-        self.g.truncate(n);
-        self.g_lagrange = g_to_lagrange(&self.g, new_k);
+        self.g.truncate_into_owned(n);
+        self.g_lagrange = BasesStorage::owned(g_to_lagrange(&self.g, new_k));
         self.g_lagrange_delta = OnceLock::new();
         self.g_lagrange_double_delta = OnceLock::new();
         self.residue_bases = Default::default();
@@ -241,8 +244,8 @@ where
         let s_g2 = g2 * s;
 
         Self {
-            g: g_affine,
-            g_lagrange: g_lagrange_affine,
+            g: BasesStorage::owned(g_affine),
+            g_lagrange: BasesStorage::owned(g_lagrange_affine),
             g_lagrange_delta: OnceLock::new(),
             g_lagrange_double_delta: OnceLock::new(),
             g2,
@@ -272,8 +275,8 @@ where
             None => g_to_lagrange(&g_affine, k),
         };
         Self {
-            g: g_affine,
-            g_lagrange: g_lagrange_affine,
+            g: BasesStorage::owned(g_affine),
+            g_lagrange: BasesStorage::owned(g_lagrange_affine),
             g_lagrange_delta: OnceLock::new(),
             g_lagrange_double_delta: OnceLock::new(),
             g2,
@@ -377,6 +380,215 @@ where
         let g2 = E::G2::read(reader, format)?;
         let s_g2 = E::G2::read(reader, format)?;
 
+        Ok(Self {
+            g: BasesStorage::owned(g),
+            g_lagrange: BasesStorage::owned(g_lagrange),
+            g_lagrange_delta: OnceLock::new(),
+            g_lagrange_double_delta: OnceLock::new(),
+            g2,
+            s_g2,
+            residue_bases: Default::default(),
+        })
+    }
+
+    /// Identifies the private 0.8.3 affine companion layout for this curve and k.
+    /// It is a cache compatibility check, not a digest of the SRS contents.
+    #[cfg(feature = "mmap")]
+    fn companion_identity(k: u32) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for part in [
+            b"MDNGHTV3".as_slice(),
+            env!("CARGO_PKG_VERSION").as_bytes(),
+            std::any::type_name::<E::G1Affine>().as_bytes(),
+            &std::mem::size_of::<E::G1Affine>().to_le_bytes(),
+            &std::mem::align_of::<E::G1Affine>().to_le_bytes(),
+            &k.to_le_bytes(),
+        ] {
+            for &byte in part {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    /// Writes the private, host-layout affine SRS companion format.
+    /// This is a local cache format, not a network or cross-device format.
+    /// Publish the completed file without replacing an existing inode, and
+    /// keep it in a private directory that other processes cannot modify.
+    #[cfg(feature = "mmap")]
+    #[allow(unsafe_code)]
+    pub fn write_mmap_companion<W: io::Write>(&self, writer: &mut W) -> io::Result<()>
+    where
+        E::G1Affine: crate::poly::kzg::bases::PlainBytes,
+        E::G2: ProcessedSerdeObject,
+    {
+        const HEADER_LEN: usize = 96;
+        const G_OFFSET: usize = 128;
+        let k = self.max_k();
+        let n = self.g.len();
+        let point_size = std::mem::size_of::<E::G1Affine>();
+        let block_bytes =
+            n.checked_mul(point_size).ok_or_else(|| io::Error::other("SRS too large"))?;
+        let gl_offset = G_OFFSET
+            .checked_add(block_bytes)
+            .ok_or_else(|| io::Error::other("SRS too large"))?;
+        let g2_offset = gl_offset
+            .checked_add(block_bytes)
+            .ok_or_else(|| io::Error::other("SRS too large"))?;
+        let mut g2_buf = Vec::new();
+        let mut s_g2_buf = Vec::new();
+        self.g2.write(&mut g2_buf, SerdeFormat::RawBytesUnchecked)?;
+        self.s_g2.write(&mut s_g2_buf, SerdeFormat::RawBytesUnchecked)?;
+        let s_g2_offset = g2_offset
+            .checked_add(g2_buf.len())
+            .ok_or_else(|| io::Error::other("SRS too large"))?;
+
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        header.extend_from_slice(b"MDNGHTV3");
+        header.extend_from_slice(&3u32.to_le_bytes());
+        header.extend_from_slice(&k.to_le_bytes());
+        header
+            .extend_from_slice(&u32::try_from(point_size).map_err(io::Error::other)?.to_le_bytes());
+        header.extend_from_slice(&1u32.to_le_bytes()); // both primary bases present
+        header.extend_from_slice(&Self::companion_identity(k).to_le_bytes());
+        for value in [
+            G_OFFSET,
+            n,
+            gl_offset,
+            n,
+            g2_offset,
+            g2_buf.len(),
+            s_g2_offset,
+            s_g2_buf.len(),
+        ] {
+            header
+                .extend_from_slice(&u64::try_from(value).map_err(io::Error::other)?.to_le_bytes());
+        }
+        debug_assert_eq!(header.len(), HEADER_LEN);
+        writer.write_all(&header)?;
+        writer.write_all(&[0u8; G_OFFSET - HEADER_LEN])?;
+        for points in [&self.g[..], &self.g_lagrange[..]] {
+            // SAFETY: PlainBytes guarantees no padding or invalid Rust bit
+            // patterns; these are live, initialized affine points.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    points.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(points),
+                )
+            };
+            writer.write_all(bytes)?;
+        }
+        writer.write_all(&g2_buf)?;
+        writer.write_all(&s_g2_buf)?;
+        Ok(())
+    }
+
+    /// Publishes a complete companion at `path` without replacing an existing
+    /// file. The caller must choose a private directory and keep the published
+    /// inode immutable while any process maps it.
+    #[cfg(feature = "mmap")]
+    pub fn publish_mmap_companion(&self, path: &std::path::Path) -> io::Result<()>
+    where
+        E::G1Affine: crate::poly::kzg::bases::PlainBytes,
+        E::G2: ProcessedSerdeObject,
+    {
+        let parent =
+            path.parent().ok_or_else(|| io::Error::other("companion path has no parent"))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        self.write_mmap_companion(&mut temporary)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist_noclobber(path).map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    /// Reads the private affine companion produced by `write_mmap_companion`.
+    /// Header, ranges, alignment, and format identity are checked before any
+    /// mapped point slice is exposed. Point *values* are not validated.
+    ///
+    /// # Safety
+    /// The caller must own the backing file and keep it immutable for every
+    /// clone and borrow of the returned parameters. Do not map downloaded or
+    /// attacker-writable files. A malicious or modified file can change proof
+    /// results despite a valid header.
+    #[cfg(feature = "mmap")]
+    #[allow(unsafe_code)]
+    pub unsafe fn read_mmap_arc(mmap: Arc<memmap2::Mmap>) -> io::Result<Self>
+    where
+        E::G1Affine: crate::poly::kzg::bases::PlainBytes,
+        E::G2: ProcessedSerdeObject,
+    {
+        const HEADER_LEN: usize = 96;
+        const G_OFFSET: usize = 128;
+        fn bad(message: &'static str) -> io::Error {
+            io::Error::new(io::ErrorKind::InvalidData, message)
+        }
+        let bytes = &mmap[..];
+        if bytes.len() < HEADER_LEN || &bytes[0..8] != b"MDNGHTV3" {
+            return Err(bad("not a v3 affine companion"));
+        }
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let usize_at = |at: usize| -> io::Result<usize> {
+            usize::try_from(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()))
+                .map_err(|_| bad("companion field overflows usize"))
+        };
+        if u32_at(8) != 3 || u32_at(20) != 1 {
+            return Err(bad("unsupported companion version or flags"));
+        }
+        let k = u32_at(12);
+        let expected = 1usize.checked_shl(k).ok_or_else(|| bad("invalid k"))?;
+        let point_size = std::mem::size_of::<E::G1Affine>();
+        if usize::try_from(u32_at(16)).ok() != Some(point_size) {
+            return Err(bad("affine point layout mismatch"));
+        }
+        if u64::from_le_bytes(bytes[24..32].try_into().unwrap()) != Self::companion_identity(k) {
+            return Err(bad("companion identity mismatch"));
+        }
+        let fields: Vec<usize> = (32..96).step_by(8).map(usize_at).collect::<io::Result<_>>()?;
+        let [
+            g_offset,
+            g_count,
+            gl_offset,
+            gl_count,
+            g2_offset,
+            g2_size,
+            s_g2_offset,
+            s_g2_size,
+        ]: [usize; 8] = fields.try_into().unwrap();
+        if g_offset != G_OFFSET || g_count != expected || gl_count != expected {
+            return Err(bad("companion base count or offset mismatch"));
+        }
+        let block_bytes =
+            expected.checked_mul(point_size).ok_or_else(|| bad("base length overflow"))?;
+        if gl_offset
+            != g_offset.checked_add(block_bytes).ok_or_else(|| bad("base range overflow"))?
+            || g2_offset
+                != gl_offset.checked_add(block_bytes).ok_or_else(|| bad("base range overflow"))?
+            || s_g2_offset
+                != g2_offset.checked_add(g2_size).ok_or_else(|| bad("g2 range overflow"))?
+            || bytes.len()
+                != s_g2_offset.checked_add(s_g2_size).ok_or_else(|| bad("s_g2 range overflow"))?
+        {
+            return Err(bad("companion blocks are truncated or not canonical"));
+        }
+        let base_addr = bytes.as_ptr() as usize;
+        let align = std::mem::align_of::<E::G1Affine>();
+        if base_addr.checked_add(g_offset).ok_or_else(|| bad("address overflow"))? % align != 0
+            || base_addr.checked_add(gl_offset).ok_or_else(|| bad("address overflow"))? % align != 0
+        {
+            return Err(bad("affine base block misaligned"));
+        }
+        let mut g2_bytes = &bytes[g2_offset..s_g2_offset];
+        let mut s_g2_bytes = &bytes[s_g2_offset..];
+        let g2 = E::G2::read(&mut g2_bytes, SerdeFormat::RawBytesUnchecked)?;
+        let s_g2 = E::G2::read(&mut s_g2_bytes, SerdeFormat::RawBytesUnchecked)?;
+        if !g2_bytes.is_empty() || !s_g2_bytes.is_empty() {
+            return Err(bad("trailing G2 bytes"));
+        }
+        // SAFETY: all ranges, lengths and alignment were checked above.
+        // PlainBytes covers point representation; the caller owns immutability.
+        let g = unsafe { BasesStorage::mapped(mmap.clone(), g_offset, expected) };
+        let g_lagrange = unsafe { BasesStorage::mapped(mmap, gl_offset, expected) };
         Ok(Self {
             g,
             g_lagrange,
@@ -618,5 +830,92 @@ mod test {
             params.bases::<LagrangeDoubleDeltaCoeff>(),
             super::suffix_sum(params.bases::<LagrangeDeltaCoeff>())
         );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[allow(unsafe_code)]
+    #[test]
+    fn test_affine_mmap_companion_round_trip_and_downsize() {
+        use midnight_curves::Bls12;
+        use std::sync::Arc;
+
+        let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(4, OsRng);
+        let mut file = tempfile::tempfile().unwrap();
+        params.write_mmap_companion(&mut file).unwrap();
+        file.sync_all().unwrap();
+        // SAFETY: this test owns the file and never mutates it after mapping.
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file) }.unwrap());
+        // SAFETY: the test owns the immutable companion for every clone.
+        let mut mapped = unsafe { ParamsKZG::<Bls12>::read_mmap_arc(mmap) }.unwrap();
+        assert!(mapped.g.is_mapped());
+        assert!(mapped.g_lagrange.is_mapped());
+        assert_eq!(params.g, mapped.g);
+        assert_eq!(params.g_lagrange, mapped.g_lagrange);
+        assert_eq!(params.g2, mapped.g2);
+        assert_eq!(params.s_g2, mapped.s_g2);
+        let cloned = mapped.clone();
+        assert!(cloned.g.is_mapped());
+        assert_eq!(
+            params.bases::<LagrangeDoubleDeltaCoeff>(),
+            mapped.bases::<LagrangeDoubleDeltaCoeff>()
+        );
+
+        mapped.downsize(3);
+        assert!(!mapped.g.is_mapped());
+        assert!(!mapped.g_lagrange.is_mapped());
+        assert_eq!(mapped.max_k(), 3);
+        assert_eq!(cloned.max_k(), 4);
+    }
+
+    #[cfg(feature = "mmap")]
+    #[allow(unsafe_code)]
+    #[test]
+    fn test_affine_mmap_companion_rejects_old_and_damaged_layouts() {
+        use midnight_curves::Bls12;
+        use std::sync::Arc;
+
+        fn load(bytes: &[u8]) -> std::io::Result<ParamsKZG<Bls12>> {
+            let mut mapping = memmap2::MmapMut::map_anon(bytes.len().max(1)).unwrap();
+            mapping[..bytes.len()].copy_from_slice(bytes);
+            let mapping = Arc::new(mapping.make_read_only().unwrap());
+            // SAFETY: this test owns the read-only anonymous mapping.
+            unsafe { ParamsKZG::<Bls12>::read_mmap_arc(mapping) }
+        }
+
+        let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(4, OsRng);
+        let mut good = Vec::new();
+        params.write_mmap_companion(&mut good).unwrap();
+        assert!(load(&good).is_ok());
+        let mut old = good.clone();
+        old[..8].copy_from_slice(b"MDNGHTV2");
+        assert_eq!(
+            load(&old).err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        for at in [8, 16, 20, 24, 32, 40, 48] {
+            let mut damaged = good.clone();
+            damaged[at] ^= 1;
+            let error = load(&damaged).err().expect("damaged companion was accepted");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "offset {at}");
+        }
+        assert_eq!(
+            load(&good[..good.len() - 1]).err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn test_affine_mmap_companion_publication_does_not_replace() {
+        use midnight_curves::Bls12;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("params.mmap");
+        let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(4, OsRng);
+        params.publish_mmap_companion(&path).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        let error = params.publish_mmap_companion(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), first);
     }
 }

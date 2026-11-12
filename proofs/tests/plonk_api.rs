@@ -27,6 +27,7 @@ use midnight_proofs::{
 use rand_core::{CryptoRng, OsRng, RngCore};
 
 #[test]
+#[cfg_attr(feature = "mmap", allow(unsafe_code))]
 fn plonk_api() {
     const K: u32 = 5;
 
@@ -553,6 +554,26 @@ fn plonk_api() {
         pk.get_vk(),
         &proof[..],
     );
+
+    #[cfg(feature = "mmap")]
+    {
+        let mut companion = Vec::new();
+        params.write_mmap_companion(&mut companion).unwrap();
+        let mut mapping = memmap2::MmapMut::map_anon(companion.len()).unwrap();
+        mapping[..companion.len()].copy_from_slice(&companion);
+        let mapping = std::sync::Arc::new(mapping.make_read_only().unwrap());
+        // SAFETY: the test owns this immutable anonymous mapping until the
+        // mapped parameters and proof are dropped.
+        let mut mapped = unsafe { ParamsKZG::<Bls12>::read_mmap_arc(mapping) }.unwrap();
+        let mapped_pk = keygen::<Scalar, Scheme>(&mut mapped);
+        let mapped_proof =
+            create_proof::<Scalar, Scheme, CircuitTranscript<State>, _>(OsRng, &mapped, &mapped_pk);
+        verify_proof::<_, _, CircuitTranscript<State>>(
+            &mapped.verifier_params(),
+            mapped_pk.get_vk(),
+            &mapped_proof,
+        );
+    }
 
     // fflonk combining up to 2 and up to 4 polynomials.
     fn fflonk_roundtrip<const LOG2_T_MAX: u32>() {
