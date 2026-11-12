@@ -34,6 +34,22 @@ The next local iteration implements `disk-spill` for the 0.8.3 prover. `create_p
 
 The next local iteration adds `ProverContext` and a request-owned `CancelToken` to the 0.8.3 prover, with checkpoints between trace, commitment, evaluation, and opening stages. `create_proof_with_context` is additive; both the original `create_proof` and policy-only `create_proof_with` retain their signatures. The 2.4.0 stdlib source on this branch exposes an additive `prove_with_context` and keeps `prove` on its process policy. A synthetic SRS test proved and verified through both stdlib entry points and confirmed a pre-cancelled context returns `Error::Cancelled`; a concurrent low-level proof using a different context completed. A second low-level test pauses inside proof synthesis, cancels that request after `trace.start`, and asserts the next checkpoint returns `Error::Cancelled` while an independent proof using the same parameters and key completes. The focused `test_create_proof` gate passed with `dev-curves` alone and with `dev-curves,disk-spill`. This verifies in-flight cancellation between stages, but does not show interruption inside a long-running stage. The external ZKIR v3 boundary, large-k memory measurements, and current-head CI remain open for this 0.8.3 branch. The released Ledger9 consumer stays pinned to 0.8.2, so this 0.8.3 code is not yet part of that release line.
 
+An isolated ZKIR 3.2.1 library check against this local 0.8.3 source and
+Ledger9 transient-crypto 3.1.0 reached a concrete migration boundary. Cargo
+needed local patches for curves, circuits, proofs, stdlib, and transient-crypto,
+including the upstream Git source of proofs, plus a temporary lockfile update
+from transient-crypto 3.0.0 to 3.1.0. With those patches resolved to one local
+proofs 0.8.3 source, `cargo check -p midnight-zkir --lib` failed in Ledger9
+transient-crypto: four uses of `MidnightVK` need the new `PCS` type parameter;
+`ParamsKZG::read_custom_lazy` is absent; `verify` and `batch_verify` take an
+additional `PCS` type argument; and two mmap-reader calls require an explicit
+unsafe boundary (with one more warning in an unsafe function). These are the
+first compiler errors, not an exhaustive port inventory. A dedicated
+transient-crypto/ZKIR adapter and cross-version artifact gates are required
+before considering a Ledger9 0.8.3 consumer. The released Ledger9 0.8.2 pin
+remains in place. The temporary ZKIR lockfile and build target were removed
+after this check.
+
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
 3. Port streamed coset construction to each new 0.8.3 trace/evaluation owner. Force spill at a known `k`, assert that the spill arm ran, inject storage failures at creation and reservation, and verify both normal and fallback proofs. Measure disk bytes and RSS as well as time. The local code, fault injection, and small-circuit proof gates are in place; measurements remain.
