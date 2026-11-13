@@ -223,7 +223,7 @@ impl<Rel: Relation, PCS: MidnightPCS> MidnightPK<Rel, PCS> {
     /// Fails if the key was written under a commitment scheme other than
     /// `PCS`.
     pub fn read<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self> {
-        Self::read_with_policy(reader, format, ProverConfig::process())
+        Self::read_with_policy(reader, format, &ProverConfig::heap())
     }
 
     /// Read a proving key under an explicit memory policy. The serialized
@@ -607,7 +607,7 @@ where
     F: Hashable<H> + Sampleable<H>,
 {
     prove_with_context::<R, H, PCS>(
-        &ProverContext::new(ProverConfig::process().clone()),
+        &ProverContext::new(ProverConfig::heap()),
         params,
         pk,
         relation,

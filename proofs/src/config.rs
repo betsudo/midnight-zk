@@ -74,8 +74,8 @@ impl ProverConfig {
         self.spill_cosets && k >= self.coset_spill_floor_k
     }
 
-    /// Read legacy process-wide settings once at the application boundary.
-    /// Explicit callers should pass a policy to `create_proof_with` instead.
+    /// Read process-wide settings once at the application boundary. Callers
+    /// can pass this policy to the explicit keygen, load, and proof APIs.
     pub fn process() -> &'static Self {
         static PROCESS: OnceLock<ProverConfig> = OnceLock::new();
         PROCESS.get_or_init(|| Self {

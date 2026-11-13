@@ -649,7 +649,7 @@ where
             format,
             #[cfg(feature = "circuit-params")]
             params,
-            ProverConfig::process(),
+            &ProverConfig::heap(),
         )
     }
 

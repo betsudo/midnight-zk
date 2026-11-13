@@ -293,7 +293,7 @@ where
     CS: PolynomialCommitmentScheme<F>,
     ConcreteCircuit: Circuit<F>,
 {
-    keygen_pk_with(vk, circuit, ProverConfig::process())
+    keygen_pk_with(vk, circuit, &ProverConfig::heap())
 }
 
 /// Generate a proving key with explicit key storage and coset policies.

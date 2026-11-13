@@ -444,7 +444,7 @@ where
     create_proof_with(
         params,
         pk,
-        ProverConfig::process(),
+        &ProverConfig::heap(),
         circuit,
         #[cfg(feature = "committed-instances")]
         nb_committed_instances,
@@ -710,9 +710,11 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
     });
     let advice_views = advice_cosets.views();
     let instance_views = instance_cosets.views();
+    let fixed_labels: Vec<_> =
+        (0..pk.vk.cs.num_fixed_columns()).map(PolynomialLabel::Fixed).collect();
     let fixed_cosets = pk.fixed_cosets.is_empty().then(|| {
         build_cosets(
-            &pk.phase0_polys.views_of(&pk.vk.cs.fixed_polys_labels()),
+            &pk.phase0_polys.views_of(&fixed_labels),
             domain.k(),
             config,
             |poly| domain.coeff_to_extended(poly.materialise()),
