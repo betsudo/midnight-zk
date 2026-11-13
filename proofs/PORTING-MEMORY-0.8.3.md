@@ -152,6 +152,22 @@ The fixtures and provenance live in `proofs/tests/fixtures/legacy_082`.
 This does not qualify production SRS files or all cross-version circuit
 shapes.
 
+The next opt-in PLONK gate used Ledger9's tracked
+`transient-crypto/static/bls_midnight_2p14` parameter file, SHA-256
+`fc253016885ec830e97808c9ec920bb5cab5c21af590380a6cb5eb0538e2b244`.
+Ledger's `translate-params.rs` documents its RawBytes translation from the
+ceremony powers of tau; the identical untracked proof-server copy was not
+modified. Set `MIDNIGHT_PROOFS_TEST_CEREMONY_SRS` to that tracked file and run
+`cargo test -p midnight-proofs --test plonk_api -- plonk_api --exact` with
+default features or add `--features mmap,disk-spill`. Both local gates passed.
+The test read and byte-round-tripped the full k=14 file through ordinary and
+lazy readers; the mmap gate also built and round-tripped a full-size affine
+companion. It then downsized the parameters to the test circuit's k=5 and
+generated and verified a proof, including the mapped-parameter branch with
+the native features. This checks compatibility with the exact tracked file,
+not ceremony provenance, a k=14 circuit, a k>=18 SRS, or a Ledger9 server
+request using these bytes.
+
 After that key-version change, the local adapter stack at proofs `120539fe`,
 Ledger transient-crypto `c21aeb5`, and ZKIR v3 adapter `9976f4c` passed
 all 53 ZKIR library tests, the three `proofs_083_memory` tests, and the

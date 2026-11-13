@@ -547,7 +547,58 @@ fn plonk_api() {
     bad_keys!(Scalar, Scheme);
 
     let rng = OsRng;
-    let mut params = ParamsKZG::<Bls12>::unsafe_setup(K, rng);
+    // Opt-in gate for a translated ceremony SRS. Keep the ordinary test
+    // self-contained, but exercise exact Ledger9 parameter bytes when the
+    // file is available locally.
+    let mut params = if let Some(path) = std::env::var_os("MIDNIGHT_PROOFS_TEST_CEREMONY_SRS") {
+        use std::io::Cursor;
+
+        use midnight_proofs::utils::SerdeFormat;
+
+        let bytes = std::fs::read(path).expect("read ceremony SRS");
+        let mut params =
+            ParamsKZG::<Bls12>::read_custom(&mut Cursor::new(&bytes), SerdeFormat::RawBytes)
+                .expect("read ceremony SRS in the ordinary format");
+        assert!(params.max_k() >= K);
+        let mut roundtrip = Vec::new();
+        params.write_custom(&mut roundtrip, SerdeFormat::RawBytes).unwrap();
+        assert_eq!(roundtrip, bytes, "ordinary SRS bytes changed on round trip");
+
+        let lazy =
+            ParamsKZG::<Bls12>::read_custom_lazy(&mut Cursor::new(&bytes), SerdeFormat::RawBytes)
+                .expect("read ceremony SRS with deferred Lagrange basis");
+        let mut lazy_roundtrip = Vec::new();
+        lazy.write_custom(&mut lazy_roundtrip, SerdeFormat::RawBytes).unwrap();
+        assert_eq!(
+            lazy_roundtrip, bytes,
+            "lazy SRS basis differs from the file"
+        );
+
+        #[cfg(feature = "mmap")]
+        {
+            let mut companion = Vec::new();
+            params.write_mmap_companion(&mut companion).unwrap();
+            let mut mapping = memmap2::MmapMut::map_anon(companion.len()).unwrap();
+            mapping[..companion.len()].copy_from_slice(&companion);
+            // SAFETY: this test owns the immutable mapping until the mapped
+            // parameters and their round trip are dropped.
+            let mapped = unsafe {
+                ParamsKZG::<Bls12>::read_mmap_arc(std::sync::Arc::new(
+                    mapping.make_read_only().unwrap(),
+                ))
+            }
+            .expect("read ceremony SRS companion");
+            assert_eq!(mapped.max_k(), params.max_k());
+            let mut mapped_roundtrip = Vec::new();
+            mapped.write_custom(&mut mapped_roundtrip, SerdeFormat::RawBytes).unwrap();
+            assert_eq!(mapped_roundtrip, bytes, "mapped SRS differs from the file");
+        }
+
+        params.downsize(K);
+        params
+    } else {
+        ParamsKZG::<Bls12>::unsafe_setup(K, rng)
+    };
 
     let pk = keygen::<Scalar, Scheme>(&mut params);
 
