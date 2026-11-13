@@ -343,19 +343,63 @@ where
 
     let permutations = assembly.permutation.into_permutations::<F>(&vk.domain, &cs.permutation);
     let fixed = super::key_storage::KeyPolys::Owned(fixed);
-    let (phase0_polys, fixed_cosets, sigmas) = super::build_phase0_polys(
-        &vk.domain,
-        &cs,
-        vk.transcript_repr,
-        &fixed,
-        super::key_storage::KeyPolys::Owned(permutations),
-        policy,
-    );
+    let permutations = super::key_storage::KeyPolys::Owned(permutations);
+
+    // Map the synthesized Lagrange columns before deriving phase-0
+    // coefficients. The mapped builder transforms one column at a time;
+    // building the whole coefficient group and mapping it afterward keeps
+    // all of those columns live on the heap during key generation.
+    #[cfg(feature = "disk-spill")]
+    let (fixed, phase0_polys, fixed_cosets, sigmas) = if policy.map_prover_key {
+        let fixed = fixed.map_to_disk(policy.spill_dir.as_deref()).map_err(Error::KeyStorage)?;
+        let permutations = permutations
+            .map_to_disk(policy.spill_dir.as_deref())
+            .map_err(Error::KeyStorage)?;
+        let (phase0_polys, fixed_cosets, sigmas) = super::build_phase0_polys_mapped(
+            &vk.domain,
+            &cs,
+            vk.transcript_repr,
+            &fixed,
+            permutations,
+            policy,
+        )
+        .map_err(Error::KeyStorage)?;
+        (fixed, phase0_polys, fixed_cosets, sigmas)
+    } else {
+        let (phase0_polys, fixed_cosets, sigmas) = super::build_phase0_polys(
+            &vk.domain,
+            &cs,
+            vk.transcript_repr,
+            &fixed,
+            permutations,
+            policy,
+        );
+        (fixed, phase0_polys, fixed_cosets, sigmas)
+    };
+
+    #[cfg(not(feature = "disk-spill"))]
+    let (fixed, phase0_polys, fixed_cosets, sigmas) = {
+        if policy.map_prover_key {
+            return Err(Error::KeyStorage(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "mapped proving keys require the disk-spill feature",
+            )));
+        }
+        let (phase0_polys, fixed_cosets, sigmas) = super::build_phase0_polys(
+            &vk.domain,
+            &cs,
+            vk.transcript_repr,
+            &fixed,
+            permutations,
+            policy,
+        );
+        (fixed, phase0_polys, fixed_cosets, sigmas)
+    };
 
     let [l0, l_last, l_active_row] = compute_lagrange_polys(&vk, &cs);
     // Compute the optimized evaluation data structure
     let ev = Evaluator::new(&vk.cs);
-    let pk = ProvingKey {
+    Ok(ProvingKey {
         vk,
         l0,
         l_last,
@@ -366,17 +410,7 @@ where
         sigmas,
         ev,
         region_starts,
-    };
-    if policy.map_prover_key {
-        #[cfg(feature = "disk-spill")]
-        return pk.map_key_to_disk(policy.spill_dir.as_deref()).map_err(Error::KeyStorage);
-        #[cfg(not(feature = "disk-spill"))]
-        return Err(Error::KeyStorage(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "mapped proving keys require the disk-spill feature",
-        )));
-    }
-    Ok(pk)
+    })
 }
 
 pub(crate) fn compute_lagrange_polys<F, CS>(

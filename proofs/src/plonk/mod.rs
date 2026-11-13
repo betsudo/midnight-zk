@@ -633,7 +633,6 @@ where
             #[cfg(feature = "circuit-params")]
             params,
         )?;
-        let [l0, l_last, l_active_row] = compute_lagrange_polys(&vk, &vk.cs);
         let fixed_values = if policy.map_prover_key {
             #[cfg(feature = "disk-spill")]
             {
@@ -708,6 +707,9 @@ where
             permutations,
             policy,
         );
+        // Keep the three extended-domain selector polynomials out of the
+        // peak while mapped columns are being deserialized and transformed.
+        let [l0, l_last, l_active_row] = compute_lagrange_polys(&vk, &vk.cs);
         let ev = Evaluator::new(vk.cs());
         let pk = Self {
             vk,

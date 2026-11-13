@@ -216,6 +216,22 @@ dependency graph, browser runtime proof, or current-head CI. The edited
 ZKIR test passed `rustfmt --check`; workspace-wide formatting still reports
 differences in unrelated upstream files.
 
+The local keygen follow-up maps synthesized fixed and permutation Lagrange
+columns before deriving phase-0 coefficients. The mapped phase-0 builder
+transforms one column at a time into a reserved read-only mapping instead of
+collecting the whole coefficient group on the heap and mapping it afterward.
+Mapped-key deserialization now computes the three extended-domain selector
+polynomials only after its mapped columns and phase-0 group are loaded, so
+those allocations do not overlap with the loader's transient columns. The
+`plonk_api` gate passed under default and `mmap,disk-spill` features; the
+opt-in gate also used Ledger9's tracked k=14 SRS (downsized to the k=5 test
+circuit), generated mapped keys both with and without coset spill, compared
+their serialized keys and seeded proofs with loaded/heap variants, verified
+the proofs, and checked a failing mapping directory. Circuit synthesis still
+owns all fixed and permutation Lagrange columns before mapping, and the three
+extended-domain selectors remain heap-backed. No representative keygen RSS
+or disk peak has been measured for this change.
+
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
 3. Port streamed coset construction to each new 0.8.3 trace/evaluation owner. Force spill at a known `k`, assert that the spill arm ran, inject storage failures at creation and reservation, and verify both normal and fallback proofs. Measure disk bytes and RSS as well as time. The local code, fault injection, and small-circuit proof gates are in place; measurements remain.

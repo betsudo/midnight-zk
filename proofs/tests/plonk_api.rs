@@ -672,6 +672,13 @@ fn plonk_api() {
         .expect("the heap-key load policy should succeed");
         assert_eq!(heap_pk.to_bytes(SerdeFormat::Processed), serialized_key);
         let mapped_only_policy = ProverConfig::mapped_key();
+        let mapped_only_vk = keygen_vk::<Scalar, Scheme, _>(&mut params, &empty_circuit).unwrap();
+        let generated_mapped_only_pk =
+            keygen_pk_with(mapped_only_vk, &empty_circuit, &mapped_only_policy).unwrap();
+        assert_eq!(
+            generated_mapped_only_pk.to_bytes(SerdeFormat::Processed),
+            serialized_key
+        );
         let mapped_only_pk =
             ProvingKey::<Scalar, Scheme>::read_with_policy::<_, MyCircuit<Scalar>>(
                 &mut &serialized_key[..],
@@ -708,6 +715,7 @@ fn plonk_api() {
         let mut first_proof = None;
         for (key, policy) in [
             (&spill_pk, spill_policy.clone()),
+            (&generated_mapped_only_pk, mapped_only_policy.clone()),
             (
                 &loaded_pk,
                 ProverConfig {
