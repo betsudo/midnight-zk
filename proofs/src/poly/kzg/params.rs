@@ -108,8 +108,27 @@ where
     E::G1Affine: CurveAffine,
 {
     fn g_lagrange_slice(&self) -> &[E::G1Affine] {
-        self.g_lagrange
-            .get_or_init(|| BasesStorage::owned(g_to_lagrange(&self.g, self.max_k())))
+        self.g_lagrange.get_or_init(|| {
+            // The FFT uses Rayon scopes. Running it on a proof's Rayon pool
+            // could steal another proof that asks for this same OnceLock and
+            // reenter initialization. Keep the one-time FFT on its own pool.
+            // `install` may itself run tasks from the caller's pool while it
+            // waits, so an ordinary scoped thread is the handoff boundary.
+            let workers = rayon::current_num_threads();
+            let lagrange = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(workers)
+                            .build()
+                            .expect("create SRS basis FFT pool");
+                        pool.install(|| g_to_lagrange(&self.g, self.max_k()))
+                    })
+                    .join()
+                    .expect("SRS basis FFT worker panicked")
+            });
+            BasesStorage::owned(lagrange)
+        })
     }
 
     /// Return the SRS bases corresponding to the polynomial representation `B`.
@@ -821,11 +840,13 @@ impl<E: MultiMillerLoop + Debug> ParamsKZG<E> {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use rand_core::OsRng;
 
     use crate::{
         poly::{
-            LagrangeDeltaCoeff, LagrangeDoubleDeltaCoeff, PolynomialLabel,
+            LagrangeCoeff, LagrangeDeltaCoeff, LagrangeDoubleDeltaCoeff, PolynomialLabel,
             commitment::PolynomialCommitmentScheme,
             kzg::{KZGCommitmentScheme, params::ParamsKZG},
         },
@@ -1069,6 +1090,35 @@ mod test {
             .kind(),
             std::io::ErrorKind::UnexpectedEof,
         );
+    }
+
+    #[test]
+    fn test_lazy_lagrange_init_inside_shared_rayon_pool() {
+        use midnight_curves::Bls12;
+
+        let original: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(4, OsRng);
+        let expected = original.bases::<LagrangeCoeff>().to_vec();
+        let mut bytes = Vec::new();
+        original.write_custom(&mut bytes, SerdeFormat::RawBytes).unwrap();
+        let lazy = Arc::new(
+            ParamsKZG::<Bls12>::read_custom_lazy(
+                &mut std::io::Cursor::new(bytes),
+                SerdeFormat::RawBytes,
+            )
+            .unwrap(),
+        );
+        assert!(lazy.g_lagrange.get().is_none());
+
+        let proof_pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        proof_pool.scope(|scope| {
+            for _ in 0..2 {
+                let lazy = Arc::clone(&lazy);
+                let expected = &expected;
+                scope
+                    .spawn(move |_| assert_eq!(lazy.bases::<LagrangeCoeff>(), expected.as_slice()));
+            }
+        });
+        assert!(lazy.g_lagrange.get().is_some());
     }
 
     #[test]
