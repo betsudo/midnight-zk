@@ -7,7 +7,7 @@ use std::{
 };
 
 use ff::{Field, FromUniformBytes, PrimeField, WithSmallOrderMulGroup};
-use rand_core::{CryptoRng, OsRng, RngCore};
+use rand_core::{CryptoRng, RngCore};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
@@ -317,6 +317,7 @@ pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transc
     trace: ProverTrace<'a, F>,
     transcript: &mut T,
     context: &ProverContext,
+    rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<(), Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -337,7 +338,7 @@ where
     // limbs, and commit to the limbs as one group
     checkpoint(context, "finalise.quotient")?;
     let quotient_committed =
-        compute_h_poly::<F, CS, T>(params, pk.get_vk().get_domain(), nu_poly, transcript)?;
+        compute_h_poly::<F, CS, T>(params, pk.get_vk().get_domain(), nu_poly, transcript, rng)?;
 
     let ProverTrace {
         instance_polys,
@@ -543,6 +544,7 @@ where
         trace,
         transcript,
         context,
+        &mut rng,
     )
 }
 
@@ -778,6 +780,7 @@ pub(crate) fn compute_h_poly<
     domain: &EvaluationDomain<F>,
     nu_poly: Polynomial<F, ExtendedLagrangeCoeff>,
     transcript: &mut T,
+    rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<argument::prover::Committed<F, Coeff>, Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -807,7 +810,7 @@ where
     let mut h_limbs = h_poly.chunks_exact(limb_len).map(|v| v.to_vec()).collect::<Vec<_>>();
     drop(h_poly);
 
-    blind_quotient_limbs(&mut h_limbs);
+    blind_quotient_limbs(&mut h_limbs, rng);
 
     let h_limbs = (h_limbs.into_iter().enumerate())
         .map(|(i, h_limb)| {
@@ -825,12 +828,15 @@ where
 /// coefficients each, without changing `h(X)`: each boundary between two limbs
 /// gets two random `t`, `t'`, added as `t X^{n-2} + t' X^{n-1}` to the lower
 /// limb and subtracted as `t + t' X` from the upper one.
-fn blind_quotient_limbs<F: PrimeField>(quotient_limbs: &mut [Vec<F>]) {
+fn blind_quotient_limbs<F: PrimeField>(
+    quotient_limbs: &mut [Vec<F>],
+    rng: &mut (impl RngCore + CryptoRng),
+) {
     let nr_limbs = quotient_limbs.len();
     assert!(nr_limbs >= 2);
 
     for i in 1..nr_limbs {
-        let (t, t_prime) = (F::random(OsRng), F::random(OsRng));
+        let (t, t_prime) = (F::random(&mut *rng), F::random(&mut *rng));
         quotient_limbs[i - 1].extend([t, t_prime]);
         quotient_limbs[i][0] -= t;
         quotient_limbs[i][1] -= t_prime;

@@ -24,7 +24,8 @@ use midnight_proofs::{
     transcript::{CircuitTranscript, Hashable, Sampleable, Transcript},
     utils::{arithmetic::Field, rational::Rational},
 };
-use rand_core::{CryptoRng, OsRng, RngCore};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{CryptoRng, OsRng, RngCore, SeedableRng};
 
 #[test]
 #[cfg_attr(feature = "mmap", allow(unsafe_code))]
@@ -606,6 +607,7 @@ fn plonk_api() {
             .is_err(),
             "an opted-in key mapping failure must be returned to the caller"
         );
+        let mut first_proof = None;
         for (key, policy) in [&spill_pk, &loaded_pk].into_iter().zip([
             spill_policy.clone(),
             ProverConfig {
@@ -623,10 +625,18 @@ fn plonk_api() {
                 0,
                 &[&[instance]],
                 &mut transcript,
-                OsRng,
+                ChaCha20Rng::from_seed([42; 32]),
             )
             .expect("mapped cosets and heap fallback must both prove");
             let proof = transcript.finalize();
+            if let Some(first) = &first_proof {
+                assert_eq!(
+                    first, &proof,
+                    "storage policy must not change a seeded proof"
+                );
+            } else {
+                first_proof = Some(proof.clone());
+            }
             verify_proof::<_, _, CircuitTranscript<State>>(
                 &params.verifier_params(),
                 key.get_vk(),

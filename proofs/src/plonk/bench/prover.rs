@@ -4,7 +4,8 @@ use std::{collections::BTreeMap, hash::Hash};
 
 use criterion::BenchmarkGroup;
 use ff::{FromUniformBytes, WithSmallOrderMulGroup};
-use rand_core::{CryptoRng, RngCore};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{CryptoRng, RngCore, SeedableRng};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
@@ -447,6 +448,7 @@ pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transc
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     trace: ProverTrace<'a, F>,
     transcript: &mut T,
+    rng: &mut (impl RngCore + CryptoRng),
     group: &mut BenchmarkGroup<'_, criterion::measurement::WallTime>,
 ) -> Result<(), Error>
 where
@@ -475,19 +477,20 @@ where
     let quotient_committed = {
         group.bench_function("Compute quotient poly", |b| {
             b.iter_batched(
-                || transcript.clone(),
-                |mut t| {
+                || (transcript.clone(), ChaCha20Rng::from_seed([42; 32])),
+                |(mut t, mut sample_rng)| {
                     let _ = compute_h_poly::<F, CS, T>(
                         params,
                         pk.get_vk().get_domain(),
                         nu_poly.clone(),
                         &mut t,
+                        &mut sample_rng,
                     );
                 },
                 criterion::BatchSize::SmallInput,
             )
         });
-        compute_h_poly::<F, CS, T>(params, pk.get_vk().get_domain(), nu_poly, transcript)?
+        compute_h_poly::<F, CS, T>(params, pk.get_vk().get_domain(), nu_poly, transcript, rng)?
     };
 
     let ProverTrace {
@@ -641,7 +644,7 @@ where
         nb_committed_instances,
         instances,
         transcript,
-        rng,
+        &mut *rng,
         group,
     )?;
 
@@ -652,6 +655,7 @@ where
         nb_committed_instances,
         trace,
         transcript,
+        rng,
         group,
     )
 }

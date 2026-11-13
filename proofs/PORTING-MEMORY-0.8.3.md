@@ -82,8 +82,17 @@ zkir3_mapped_params zkir3_heap_and_mapped_params_produce_the_same_valid_proof`.
 Ledger9 branch `sync/ledger9-proofs-083-v2-compat` subsequently fixed the
 in-tree v2 API break and passed three fixture-free v2 proofs plus an opt-in v3
 HTTP proof with forced coset spill. That run preceded the local mapped-key
-port, so the broader server test must be retried against the new branch. The
-earlier 0.8.2 key mapper's forged `Vec` views were not copied into 0.8.3.
+port. The broader server test now compiles with the local key policy. Its first
+run verified both proofs but found different bytes despite identical seeded
+caller RNGs: quotient-limb blinding still drew directly from `OsRng`. The
+prover now passes the caller RNG through finalisation. The Ledger9 v3 heap
+versus mapped-parameter/forced-spill comparison, the policy-cache test, and
+the Compact-generated v3 counter proof passed against the local branch.
+This used temporary path patches for proofs, curves, circuits, stdlib and
+ZKIR v3, including a patch for an external SHA3 circuit's Git-sourced proofs
+dependency. It does not establish a released-package build or current-head
+CI. The earlier 0.8.2 key mapper's forged `Vec` views were not copied into
+0.8.3.
 
 The opening-query path now carries read-only `PolynomialView` descriptors
 through both KZG and fflonk while preserving `ProverQuery::new` for owned
@@ -97,8 +106,9 @@ identical serialization, rejects a wrong public statement, and checks that a
 missing mapping directory rejects the key load. This port still deserializes
 all Lagrange columns and builds the phase-0 group before moving them into
 mapped storage, so load-time peak memory is not yet bounded by one column.
-Reservation fault injection, load/proof RSS and disk measurements, the Ledger9
-consumer gate, and current-head CI remain before qualification.
+Reservation fault injection, load/proof RSS and disk measurements, released
+dependency alignment, broader Ledger9 consumer gates, and current-head CI
+remain before qualification.
 
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
