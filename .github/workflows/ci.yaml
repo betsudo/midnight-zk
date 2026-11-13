@@ -35,7 +35,7 @@ jobs:
         if: steps.restore-srs.outputs.cache-hit != 'true'
         run: |
           mkdir -p zk_stdlib/examples/assets
-          curl -L -o zk_stdlib/examples/assets/bls_filecoin_2p19 \
+          curl --fail --location --show-error -o zk_stdlib/examples/assets/bls_filecoin_2p19 \
             https://midnight-s3-fileshare-dev-eu-west-1.s3.eu-west-1.amazonaws.com/bls_filecoin_2p19
 
   test-blstrs:
