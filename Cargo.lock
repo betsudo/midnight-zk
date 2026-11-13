@@ -209,7 +209,7 @@ dependencies = [
  "blake2b_simd",
  "ff",
  "hex",
- "midnight-curves 0.3.1",
+ "midnight-curves 0.3.2",
  "midnight-proofs",
  "num-bigint",
  "rand 0.8.7",
@@ -1111,7 +1111,7 @@ dependencies = [
  "ff",
  "group",
  "midnight-circuits",
- "midnight-curves 0.3.1",
+ "midnight-curves 0.3.2",
  "midnight-proofs",
  "midnight-zk-stdlib",
  "rand 0.8.7",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "midnight-circuits"
-version = "7.3.0"
+version = "7.3.1"
 dependencies = [
  "base64",
  "criterion",
@@ -1131,7 +1131,7 @@ dependencies = [
  "group",
  "itertools 0.15.0",
  "lazy_static",
- "midnight-curves 0.3.1",
+ "midnight-curves 0.3.2",
  "midnight-proofs",
  "num-bigint",
  "num-integer",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "midnight-curves"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ark-std",
  "bitvec",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "midnight-proofs"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "assert_matches",
  "blake2b_simd",
@@ -1217,7 +1217,7 @@ dependencies = [
  "libc",
  "memmap2",
  "midnight-circuits",
- "midnight-curves 0.3.1",
+ "midnight-curves 0.3.2",
  "midnight-zk-stdlib",
  "num-bigint",
  "proptest",
@@ -1253,7 +1253,7 @@ dependencies = [
  "hex-literal",
  "itertools 0.15.0",
  "midnight-circuits",
- "midnight-curves 0.3.1",
+ "midnight-curves 0.3.2",
  "midnight-proofs",
  "num-bigint",
  "num-traits",
