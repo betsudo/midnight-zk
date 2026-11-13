@@ -27,6 +27,7 @@ We use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * `MidnightVK::read` and `MidnightPK::read` reject a `k` outside `1..=F::S` instead of underflowing on `k = 0` [#581](https://github.com/midnightntwrk/midnight-zk/pull/581)
 
 ### Changed
+* LOCAL PORT: regenerate the 14 example verification-key hashes for the optimized proofs 0.8.4 wire-format version `0x04`. These keys differ from the released 0.8.2 keys and are not interchangeable with them.
 * BREAKING: `MidnightVK`, `MidnightPK`, `setup_vk`, `setup_pk`, `prove`, `verify`, `batch_verify` and `cost_model` are generic over the commitment scheme `PCS: MidnightPCS`, which must be given explicitly (e.g. `setup_vk::<_, KZG>`). Serialized verifying keys record their PCS and fail to read under another one. Their format version is 3, and `MidnightVK::read` and `ZkStdLibArch::read` reject other versions, which belong to other proof systems
 * BREAKING: `ZkStdLib::verifier::<PCS>()` is generic over `PCS: MidnightPCS` and verifies proofs committed with `PCS`, which `MidnightPCS` requires to implement `InCircuitPCS<BlstrsEmulation>`. It returns a `VerifierGadget<BlstrsEmulation, PCS>` by value
 * BREAKING: serialized `MidnightPK`s record their PCS, as `MidnightVK`s do, and fail to read under another one
