@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+* Request policy calls now return an explicit error when mapped proving keys or
+  coset disk spill are requested without the `disk-spill` build feature.
 * `keygen_pk_with_policy`: generate a proving key under an explicit
   `ProverConfig`, the same seam `ProvingKey::read_with_policy` gives key
   loading. `keygen_pk` calls it with the process policy, so existing callers

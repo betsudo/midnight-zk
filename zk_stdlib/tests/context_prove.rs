@@ -17,9 +17,10 @@ use rand::{rngs::StdRng, SeedableRng};
 #[cfg(not(feature = "disk-spill"))]
 #[test]
 fn mapped_key_load_requires_disk_spill_capability() {
+    use std::io::ErrorKind;
+
     use midnight_proofs::utils::SerdeFormat;
     use midnight_zk_stdlib::MidnightPK;
-    use std::io::ErrorKind;
 
     let error = MidnightPK::<EmptyRelation>::read_with_policy(
         &mut [10u8].as_slice(),
