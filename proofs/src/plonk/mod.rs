@@ -418,6 +418,40 @@ pub(in crate::plonk) fn build_phase0_polys<F: WithSmallOrderMulGroup<3>>(
     )
 }
 
+#[cfg(test)]
+mod keygen_coset_cache_tests {
+    use super::*;
+    use midnight_curves::Fq;
+
+    fn build_with_policy(policy: &ProverConfig) -> (usize, usize) {
+        let domain = EvaluationDomain::<Fq>::new(4, 4);
+        let mut cs = ConstraintSystem::<Fq>::default();
+        cs.fixed_column();
+        let advice = cs.advice_column();
+        cs.enable_equality(advice);
+
+        let values: Vec<_> = (0..domain.n).map(Fq::from).collect();
+        let fixed = KeyPolys::Owned(vec![domain.lagrange_from_vec(values.clone())]);
+        let sigmas = KeyPolys::Owned(vec![domain.lagrange_from_vec(values)]);
+        let (_, fixed_cosets, sigmas) =
+            build_phase0_polys(&domain, &cs, Fq::from(7), &fixed, sigmas, policy);
+        (fixed_cosets.len(), sigmas.cosets.len())
+    }
+
+    #[test]
+    fn heap_keygen_keeps_fixed_and_permutation_cosets() {
+        assert_eq!(build_with_policy(&ProverConfig::heap()), (1, 1));
+    }
+
+    #[cfg(feature = "disk-spill")]
+    #[test]
+    fn forced_spill_keygen_omits_cached_cosets() {
+        let mut policy = ProverConfig::spilled();
+        policy.coset_spill_floor_k = 0;
+        assert_eq!(build_with_policy(&policy), (0, 0));
+    }
+}
+
 /// Derive a mapped phase-0 group from already mapped Lagrange columns without
 /// first collecting every coefficient polynomial on the heap. The heap keygen
 /// path above keeps its parallel transforms and existing behavior.

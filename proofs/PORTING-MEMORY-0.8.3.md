@@ -240,6 +240,16 @@ coset-spill proving policy. The fixture, raw samples, and limitations are
 recorded in Ledger `proof-server/tests/compact-v3-hash-chain-k18/README.md`;
 these exploratory one-run measurements do not select a release default.
 
+The `build_phase0_polys` regression gate now constructs both a fixed and a
+permutation column and checks their coset caches directly. The default heap
+policy retains both caches, while forced `disk-spill` omits both; the focused
+unit tests pass with default features and with `mmap,disk-spill`. This checks
+the specific missing-cache regression in betsudo/midnight-zk#2, but does not
+establish a heap keygen latency comparison. The 0.8.3 affine MSM remains on
+upstream's unconditional `multi_exp_affine` path from #544. Its x86 performance
+against the old 0.8.2 target-specific gate remains unmeasured; no old
+projective-base threshold has been copied into the affine implementation.
+
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
 3. Port streamed coset construction to each new 0.8.3 trace/evaluation owner. Force spill at a known `k`, assert that the spill arm ran, inject storage failures at creation and reservation, and verify both normal and fallback proofs. Measure disk bytes and RSS as well as time. The local code, fault injection, and small-circuit proof gates are in place; measurements remain.
