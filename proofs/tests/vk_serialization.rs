@@ -3,17 +3,20 @@
 //! the `transcript_repr` derived from them is the same on both paths (keygen
 //! and deserialization).
 
+use blake2b_simd::State;
 use midnight_curves::{Bls12, Fq};
 use midnight_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
         Advice, Circuit, Column, ConstraintSystem, Constraints, Error, ProvingKey, Selector,
-        VerifyingKey, keygen_pk, keygen_vk_with_k,
+        VerifyingKey, keygen_pk, keygen_vk_with_k, prepare,
     },
     poly::{
         Rotation,
+        commitment::Guard,
         kzg::{KZGCommitmentScheme, params::ParamsKZG},
     },
+    transcript::{CircuitTranscript, Transcript},
     utils::{SerdeFormat, arithmetic::Field},
 };
 use rand::{SeedableRng, rngs::StdRng};
@@ -124,5 +127,116 @@ fn pk_round_trip() {
         .expect("pk should deserialize");
 
         assert_eq!(read.to_bytes(format), bytes);
+    }
+}
+
+#[test]
+fn rejects_082_keys_and_proof_but_reads_compatible_processed_params() {
+    // Produced by the signed betsudo 0.8.2 head 397b2424 with the same
+    // circuit, k=5, and seeded synthetic parameters; see the fixture README.
+    let vk = include_bytes!("fixtures/legacy_082/vk-082.bin");
+    let pk = include_bytes!("fixtures/legacy_082/pk-082.bin");
+    let params = include_bytes!("fixtures/legacy_082/params-082.bin");
+    let proof = include_bytes!("fixtures/legacy_082/proof-082.bin");
+
+    assert_eq!(vk[0], 0x03);
+    assert_eq!(pk[0], 0x03);
+    assert_eq!(keygen().to_bytes(SerdeFormat::Processed)[0], 0x04);
+    let vk_error = match VerifyingKey::<Fq, KZGCommitmentScheme<Bls12>>::from_bytes::<MyCircuit>(
+        vk,
+        SerdeFormat::Processed,
+        #[cfg(feature = "circuit-params")]
+        (),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a 0.8.2 verifying key must not load as 0.8.3"),
+    };
+    assert_eq!(vk_error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(vk_error.to_string(), "unexpected version byte");
+
+    let pk_error = match ProvingKey::<Fq, KZGCommitmentScheme<Bls12>>::from_bytes::<MyCircuit>(
+        pk,
+        SerdeFormat::Processed,
+        #[cfg(feature = "circuit-params")]
+        (),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a 0.8.2 proving key must not load as 0.8.3"),
+    };
+    assert_eq!(pk_error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(pk_error.to_string(), "unexpected version byte");
+
+    let params_read = ParamsKZG::<Bls12>::read_custom(&mut &params[..], SerdeFormat::Processed)
+        .expect("the ordinary processed parameter wire format is compatible for this fixture");
+    let mut roundtrip = Vec::new();
+    params_read.write_custom(&mut roundtrip, SerdeFormat::Processed).unwrap();
+    assert_eq!(roundtrip, params);
+    let current = ParamsKZG::<Bls12>::unsafe_setup(K, StdRng::seed_from_u64(0));
+    let mut generated = Vec::new();
+    current.write_custom(&mut generated, SerdeFormat::Processed).unwrap();
+    assert_eq!(generated, params);
+
+    let mut transcript = CircuitTranscript::<State>::init_from_bytes(proof);
+    let invalid = match prepare(
+        &keygen(),
+        #[cfg(feature = "committed-instances")]
+        &[],
+        &[],
+        &mut transcript,
+    ) {
+        Err(_) => true,
+        Ok(guard) => guard.verify(&current.verifier_params()).is_err(),
+    };
+    assert!(invalid, "a 0.8.2 proof must not verify as 0.8.3");
+}
+
+#[test]
+fn raw_082_keys_reject_and_params_round_trip() {
+    let current = ParamsKZG::<Bls12>::unsafe_setup(K, StdRng::seed_from_u64(0));
+    for (format, vk, pk, params) in [
+        (
+            SerdeFormat::RawBytes,
+            &include_bytes!("fixtures/legacy_082/vk-082-raw.bin")[..],
+            &include_bytes!("fixtures/legacy_082/pk-082-raw.bin")[..],
+            &include_bytes!("fixtures/legacy_082/params-082-raw.bin")[..],
+        ),
+        (
+            SerdeFormat::RawBytesUnchecked,
+            &include_bytes!("fixtures/legacy_082/vk-082-raw.bin")[..],
+            &include_bytes!("fixtures/legacy_082/pk-082-raw.bin")[..],
+            &include_bytes!("fixtures/legacy_082/params-082-raw.bin")[..],
+        ),
+    ] {
+        assert_eq!(vk[0], 0x03);
+        assert_eq!(pk[0], 0x03);
+        let vk_error = match VerifyingKey::<Fq, KZGCommitmentScheme<Bls12>>::from_bytes::<MyCircuit>(
+            vk,
+            format,
+            #[cfg(feature = "circuit-params")]
+            (),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a 0.8.2 verifying key must not load as 0.8.3"),
+        };
+        assert_eq!(vk_error.kind(), std::io::ErrorKind::InvalidData);
+        let pk_error = match ProvingKey::<Fq, KZGCommitmentScheme<Bls12>>::from_bytes::<MyCircuit>(
+            pk,
+            format,
+            #[cfg(feature = "circuit-params")]
+            (),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a 0.8.2 proving key must not load as 0.8.3"),
+        };
+        assert_eq!(pk_error.kind(), std::io::ErrorKind::InvalidData);
+
+        let parsed = ParamsKZG::<Bls12>::read_custom(&mut &params[..], format)
+            .expect("ordinary parameter bytes should load for this fixture");
+        let mut roundtrip = Vec::new();
+        parsed.write_custom(&mut roundtrip, format).unwrap();
+        assert_eq!(roundtrip, params);
+        let mut generated = Vec::new();
+        current.write_custom(&mut generated, format).unwrap();
+        assert_eq!(generated, params);
     }
 }

@@ -4,7 +4,7 @@ This is the future upstreaming track for [betsudo/midnight-zk#5](https://github.
 
 ## Compatibility boundary
 
-Upstream's [proofs changelog](CHANGELOG.md) says #513 changed the challenge and commitment order for **every** proof; pre-change proofs no longer verify. The 0.8.2 and 0.8.3 `VerifyingKey` code both use version byte `0x03`, but the serialized payload and transcript representation have changed. That byte alone is not a compatibility check. The 0.8.3 `ParamsKZG` also stores four affine bases (`g`, `g_lagrange`, delta, double delta), plus cached residue bases, where the 0.8.2 patched line stores two projective bases (`g`, lazily initialized `g_lagrange`). Its ordinary parameter file still writes the two primary bases, but their point representation differs. Treat proving keys, verifying keys, proofs, and mmap companion files as version-specific. Do not repin released Ledger9 to 0.8.3 or reuse a 0.8.2 companion. Test cross-version rejection explicitly before a consumer migration.
+Upstream's [proofs changelog](CHANGELOG.md) says #513 changed the challenge and commitment order for **every** proof; pre-change proofs no longer verify. The upstream 0.8.3 baseline reused the 0.8.2 `VerifyingKey` version byte `0x03` despite a different serialized payload and transcript representation. This local port uses `0x04` for the new VK/PK payload, so the old key format rejects at its header. The 0.8.3 `ParamsKZG` stores four affine bases (`g`, `g_lagrange`, delta, double delta), plus cached residue bases, where the 0.8.2 patched line stores two projective bases (`g`, lazily initialized `g_lagrange`). Its ordinary parameter file still writes two primary bases and proved byte-identical for one deterministic k=5 fixture in all three `SerdeFormat` modes; production SRS files remain unqualified. Treat proofs, VKs, PKs, and mmap companions as version-specific. Do not repin released Ledger9 to 0.8.3 or reuse a 0.8.2 companion.
 
 ## Patch disposition
 
@@ -141,6 +141,16 @@ into ZKIR's Cargo graph, including the Git-sourced proofs dependency in
 3.0.0 to 3.1.0; the resulting Wasm graph contained only proofs 0.8.3 and
 did not enable `mmap` or `disk-spill`. This is a browser **compile** gate,
 not a browser runtime proof, a released-package build, or current-head CI.
+
+The fixture from betsudo proofs 0.8.2 `397b2424` uses a k=5 circuit and
+a deterministic synthetic SRS. Its proof verifies under 0.8.2. The local
+0.8.3 test rejects its VK and PK at the distinct version byte in all three
+serialization modes and rejects its proof using the new circuit's VK. Its
+ordinary parameter bytes load, round-trip unchanged, and match a seeded
+0.8.3 setup in Processed, RawBytes, and RawBytesUnchecked modes.
+The fixtures and provenance live in `proofs/tests/fixtures/legacy_082`.
+This does not qualify production SRS files or all cross-version circuit
+shapes.
 
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.

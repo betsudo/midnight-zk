@@ -72,7 +72,9 @@ pub struct VerifyingKey<F: PrimeField, CS: PolynomialCommitmentScheme<F>> {
 }
 
 // Current version of the VK
-const VERSION: u8 = 0x03;
+// The phase-0 commitment payload differs from the 0.8.2 VK/PK layout.
+// Give it a distinct tag so an old key cannot be mistaken for a new one.
+const VERSION: u8 = 0x04;
 
 impl<F, CS> VerifyingKey<F, CS>
 where
