@@ -349,52 +349,97 @@ where
                 format!("k = {k} exceeds the maximum supported value {}", E::Fr::S),
             ));
         }
-        let n = 1 << k;
+        let n = 1usize
+            .checked_shl(k)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS size overflows"))?;
+        const POINT_CHUNK: usize = 4096;
 
-        let (g, g_lagrange) = match format {
-            SerdeFormat::Processed => {
-                let load_points_from_file_parallelly =
-                    |reader: &mut R| -> io::Result<Vec<E::G1Affine>> {
-                        let mut points_compressed =
-                            vec![<E::G1Affine as GroupEncoding>::Repr::default(); n];
-                        for points_compressed in points_compressed.iter_mut() {
-                            reader.read_exact((*points_compressed).as_mut())?;
-                        }
-                        let mut points = vec![Option::<E::G1Affine>::None; n];
-                        parallelize(&mut points, |points, chunks| {
-                            for (i, point) in points.iter_mut().enumerate() {
-                                *point = Option::from(E::G1Affine::from_bytes(
-                                    &points_compressed[chunks + i],
-                                ));
-                            }
-                        });
-                        points
-                            .into_iter()
-                            .map(|p| p.ok_or_else(|| io::Error::other("invalid point encoding")))
-                            .collect()
-                    };
-
-                let g = load_points_from_file_parallelly(reader)?;
-                let g_lagrange = load_points_from_file_parallelly(reader)?;
-                (g, g_lagrange)
-            }
-            SerdeFormat::RawBytes => {
-                let g =
-                    (0..n).map(|_| E::G1Affine::read_raw(reader)).collect::<Result<Vec<_>, _>>()?;
-                let g_lagrange =
-                    (0..n).map(|_| E::G1Affine::read_raw(reader)).collect::<Result<Vec<_>, _>>()?;
-                (g, g_lagrange)
-            }
-            SerdeFormat::RawBytesUnchecked => {
-                let g = (0..n).map(|_| E::G1Affine::read_raw_unchecked(reader)).collect::<Vec<_>>();
-                let g_lagrange =
-                    (0..n).map(|_| E::G1Affine::read_raw_unchecked(reader)).collect::<Vec<_>>();
-                (g, g_lagrange)
-            }
+        let reserve_points = |points: &mut Vec<E::G1Affine>, remaining: usize| {
+            points
+                .try_reserve(remaining.min(POINT_CHUNK))
+                .map_err(|err| io::Error::other(format!("SRS allocation failed: {err}")))
         };
 
-        let g2 = E::G2::read(reader, format)?;
-        let s_g2 = E::G2::read(reader, format)?;
+        let (g, g_lagrange) =
+            match format {
+                SerdeFormat::Processed => {
+                    let load_points_from_file_parallelly =
+                        |reader: &mut R| -> io::Result<Vec<E::G1Affine>> {
+                            let mut result = Vec::new();
+                            while result.len() < n {
+                                let count = (n - result.len()).min(POINT_CHUNK);
+                                let mut compressed =
+                                    vec![<E::G1Affine as GroupEncoding>::Repr::default(); count];
+                                for repr in &mut compressed {
+                                    reader.read_exact(repr.as_mut())?;
+                                }
+                                let mut points = vec![Option::<E::G1Affine>::None; count];
+                                parallelize(&mut points, |points, start| {
+                                    for (i, point) in points.iter_mut().enumerate() {
+                                        *point = Option::from(E::G1Affine::from_bytes(
+                                            &compressed[start + i],
+                                        ));
+                                    }
+                                });
+                                reserve_points(&mut result, count)?;
+                                for point in points {
+                                    result.push(point.ok_or_else(|| {
+                                        io::Error::other("invalid point encoding")
+                                    })?);
+                                }
+                            }
+                            Ok(result)
+                        };
+
+                    let g = load_points_from_file_parallelly(reader)?;
+                    let g_lagrange = load_points_from_file_parallelly(reader)?;
+                    (g, g_lagrange)
+                }
+                SerdeFormat::RawBytes => {
+                    let read_points = |reader: &mut R| -> io::Result<Vec<E::G1Affine>> {
+                        let mut points = Vec::new();
+                        for i in 0..n {
+                            if i % POINT_CHUNK == 0 {
+                                reserve_points(&mut points, n - i)?;
+                            }
+                            points.push(E::G1Affine::read_raw(reader)?);
+                        }
+                        Ok(points)
+                    };
+                    let g = read_points(reader)?;
+                    let g_lagrange = read_points(reader)?;
+                    (g, g_lagrange)
+                }
+                SerdeFormat::RawBytesUnchecked => {
+                    let read_points = |reader: &mut R| -> io::Result<Vec<E::G1Affine>> {
+                        let mut points = Vec::new();
+                        let mut raw = vec![0u8; E::G1Affine::identity().to_raw_bytes().len()];
+                        for i in 0..n {
+                            if i % POINT_CHUNK == 0 {
+                                reserve_points(&mut points, n - i)?;
+                            }
+                            reader.read_exact(&mut raw)?;
+                            points.push(E::G1Affine::read_raw_unchecked(&mut &raw[..]));
+                        }
+                        Ok(points)
+                    };
+                    let g = read_points(reader)?;
+                    let g_lagrange = read_points(reader)?;
+                    (g, g_lagrange)
+                }
+            };
+
+        let read_g2 = |reader: &mut R| -> io::Result<E::G2> {
+            if matches!(format, SerdeFormat::RawBytesUnchecked) {
+                let mut raw = vec![0u8; E::G2::identity().byte_length(format)];
+                reader.read_exact(&mut raw)?;
+                E::G2::read(&mut &raw[..], format)
+            } else {
+                E::G2::read(reader, format)
+            }
+        };
+        let g2 = read_g2(reader)?;
+        let s_g2 = read_g2(reader)?;
 
         Ok(Self {
             g: BasesStorage::owned(g),
@@ -428,32 +473,36 @@ where
             .checked_shl(k)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS size overflows"))?;
         let before_g = reader.stream_position()?;
-        // The unchecked point readers panic on a short stream. They are only
-        // appropriate for trusted parameter files, but a truncated file must
-        // still return an I/O error before any unchecked read begins.
-        if matches!(format, SerdeFormat::RawBytesUnchecked) {
-            let point_bytes = E::G1Affine::identity().to_raw_bytes().len();
-            let primary_bytes = n
-                .checked_mul(point_bytes)
-                .and_then(|size| size.checked_mul(2))
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?;
-            let required = primary_bytes
-                .checked_add(
-                    E::G2::identity().byte_length(format).checked_mul(2).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "SRS too large")
-                    })?,
-                )
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?;
-            let required = u64::try_from(required)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?;
-            let end = reader.seek(io::SeekFrom::End(0))?;
-            reader.seek(io::SeekFrom::Start(before_g))?;
-            if end.saturating_sub(before_g) < required {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated SRS",
-                ));
+        // Check the complete wire length before materialising any basis. In
+        // particular, an otherwise valid k=32 header must not allocate a
+        // multi-gigabyte vector from a truncated stream.
+        let point_bytes = match format {
+            SerdeFormat::Processed => {
+                <E::G1Affine as GroupEncoding>::Repr::default().as_ref().len()
             }
+            _ => E::G1Affine::identity().to_raw_bytes().len(),
+        };
+        let primary_bytes = n
+            .checked_mul(point_bytes)
+            .and_then(|size| size.checked_mul(2))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?;
+        let required = primary_bytes
+            .checked_add(
+                E::G2::identity()
+                    .byte_length(format)
+                    .checked_mul(2)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?,
+            )
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?;
+        let required = u64::try_from(required)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?;
+        let end = reader.seek(io::SeekFrom::End(0))?;
+        reader.seek(io::SeekFrom::Start(before_g))?;
+        if end.saturating_sub(before_g) < required {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated SRS",
+            ));
         }
         let g = match format {
             SerdeFormat::Processed => {
@@ -797,7 +846,32 @@ mod test {
                 .err()
                 .expect("oversized k must be rejected");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+            let boundary = Fq::S.to_le_bytes();
+            assert!(
+                ParamsKZG::<Bls12>::read_custom(&mut &boundary[..], format).is_err(),
+                "k at the field limit must not allocate from a truncated stream"
+            );
+            assert!(
+                ParamsKZG::<Bls12>::read_custom_lazy(&mut std::io::Cursor::new(boundary), format,)
+                    .is_err(),
+                "lazy k at the field limit must not allocate from a truncated stream"
+            );
         }
+    }
+
+    #[test]
+    fn test_read_custom_unchecked_truncation_is_an_io_error() {
+        use midnight_curves::Bls12;
+
+        let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(2, OsRng);
+        let mut bytes = Vec::new();
+        params.write_custom(&mut bytes, SerdeFormat::RawBytesUnchecked).unwrap();
+        bytes.truncate(bytes.len() - 1);
+        let err = ParamsKZG::<Bls12>::read_custom(&mut &bytes[..], SerdeFormat::RawBytesUnchecked)
+            .err()
+            .expect("truncated raw SRS must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
