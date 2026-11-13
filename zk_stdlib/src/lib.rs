@@ -1651,6 +1651,9 @@ impl<Rel: Relation> MidnightPK<Rel> {
     /// A request that selects mapped key storage must pass the same policy
     /// here and to the prover context; otherwise key loading can eagerly
     /// materialize cosets on the heap before proving begins.
+    /// Mapped key requests fail with `Unsupported` unless the dependency graph
+    /// enables `midnight-proofs/disk-spill` (for example through this crate's
+    /// opt-in `disk-spill` feature).
     pub fn read_with_policy<R: io::Read>(
         reader: &mut R,
         format: SerdeFormat,

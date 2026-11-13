@@ -53,6 +53,9 @@ default = []
 # Feature that exposes some testing functionality, such as load from scratch or instantiable
 testing = ["num-bigint/rand"]
 heap_profiling = []
+# Host-only mapped key and coset spill support for explicit prover policies.
+# Keep it opt-in so wasm consumers retain the heap implementation.
+disk-spill = ["midnight-proofs/disk-spill"]
 # Enable truncated challenges. This makes recursive proofs more efficient
 truncated-challenges = [
     "midnight-proofs/truncated-challenges",

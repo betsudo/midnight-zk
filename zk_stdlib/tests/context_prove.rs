@@ -14,7 +14,64 @@ use midnight_proofs::{
 use midnight_zk_stdlib::{Relation, ZkStdLib};
 use rand::{rngs::StdRng, SeedableRng};
 
-#[derive(Clone)]
+#[cfg(not(feature = "disk-spill"))]
+#[test]
+fn mapped_key_load_requires_disk_spill_capability() {
+    use midnight_proofs::utils::SerdeFormat;
+    use midnight_zk_stdlib::MidnightPK;
+    use std::io::ErrorKind;
+
+    let error = MidnightPK::<EmptyRelation>::read_with_policy(
+        &mut [10u8].as_slice(),
+        SerdeFormat::RawBytes,
+        &ProverConfig::mapped_key(),
+    )
+    .expect_err("mapped key policy must not silently load on the heap");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+}
+
+#[cfg(feature = "disk-spill")]
+#[test]
+fn mapped_key_round_trip_proves_with_context() {
+    use midnight_proofs::utils::SerdeFormat;
+    use midnight_zk_stdlib::MidnightPK;
+
+    let params = ParamsKZG::<Bls12>::unsafe_setup(10, StdRng::seed_from_u64(5));
+    let relation = EmptyRelation;
+    let vk = midnight_zk_stdlib::setup_vk(&params, &relation);
+    let pk = midnight_zk_stdlib::setup_pk(&relation, &vk);
+    let mut bytes = Vec::new();
+    pk.write(&mut bytes, SerdeFormat::RawBytesUnchecked)
+        .expect("serialize generated key");
+
+    let policy = ProverConfig::mapped_key();
+    let mapped = MidnightPK::<EmptyRelation>::read_with_policy(
+        &mut bytes.as_slice(),
+        SerdeFormat::RawBytesUnchecked,
+        &policy,
+    )
+    .expect("load key under mapped policy");
+    let proof = midnight_zk_stdlib::prove_with_context::<EmptyRelation, blake2b_simd::State>(
+        &ProverContext::new(policy),
+        &params,
+        &mapped,
+        &relation,
+        &(),
+        (),
+        StdRng::seed_from_u64(6),
+    )
+    .expect("mapped key should prove");
+    midnight_zk_stdlib::verify::<EmptyRelation, blake2b_simd::State>(
+        &params.verifier_params(),
+        &vk,
+        &(),
+        None,
+        &proof,
+    )
+    .expect("mapped-key proof should verify");
+}
+
+#[derive(Clone, Debug)]
 struct EmptyRelation;
 
 impl Relation for EmptyRelation {
@@ -51,6 +108,26 @@ fn released_stdlib_context_and_compatibility_proofs_verify() {
     let relation = EmptyRelation;
     let vk = midnight_zk_stdlib::setup_vk(&params, &relation);
     let pk = midnight_zk_stdlib::setup_pk(&relation, &vk);
+
+    #[cfg(not(feature = "disk-spill"))]
+    {
+        let policy = ProverConfig {
+            spill_cosets: true,
+            coset_spill_floor_k: 0,
+            ..ProverConfig::heap()
+        };
+        let error = midnight_zk_stdlib::prove_with_context::<EmptyRelation, blake2b_simd::State>(
+            &ProverContext::new(policy),
+            &params,
+            &pk,
+            &relation,
+            &(),
+            (),
+            StdRng::seed_from_u64(7),
+        )
+        .expect_err("requested coset spill must not silently use heap storage");
+        assert!(matches!(error, Error::Synthesis(message) if message.contains("disk-spill")));
+    }
 
     let token = CancelToken::new();
     token.cancel();
