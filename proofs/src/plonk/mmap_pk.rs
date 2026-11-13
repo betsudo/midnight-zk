@@ -286,6 +286,27 @@ where
     spill_iter_to_disk_with_reservation(spill_dir, polys, n_polys, n_per_poly, reserve_spill_file)
 }
 
+/// Spill a fallible polynomial stream, propagating deserialization errors
+/// before a read-only mapping can be exposed.
+pub(crate) fn spill_try_iter_to_disk<F, B, I>(
+    spill_dir: Option<&std::path::Path>,
+    polys: I,
+    n_polys: usize,
+    n_per_poly: usize,
+) -> io::Result<MmappedPolys<F, B>>
+where
+    F: Copy,
+    I: IntoIterator<Item = io::Result<Polynomial<F, B>>>,
+{
+    spill_try_iter_to_disk_with_reservation(
+        spill_dir,
+        polys,
+        n_polys,
+        n_per_poly,
+        reserve_spill_file,
+    )
+}
+
 // The reservation seam lets a test reject backing-store allocation after a
 // tempfile has opened, without changing process limits or filling a volume.
 fn spill_iter_to_disk_with_reservation<F, B, I, R>(
@@ -298,6 +319,27 @@ fn spill_iter_to_disk_with_reservation<F, B, I, R>(
 where
     F: Copy,
     I: IntoIterator<Item = Polynomial<F, B>>,
+    R: FnOnce(&mut std::fs::File, usize) -> io::Result<()>,
+{
+    spill_try_iter_to_disk_with_reservation(
+        spill_dir,
+        polys.into_iter().map(Ok),
+        n_polys,
+        n_per_poly,
+        reserve,
+    )
+}
+
+fn spill_try_iter_to_disk_with_reservation<F, B, I, R>(
+    spill_dir: Option<&std::path::Path>,
+    polys: I,
+    n_polys: usize,
+    n_per_poly: usize,
+    reserve: R,
+) -> io::Result<MmappedPolys<F, B>>
+where
+    F: Copy,
+    I: IntoIterator<Item = io::Result<Polynomial<F, B>>>,
     R: FnOnce(&mut std::fs::File, usize) -> io::Result<()>,
 {
     let elem_size = std::mem::size_of::<F>();
@@ -338,6 +380,7 @@ where
 
     let mut written_polys = 0usize;
     for (poly_index, poly) in iter.by_ref().enumerate() {
+        let poly = poly?;
         // The declared count is checked on both sides of the loop. Reject
         // overproduction before pointer arithmetic and underproduction below.
         if poly_index >= n_polys {

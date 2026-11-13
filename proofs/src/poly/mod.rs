@@ -562,6 +562,32 @@ impl<F: PrimeField + SerdeObject, B> Polynomial<F, B> {
             })
     }
 
+    /// Read a key column whose domain fixes its length. Check the serialized
+    /// length before allocating field values.
+    #[cfg(feature = "disk-spill")]
+    pub(crate) fn read_with_expected_len<R: io::Read>(
+        reader: &mut R,
+        format: SerdeFormat,
+        expected_len: usize,
+    ) -> io::Result<Self> {
+        let mut poly_len = [0u8; 4];
+        reader.read_exact(&mut poly_len)?;
+        let poly_len = u32::from_be_bytes(poly_len) as usize;
+        if poly_len != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("key polynomial length {poly_len}, expected {expected_len}"),
+            ));
+        }
+        (0..expected_len)
+            .map(|_| read_f(reader, format))
+            .collect::<io::Result<Vec<_>>>()
+            .map(|values| Self {
+                values,
+                _marker: PhantomData,
+            })
+    }
+
     /// Writes polynomial to buffer using `SerdePrimeField::write`.
     pub(crate) fn write<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&(self.values.len() as u32).to_be_bytes())?;

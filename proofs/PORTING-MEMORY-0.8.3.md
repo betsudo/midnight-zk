@@ -103,11 +103,16 @@ and uses typed views for lookup, trash, and permutation reads. Keygen and
 `mapped_key_and_cosets()`; the ordinary heap policy remains the default.
 The PLONK API test generates and verifies with mapped key columns, checks
 identical serialization, rejects a wrong public statement, and checks that a
-missing mapping directory rejects the key load. This port still deserializes
-all Lagrange columns and builds the phase-0 group before moving them into
-mapped storage, so load-time peak memory is not yet bounded by one column.
-Reservation fault injection, load/proof RSS and disk measurements, released
-dependency alignment, broader Ledger9 consumer gates, and current-head CI
+missing mapping directory rejects the key load. The mapped read now reserves
+storage and deserializes fixed and permutation Lagrange columns one at a time
+into read-only mappings. It checks serialized counts and row lengths against
+the verifying key before accepting each batch; a focused test covers the
+round trip, wrong counts and lengths, and truncated input. Phase-0 coefficient
+derivation still materializes the whole group before mapping it, and keygen
+still builds its inputs on the heap. Load-time peak memory is therefore not
+yet bounded by one column. Reservation fault injection, load/proof RSS and
+disk measurements, released dependency alignment, broader Ledger9 consumer
+gates, and current-head CI
 remain before qualification.
 
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.

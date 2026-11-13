@@ -24,8 +24,11 @@ use midnight_proofs::{
     transcript::{CircuitTranscript, Hashable, Sampleable, Transcript},
     utils::{arithmetic::Field, rational::Rational},
 };
+#[cfg(feature = "disk-spill")]
 use rand_chacha::ChaCha20Rng;
-use rand_core::{CryptoRng, OsRng, RngCore, SeedableRng};
+#[cfg(feature = "disk-spill")]
+use rand_core::SeedableRng;
+use rand_core::{CryptoRng, OsRng, RngCore};
 
 #[test]
 #[cfg_attr(feature = "mmap", allow(unsafe_code))]

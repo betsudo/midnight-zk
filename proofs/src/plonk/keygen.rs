@@ -342,12 +342,13 @@ where
     fixed.extend(selector_polys.into_iter().map(|poly| vk.domain.lagrange_from_vec(poly)));
 
     let permutations = assembly.permutation.into_permutations::<F>(&vk.domain, &cs.permutation);
+    let fixed = super::key_storage::KeyPolys::Owned(fixed);
     let (phase0_polys, fixed_cosets, sigmas) = super::build_phase0_polys(
         &vk.domain,
         &cs,
         vk.transcript_repr,
         &fixed,
-        permutations,
+        super::key_storage::KeyPolys::Owned(permutations),
         policy,
     );
 
@@ -359,7 +360,7 @@ where
         l0,
         l_last,
         l_active_row,
-        fixed_values: super::key_storage::KeyPolys::Owned(fixed),
+        fixed_values: fixed,
         fixed_cosets,
         phase0_polys,
         sigmas,

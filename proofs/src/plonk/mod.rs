@@ -361,8 +361,8 @@ pub(in crate::plonk) fn build_phase0_polys<F: WithSmallOrderMulGroup<3>>(
     domain: &EvaluationDomain<F>,
     cs: &ConstraintSystem<F>,
     vk_repr: F,
-    fixed_values: &[Polynomial<F, LagrangeCoeff>],
-    sigmas: Vec<Polynomial<F, LagrangeCoeff>>,
+    fixed_values: &KeyPolys<F, LagrangeCoeff>,
+    sigmas: KeyPolys<F, LagrangeCoeff>,
     policy: &ProverConfig,
 ) -> (
     argument::prover::KeyGroup<F>,
@@ -370,15 +370,17 @@ pub(in crate::plonk) fn build_phase0_polys<F: WithSmallOrderMulGroup<3>>(
     permutation::Sigmas<F>,
 ) {
     let sigma_labels = cs.permutation.polynomial_labels();
+    let sigma_views = sigmas.views();
     assert_eq!(
-        sigmas.len(),
+        sigma_views.len(),
         sigma_labels.len(),
         "the number of permutation polynomials does not match the number of permutation columns"
     );
 
-    let fixed_coeffs: Vec<_> = fixed_values
+    let fixed_views = fixed_values.views();
+    let fixed_coeffs: Vec<_> = fixed_views
         .par_iter()
-        .map(|poly| domain.lagrange_to_coeff(poly.clone()))
+        .map(|poly| domain.lagrange_to_coeff(poly.materialise()))
         .collect();
     let cache_cosets = !cfg!(feature = "disk-spill") || !policy.spills_cosets_at(domain.k());
     let fixed_cosets = if cache_cosets {
@@ -399,7 +401,7 @@ pub(in crate::plonk) fn build_phase0_polys<F: WithSmallOrderMulGroup<3>>(
     let (sigma_coeffs, sigma_cosets) = permutation::keygen::compute_polys_and_cosets(
         domain,
         &cs.permutation,
-        &sigmas,
+        &sigma_views,
         cache_cosets,
     );
     group.extend(sigma_labels.into_iter().zip(sigma_coeffs));
@@ -408,7 +410,7 @@ pub(in crate::plonk) fn build_phase0_polys<F: WithSmallOrderMulGroup<3>>(
         argument::prover::KeyGroup::new(group, vk_repr),
         fixed_cosets,
         permutation::Sigmas {
-            values: KeyPolys::Owned(sigmas),
+            values: sigmas,
             cosets: sigma_cosets,
         },
     )
@@ -564,14 +566,47 @@ where
             params,
         )?;
         let [l0, l_last, l_active_row] = compute_lagrange_polys(&vk, &vk.cs);
-        let fixed_values: Vec<_> = read_polynomial_vec(reader, format)?;
-        let permutations: Vec<_> = read_polynomial_vec(reader, format)?;
-        if permutations.len() != vk.cs.permutation.columns.len() {
+        let fixed_values = if policy.map_prover_key {
+            #[cfg(feature = "disk-spill")]
+            {
+                KeyPolys::read_mapped(
+                    reader,
+                    format,
+                    vk.cs.num_fixed_columns,
+                    vk.domain.n as usize,
+                    policy.spill_dir.as_deref(),
+                )?
+            }
+            #[cfg(not(feature = "disk-spill"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "mapped proving keys require the disk-spill feature",
+            ));
+        } else {
+            KeyPolys::Owned(read_polynomial_vec(reader, format)?)
+        };
+        let permutations = if policy.map_prover_key {
+            #[cfg(feature = "disk-spill")]
+            {
+                KeyPolys::read_mapped(
+                    reader,
+                    format,
+                    vk.cs.permutation.columns.len(),
+                    vk.domain.n as usize,
+                    policy.spill_dir.as_deref(),
+                )?
+            }
+            #[cfg(not(feature = "disk-spill"))]
+            unreachable!()
+        } else {
+            KeyPolys::Owned(read_polynomial_vec(reader, format)?)
+        };
+        if permutations.views().len() != vk.cs.permutation.columns.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "{} permutation polynomials, expected {}",
-                    permutations.len(),
+                    permutations.views().len(),
                     vk.cs.permutation.columns.len()
                 ),
             ));
@@ -590,7 +625,7 @@ where
             l0,
             l_last,
             l_active_row,
-            fixed_values: KeyPolys::Owned(fixed_values),
+            fixed_values,
             fixed_cosets,
             phase0_polys,
             sigmas,
