@@ -8,6 +8,7 @@ We use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 ### Added
+* LOCAL PORT: the released 2.4.0 stdlib API now has an additive `prove_with_context` entry point backed by optimized proofs 0.8.2. The original `prove` entry point retains its process-policy behavior. This source must be pinned by an immutable fork commit; it does not change the serialized key or proof format.
 ### Changed
 ### Removed
 

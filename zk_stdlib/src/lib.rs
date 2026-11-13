@@ -100,6 +100,7 @@ use midnight_curves::{
 };
 use midnight_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
+    config::ProverContext,
     dev::cost_model::{circuit_model, CircuitModel},
     plonk::{
         self, keygen_vk_with_k, prepare, Circuit, ConstraintSystem, Error, ProvingKey, VerifyingKey,
@@ -1130,14 +1131,6 @@ where
     ) -> Result<(), Error> {
         self.native_gadget.constrain_as_public_input(layouter, assigned)
     }
-
-    fn assign_as_public_input(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        value: Value<<T>::Element>,
-    ) -> Result<T, Error> {
-        self.native_gadget.assign_as_public_input(layouter, value)
-    }
 }
 
 impl<T> CommittedInstanceInstructions<F, T> for ZkStdLib
@@ -1993,6 +1986,31 @@ where
     G1Projective: Hashable<H>,
     F: Hashable<H> + Sampleable<H>,
 {
+    prove_with_context::<R, H>(
+        &ProverContext::process(),
+        params,
+        pk,
+        relation,
+        instance,
+        witness,
+        rng,
+    )
+}
+
+/// Produce a proof with a request-owned memory and cancellation context.
+pub fn prove_with_context<R: Relation, H: TranscriptHash>(
+    context: &ProverContext,
+    params: &ParamsKZG<midnight_curves::Bls12>,
+    pk: &MidnightPK<R>,
+    relation: &R,
+    instance: &R::Instance,
+    witness: R::Witness,
+    rng: impl RngCore + CryptoRng,
+) -> Result<Vec<u8>, R::Error>
+where
+    G1Projective: Hashable<H>,
+    F: Hashable<H> + Sampleable<H>,
+{
     let pi = R::format_instance(instance)?;
     let com_inst = R::format_committed_instances(&witness);
     let circuit = MidnightCircuit::new(
@@ -2001,7 +2019,8 @@ where
         Value::known(witness),
         Some(pk.k as u32),
     );
-    BlstPLONK::<MidnightCircuit<R>>::prove::<H>(
+    BlstPLONK::<MidnightCircuit<R>>::prove_with_context::<H>(
+        context,
         params,
         &pk.pk,
         &circuit,
