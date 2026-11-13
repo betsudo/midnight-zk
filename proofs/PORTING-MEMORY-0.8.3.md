@@ -120,6 +120,15 @@ to be bounded by one column. Reservation fault injection, load/proof RSS and
 disk measurements, released dependency alignment, broader Ledger9 consumer
 gates, and current-head CI remain before qualification.
 
+The local `sync/proofs-083-phase0-stream` build gate passed native
+`cargo check -p midnight-proofs` with default features, `mmap`, and
+`disk-spill`. Browser Wasm `wasm32-unknown-unknown` passed with default and
+no-default features using Homebrew LLVM 20.1.6 as `CC` for `blst`. Opting
+into `mmap` or `disk-spill` on Wasm failed only at the crate's intended
+capability `compile_error!` declarations. This checks the proofs crate at a
+local head; it does not qualify the external ZKIR/stdlib browser consumer or
+replace exact-head CI.
+
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
 3. Port streamed coset construction to each new 0.8.3 trace/evaluation owner. Force spill at a known `k`, assert that the spill arm ran, inject storage failures at creation and reservation, and verify both normal and fallback proofs. Measure disk bytes and RSS as well as time. The local code, fault injection, and small-circuit proof gates are in place; measurements remain.

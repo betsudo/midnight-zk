@@ -25,8 +25,6 @@
 //! the public API keeps the typing strong so the compiler enforces
 //! the invariant.
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-use std::io::Write;
 use std::{io, marker::PhantomData, sync::Arc};
 
 use crate::poly::{Polynomial, PolynomialRead, PolynomialView, polynomial_views};
