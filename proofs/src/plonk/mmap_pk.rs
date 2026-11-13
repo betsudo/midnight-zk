@@ -158,7 +158,10 @@ fn zero_fill_spill_file(file: &mut std::fs::File, total_bytes: usize) -> io::Res
         file.write_all(&ZERO_BLOCK[..n])?;
         remaining -= n;
     }
-    file.flush()?;
+    // `File::flush` does not commit the OS page cache. Filesystems with
+    // delayed allocation can report ENOSPC only when the data is synced;
+    // detect that before a later writable mmap fault can SIGBUS the prover.
+    file.sync_all()?;
     Ok(())
 }
 
@@ -511,6 +514,25 @@ mod test {
                 "poly {i} values survived the round trip"
             );
         }
+    }
+
+    #[test]
+    fn zero_fill_reservation_round_trips_values() {
+        // Exercise the fallback used when this filesystem cannot preallocate.
+        // The normal round-trip above takes the native reservation path.
+        let dir = tempfile::tempdir().unwrap();
+        let spilled = spill_iter_to_disk_with_reservation(
+            Some(dir.path()),
+            vec![poly(&[1, 2, 3, 4]), poly(&[5, 6, 7, 8])],
+            2,
+            4,
+            zero_fill_spill_file,
+        )
+        .unwrap();
+        let views = spilled.views();
+        assert_eq!(&views[0][..], &[1u64, 2, 3, 4].map(Fp::from));
+        assert_eq!(&views[1][..], &[5u64, 6, 7, 8].map(Fp::from));
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0);
     }
 
     #[test]
