@@ -8,12 +8,27 @@ We use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 ### Added
-* LOCAL PORT: the released 2.4.0 stdlib API now has an additive `prove_with_context` entry point backed by optimized proofs 0.8.2. The original `prove` entry point retains its process-policy behavior. This source must be pinned by an immutable fork commit; it does not change the serialized key or proof format.
+* `prove_with_context` on the relation and PLONK adapters forwards a caller-owned memory and cancellation policy to `midnight-proofs` 0.8.2; the existing `prove` entry points keep their process defaults.
 ### Changed
 ### Removed
 
-## [2.3.3]
+## [2.4.0]
+### Changed
+* Bump `midnight-circuits` to 7.3.0 [#614](https://github.com/midnightntwrk/midnight-zk/pull/614)
+* `assign_as_public_input` always performs the in-circuit checks of `assign` (affects the VKs of relations with byte, Jubjub point or BLS12-381 point public inputs) [#598](https://github.com/midnightntwrk/midnight-zk/pull/598)
+* `DivisionInstructions::div_rem` and `rem` panic when `divisor * (dividend_bound / divisor + 1)` exceeds the field modulus, in particular when no bound is given; `DivisionInstructions` is deprecated [#606](https://github.com/midnightntwrk/midnight-zk/pull/606)
+* Examples use `EccInstructions::x` and `y` instead of the deprecated `x_coordinate` and `y_coordinate`, asserting that secp256k1 points are not the identity (affects the VKs of the Bitcoin signature and credential examples) [#612](https://github.com/midnightntwrk/midnight-zk/issues/612)
+* In-circuit `as_public_input` of Jubjub scalars encodes the canonical value, as `Instantiable::as_public_input` does (affects the VKs of relations with Jubjub scalar public inputs) [#611](https://github.com/midnightntwrk/midnight-zk/pull/611)
 
+## [2.3.5]
+### Changed
+* Bump `midnight-circuits` to 7.2.4 [#485](https://github.com/midnightntwrk/midnight-zk/pull/485)
+
+## [2.3.4]
+### Changed
+* Bump `midnight-circuits` to 7.2.3 and `midnight-proofs` to 0.8.2 for the verifier per-proof length check [#482](https://github.com/midnightntwrk/midnight-zk/pull/482)
+
+## [2.3.3]
 ### Changed
 * Display the underlying error message in `Relation::circuit` synthesis errors [#452](https://github.com/midnightntwrk/midnight-zk/pull/452)
 
