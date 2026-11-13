@@ -708,7 +708,7 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
     let instance_views = instance_cosets.views();
     let fixed_cosets = pk.fixed_cosets.is_empty().then(|| {
         build_cosets(
-            pk.phase0_polys.polys_of(&pk.vk.cs.fixed_polys_labels()),
+            &pk.phase0_polys.views_of(&pk.vk.cs.fixed_polys_labels()),
             domain.k(),
             config,
             |poly| domain.coeff_to_extended(poly.materialise()),
@@ -716,7 +716,7 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
     });
     let permutation_cosets = pk.sigmas.cosets.is_empty().then(|| {
         build_cosets(
-            pk.phase0_polys.polys_of(&pk.vk.cs.permutation.polynomial_labels()),
+            &pk.phase0_polys.views_of(&pk.vk.cs.permutation.polynomial_labels()),
             domain.k(),
             config,
             |poly| domain.coeff_to_extended(poly.materialise()),
@@ -1082,6 +1082,8 @@ fn test_create_proof() {
     let vk = keygen_vk_with_k::<Fr, KZGCommitmentScheme<Bn256>, _>(&params, &MyCircuit, K)
         .expect("keygen_vk should not fail");
     let pk = keygen_pk(vk, &MyCircuit).expect("keygen_pk should not fail");
+    #[cfg(feature = "disk-spill")]
+    let pk = pk.map_phase0_to_disk(None).expect("empty phase-0 key may stay on the heap");
     let mut transcript = CircuitTranscript::<_>::init();
 
     // Create proof with wrong number of instances (extra column).

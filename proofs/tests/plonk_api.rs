@@ -584,7 +584,26 @@ fn plonk_api() {
             (),
             &spill_policy,
         )
+        .unwrap()
+        .map_phase0_to_disk(None)
+        .expect("phase-0 key mapping should succeed");
+        assert_eq!(loaded_pk.to_bytes(SerdeFormat::Processed), serialized_key);
+        let failing_pk = ProvingKey::<Scalar, Scheme>::read_with_policy::<_, MyCircuit<Scalar>>(
+            &mut &serialized_key[..],
+            SerdeFormat::Processed,
+            #[cfg(feature = "circuit-params")]
+            (),
+            &spill_policy,
+        )
         .unwrap();
+        assert!(
+            failing_pk
+                .map_phase0_to_disk(Some(std::path::Path::new(
+                    "/nonexistent-midnight-spill-dir/for-this-test",
+                )))
+                .is_err(),
+            "an opted-in key mapping failure must be returned to the caller"
+        );
         for (key, policy) in [&spill_pk, &loaded_pk].into_iter().zip([
             spill_policy.clone(),
             ProverConfig {

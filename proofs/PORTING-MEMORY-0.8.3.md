@@ -91,15 +91,17 @@ views must not be copied into this layout.
 
 The opening-query path now carries read-only `PolynomialView` descriptors
 through both KZG and fflonk while preserving `ProverQuery::new` for owned
-callers. This is a prerequisite for mapping the phase-0 group; it does not
-itself map a proving key. The remaining port must move all three key
-collections behind owned-or-mapped storage, adapt serialization, permutation,
-evaluation, and opening reads to the same views, and choose the policy before
-building derived cosets. An opted-in key mapping failure must reject the load
-so no partially converted key or silent heap result is reported. Prove and
-verify with mapped and heap keys, check a wrong statement, inject file creation
-and reservation failures, and measure load/proof peak memory and disk bytes
-before claiming the 0.8.3 key policy is qualified.
+callers. The next local branch maps the phase-0 coefficient group through
+`map_phase0_to_disk`; the PLONK API test proves and verifies with that group
+mapped, checks identical key serialization, and rejects a missing spill
+directory. This is an explicit phase-0 operation, not the complete mapped-key
+policy. `fixed_values` and `sigmas.values` still own their Lagrange columns.
+The remaining port must move those two collections behind owned-or-mapped
+storage, adapt serialization and permutation reads to views, and choose the
+policy before building derived cosets. An opted-in mapping failure must reject
+the load so no partially converted key or silent heap result is reported.
+Check a wrong statement, inject reservation failures, and measure load/proof
+peak memory and disk bytes before claiming the 0.8.3 key policy is qualified.
 
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.

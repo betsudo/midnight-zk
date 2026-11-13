@@ -419,6 +419,37 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>> ProvingKey
 where
     F: FromUniformBytes<64>,
 {
+    /// Move the phase-0 coefficient polynomials into a read-only mapped
+    /// tempfile. Other key columns remain heap-backed at this stage.
+    /// The serialized key and proving interface are unchanged.
+    #[cfg(feature = "disk-spill")]
+    pub fn map_phase0_to_disk(self, spill_dir: Option<&std::path::Path>) -> io::Result<Self> {
+        let Self {
+            vk,
+            l0,
+            l_last,
+            l_active_row,
+            fixed_values,
+            fixed_cosets,
+            phase0_polys,
+            sigmas,
+            ev,
+            region_starts,
+        } = self;
+        Ok(Self {
+            vk,
+            l0,
+            l_last,
+            l_active_row,
+            fixed_values,
+            fixed_cosets,
+            phase0_polys: phase0_polys.map_to_disk(spill_dir)?,
+            sigmas,
+            ev,
+            region_starts,
+        })
+    }
+
     /// Get the underlying [`VerifyingKey`].
     pub fn get_vk(&self) -> &VerifyingKey<F, CS> {
         &self.vk
