@@ -96,9 +96,9 @@ CI. The earlier 0.8.2 key mapper's forged `Vec` views were not copied into
 
 The opening-query path now carries read-only `PolynomialView` descriptors
 through both KZG and fflonk while preserving `ProverQuery::new` for owned
-callers. The next branch maps the phase-0 coefficient group. The current branch
-also puts `fixed_values` and `sigmas.values` behind owned-or-mapped storage
-and uses typed views for lookup, trash, and permutation reads. Keygen and
+callers. The phase-0 coefficient group, `fixed_values`, and `sigmas.values`
+have owned-or-mapped storage, with typed views for lookup, trash, and
+permutation reads. Keygen and
 `read_with_policy` now honor `ProverConfig::mapped_key()` and
 `mapped_key_and_cosets()`; the ordinary heap policy remains the default.
 The PLONK API test generates and verifies with mapped key columns, checks
@@ -107,13 +107,18 @@ missing mapping directory rejects the key load. The mapped read now reserves
 storage and deserializes fixed and permutation Lagrange columns one at a time
 into read-only mappings. It checks serialized counts and row lengths against
 the verifying key before accepting each batch; a focused test covers the
-round trip, wrong counts and lengths, and truncated input. Phase-0 coefficient
-derivation still materializes the whole group before mapping it, and keygen
-still builds its inputs on the heap. Load-time peak memory is therefore not
-yet bounded by one column. Reservation fault injection, load/proof RSS and
+round trip, wrong counts and lengths, and truncated input. The mapped read
+also transforms each fixed and permutation column to phase-0 coefficient form
+and writes it to a reserved read-only mapping before processing the next
+column. The PLONK API gate verifies byte-identical seeded proofs from the
+generated mapped key, deserialized mapped keys with and without coset spill,
+and a deserialized heap key; it also verifies mapped FFLONK keys. Keygen still
+builds its Lagrange inputs on the heap, and key loading still creates three
+extended-domain Lagrange
+polynomials on the heap. Load-time peak memory is therefore not yet proven
+to be bounded by one column. Reservation fault injection, load/proof RSS and
 disk measurements, released dependency alignment, broader Ledger9 consumer
-gates, and current-head CI
-remain before qualification.
+gates, and current-head CI remain before qualification.
 
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.

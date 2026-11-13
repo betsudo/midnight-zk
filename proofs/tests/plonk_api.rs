@@ -590,6 +590,29 @@ fn plonk_api() {
         )
         .expect("the mapped-key load policy should succeed");
         assert_eq!(loaded_pk.to_bytes(SerdeFormat::Processed), serialized_key);
+        let heap_pk = ProvingKey::<Scalar, Scheme>::read_with_policy::<_, MyCircuit<Scalar>>(
+            &mut &serialized_key[..],
+            SerdeFormat::Processed,
+            #[cfg(feature = "circuit-params")]
+            (),
+            &ProverConfig::process(),
+        )
+        .expect("the heap-key load policy should succeed");
+        assert_eq!(heap_pk.to_bytes(SerdeFormat::Processed), serialized_key);
+        let mapped_only_policy = ProverConfig::mapped_key();
+        let mapped_only_pk =
+            ProvingKey::<Scalar, Scheme>::read_with_policy::<_, MyCircuit<Scalar>>(
+                &mut &serialized_key[..],
+                SerdeFormat::Processed,
+                #[cfg(feature = "circuit-params")]
+                (),
+                &mapped_only_policy,
+            )
+            .expect("the mapped-key policy without coset spill should succeed");
+        assert_eq!(
+            mapped_only_pk.to_bytes(SerdeFormat::Processed),
+            serialized_key
+        );
         let failing_policy = ProverConfig {
             spill_dir: Some("/nonexistent-midnight-spill-dir/for-this-test".into()),
             ..spill_policy.clone()
@@ -611,13 +634,18 @@ fn plonk_api() {
             "an opted-in key mapping failure must be returned to the caller"
         );
         let mut first_proof = None;
-        for (key, policy) in [&spill_pk, &loaded_pk].into_iter().zip([
-            spill_policy.clone(),
-            ProverConfig {
-                spill_dir: Some("/nonexistent-midnight-spill-dir/for-this-test".into()),
-                ..spill_policy
-            },
-        ]) {
+        for (key, policy) in [
+            (&spill_pk, spill_policy.clone()),
+            (
+                &loaded_pk,
+                ProverConfig {
+                    spill_dir: Some("/nonexistent-midnight-spill-dir/for-this-test".into()),
+                    ..spill_policy
+                },
+            ),
+            (&mapped_only_pk, mapped_only_policy),
+            (&heap_pk, ProverConfig::process().clone()),
+        ] {
             let mut transcript = CircuitTranscript::<State>::init();
             create_proof_with(
                 &params,
@@ -696,6 +724,34 @@ fn plonk_api() {
             pk.get_vk(),
             &proof[..],
         );
+
+        #[cfg(feature = "disk-spill")]
+        {
+            use midnight_proofs::{config::ProverConfig, utils::SerdeFormat};
+
+            let serialized = pk.to_bytes(SerdeFormat::Processed);
+            let mapped_pk = ProvingKey::<Scalar, Fflonk<Scheme, LOG2_T_MAX>>::read_with_policy::<
+                _,
+                MyCircuit<Scalar>,
+            >(
+                &mut &serialized[..],
+                SerdeFormat::Processed,
+                #[cfg(feature = "circuit-params")]
+                (),
+                &ProverConfig::mapped_key(),
+            )
+            .expect("FFLONK mapped key should load");
+            assert_eq!(mapped_pk.to_bytes(SerdeFormat::Processed), serialized);
+            let mapped_proof =
+                create_proof::<Scalar, Fflonk<Scheme, LOG2_T_MAX>, CircuitTranscript<State>, _>(
+                    OsRng, &params, &mapped_pk,
+                );
+            verify_proof::<_, _, CircuitTranscript<State>>(
+                &params.verifier_params(),
+                mapped_pk.get_vk(),
+                &mapped_proof,
+            );
+        }
     }
     fflonk_roundtrip::<1>();
     fflonk_roundtrip::<2>();

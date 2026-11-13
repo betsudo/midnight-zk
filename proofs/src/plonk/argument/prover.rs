@@ -195,6 +195,23 @@ impl<F: PrimeField> KeyGroup<F> {
         })
     }
 
+    #[cfg(feature = "disk-spill")]
+    pub(crate) fn from_mapped(
+        labels: Vec<PolynomialLabel>,
+        polys: MmappedPolys<F, Coeff>,
+        vk_repr: F,
+    ) -> Self {
+        assert!(labels.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(labels.len(), polys.len());
+        Self {
+            committed: Committed {
+                labels,
+                polys: CommittedPolys::Mapped(polys),
+            },
+            vk_repr,
+        }
+    }
+
     /// The group of `polys_map`, whose commitment is held by the verifying key
     /// of `transcript_repr` `vk_repr`.
     pub(crate) fn new(

@@ -82,6 +82,10 @@ impl<F, B> std::fmt::Debug for MmappedPolys<F, B> {
 }
 
 impl<F, B> MmappedPolys<F, B> {
+    pub(crate) fn len(&self) -> usize {
+        self.polys.len()
+    }
+
     /// Borrow in the same concrete representation used for owned polynomials.
     pub(crate) fn views(&self) -> Vec<PolynomialView<'_, F, B>> {
         polynomial_views(&self.polys)

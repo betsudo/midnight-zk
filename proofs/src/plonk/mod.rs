@@ -416,6 +416,72 @@ pub(in crate::plonk) fn build_phase0_polys<F: WithSmallOrderMulGroup<3>>(
     )
 }
 
+/// Derive a mapped phase-0 group from already mapped Lagrange columns without
+/// first collecting every coefficient polynomial on the heap. The heap keygen
+/// path above keeps its parallel transforms and existing behavior.
+#[cfg(feature = "disk-spill")]
+#[allow(clippy::type_complexity)]
+pub(in crate::plonk) fn build_phase0_polys_mapped<F: WithSmallOrderMulGroup<3>>(
+    domain: &EvaluationDomain<F>,
+    cs: &ConstraintSystem<F>,
+    vk_repr: F,
+    fixed_values: &KeyPolys<F, LagrangeCoeff>,
+    sigmas: KeyPolys<F, LagrangeCoeff>,
+    policy: &ProverConfig,
+) -> io::Result<(
+    argument::prover::KeyGroup<F>,
+    Vec<Polynomial<F, ExtendedLagrangeCoeff>>,
+    permutation::Sigmas<F>,
+)> {
+    let fixed_views = fixed_values.views();
+    let sigma_views = sigmas.views();
+    let fixed_labels: Vec<_> = (0..fixed_views.len()).map(PolynomialLabel::Fixed).collect();
+    let sigma_labels = cs.permutation.polynomial_labels();
+    assert_eq!(sigma_views.len(), sigma_labels.len());
+
+    let labels = fixed_labels.iter().chain(&sigma_labels).cloned().collect();
+    let coeffs = fixed_views
+        .iter()
+        .chain(&sigma_views)
+        .map(|poly| domain.lagrange_to_coeff(poly.materialise()));
+    let mapped = mmap_pk::spill_iter_to_disk(
+        policy.spill_dir.as_deref(),
+        coeffs,
+        fixed_views.len() + sigma_views.len(),
+        domain.n as usize,
+    )?;
+    let group = argument::prover::KeyGroup::from_mapped(labels, mapped, vk_repr);
+
+    let cache_cosets = !policy.spills_cosets_at(domain.k());
+    let fixed_cosets = if cache_cosets {
+        group
+            .views_of(&fixed_labels)
+            .into_iter()
+            .map(|poly| domain.coeff_to_extended(poly.materialise()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let sigma_cosets = if cache_cosets {
+        group
+            .views_of(&sigma_labels)
+            .into_iter()
+            .map(|poly| domain.coeff_to_extended(poly.materialise()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok((
+        group,
+        fixed_cosets,
+        permutation::Sigmas {
+            values: sigmas,
+            cosets: sigma_cosets,
+        },
+    ))
+}
+
 impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// Move the phase-0 coefficient polynomials into a read-only mapped
     /// tempfile. Other key columns remain heap-backed at this stage.
@@ -611,6 +677,27 @@ where
                 ),
             ));
         }
+        #[cfg(feature = "disk-spill")]
+        let (phase0_polys, fixed_cosets, sigmas) = if policy.map_prover_key {
+            build_phase0_polys_mapped(
+                &vk.domain,
+                &vk.cs,
+                vk.transcript_repr,
+                &fixed_values,
+                permutations,
+                policy,
+            )?
+        } else {
+            build_phase0_polys(
+                &vk.domain,
+                &vk.cs,
+                vk.transcript_repr,
+                &fixed_values,
+                permutations,
+                policy,
+            )
+        };
+        #[cfg(not(feature = "disk-spill"))]
         let (phase0_polys, fixed_cosets, sigmas) = build_phase0_polys(
             &vk.domain,
             &vk.cs,
