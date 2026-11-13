@@ -55,7 +55,7 @@ jobs:
   test-circuits:
     if: github.event.pull_request.draft == false
     name: Test circuits
-    runs-on: ubuntu-latest-16-core-x64
+    runs-on: ${{ vars.LARGE_RUNNER || 'ubuntu-latest' }}
 
     env:
       RUST_BACKTRACE: full
@@ -75,7 +75,7 @@ jobs:
     needs: download-srs
     if: github.event.pull_request.draft == false
     name: Test zk-stdlib
-    runs-on: ubuntu-latest-16-core-x64
+    runs-on: ${{ vars.LARGE_RUNNER || 'ubuntu-latest' }}
 
     env:
       RUST_BACKTRACE: full
