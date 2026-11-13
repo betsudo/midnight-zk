@@ -1854,8 +1854,7 @@ dependencies = [
 
 [[package]]
 name = "sha3-circuit"
-version = "0.1.0"
-source = "git+https://github.com/alexandroszacharakis8/sha3-circuit?rev=1a3ef7d#1a3ef7d2ce603a26081f428fa74b4a631e243f25"
+version = "0.1.1"
 dependencies = [
  "blake2b_simd",
  "ff",
