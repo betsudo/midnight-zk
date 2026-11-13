@@ -268,8 +268,9 @@ where
     )?;
 
     let mut fixed = batch_invert_rational(assembly.fixed);
-    // After this, the ConstraintSystem should not have any selectors: `verify` does
-    // not need them, and `keygen_pk` regenerates `cs` from scratch anyways.
+    // After this, the ConstraintSystem should not have any selectors: `verify`
+    // does not need them, and `keygen_pk` regenerates `cs` from scratch
+    // anyways.
     let selectors = std::mem::take(&mut assembly.selectors);
     let (cs, selector_polys) = cs.directly_convert_selectors_to_fixed(selectors);
     fixed.extend(selector_polys.into_iter().map(|poly| domain.lagrange_from_vec(poly)));
@@ -295,9 +296,10 @@ where
     keygen_pk_with(vk, circuit, ProverConfig::process())
 }
 
-/// Generate a proving key with a policy for its cached extended cosets.
-/// When spilling is enabled for this circuit size, the key keeps phase-0
-/// coefficients and omits the large extended-domain caches.
+/// Generate a proving key with explicit key storage and coset policies.
+/// When spilling is enabled for this circuit size, the key omits the large
+/// extended-domain caches. Opting into key mapping returns a storage error if
+/// the temporary files cannot be reserved.
 pub fn keygen_pk_with<F, CS, ConcreteCircuit>(
     vk: VerifyingKey<F, CS>,
     circuit: &ConcreteCircuit,
@@ -352,18 +354,28 @@ where
     let [l0, l_last, l_active_row] = compute_lagrange_polys(&vk, &cs);
     // Compute the optimized evaluation data structure
     let ev = Evaluator::new(&vk.cs);
-    Ok(ProvingKey {
+    let pk = ProvingKey {
         vk,
         l0,
         l_last,
         l_active_row,
-        fixed_values: fixed,
+        fixed_values: super::key_storage::KeyPolys::Owned(fixed),
         fixed_cosets,
         phase0_polys,
         sigmas,
         ev,
         region_starts,
-    })
+    };
+    if policy.map_prover_key {
+        #[cfg(feature = "disk-spill")]
+        return pk.map_key_to_disk(policy.spill_dir.as_deref()).map_err(Error::KeyStorage);
+        #[cfg(not(feature = "disk-spill"))]
+        return Err(Error::KeyStorage(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "mapped proving keys require the disk-spill feature",
+        )));
+    }
+    Ok(pk)
 }
 
 pub(crate) fn compute_lagrange_polys<F, CS>(

@@ -103,6 +103,7 @@ where
     let phase0_committed = pk.phase0_polys.committed(&vk_absorbed);
 
     let domain = &pk.vk.domain;
+    let fixed_views = pk.fixed_values.views();
 
     let instance = compute_instances(params, pk, instances, nb_committed_instances, transcript)?;
 
@@ -137,7 +138,7 @@ where
                     argument_index,
                     pk,
                     &advice_polys,
-                    &pk.fixed_values,
+                    &fixed_views,
                     &instance.instance_values,
                     blinds,
                 )
@@ -194,10 +195,10 @@ where
         BTreeMap::new();
 
     checkpoint(context, "trace.permutation")?;
-    let perm_z_polys = pk.vk.cs.permutation.compute_z_polys::<F, CS>(
+    let perm_z_polys = pk.vk.cs.permutation.compute_z_polys::<F, CS, _>(
         pk,
         phase1_committed.polys_of(&advice_labels),
-        &pk.fixed_values,
+        &fixed_views,
         &instance.instance_values,
         beta,
         gamma,
@@ -257,7 +258,7 @@ where
             domain,
             trash_challenge,
             phase1_committed.polys_of(&advice_labels),
-            &pk.fixed_values,
+            &fixed_views,
             &instance.instance_values,
         );
 
@@ -332,8 +333,8 @@ where
     checkpoint(context, "finalise.nu")?;
     let nu_poly = compute_nu_poly(pk, &trace, &context.config);
 
-    // Construct the quotient polynomial h(X) = nu(X)/(X^n-1), split it into limbs,
-    // and commit to the limbs as one group
+    // Construct the quotient polynomial h(X) = nu(X)/(X^n-1), split it into
+    // limbs, and commit to the limbs as one group
     checkpoint(context, "finalise.quotient")?;
     let quotient_committed =
         compute_h_poly::<F, CS, T>(params, pk.get_vk().get_domain(), nu_poly, transcript)?;
@@ -493,7 +494,8 @@ where
     )
 }
 
-/// Create a proof under an explicit memory policy and request-owned cancellation token.
+/// Create a proof under an explicit memory policy and request-owned
+/// cancellation token.
 ///
 /// The policy-only [`create_proof_with`] and original [`create_proof`] entry
 /// points retain their signatures. Cancellation is checked between the main
@@ -1083,7 +1085,7 @@ fn test_create_proof() {
         .expect("keygen_vk should not fail");
     let pk = keygen_pk(vk, &MyCircuit).expect("keygen_pk should not fail");
     #[cfg(feature = "disk-spill")]
-    let pk = pk.map_phase0_to_disk(None).expect("empty phase-0 key may stay on the heap");
+    let pk = pk.map_key_to_disk(None).expect("empty key columns may stay on the heap");
     let mut transcript = CircuitTranscript::<_>::init();
 
     // Create proof with wrong number of instances (extra column).

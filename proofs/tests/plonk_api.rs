@@ -568,7 +568,7 @@ fn plonk_api() {
             a: Value::known(a),
             lookup_table,
         };
-        let mut spill_policy = ProverConfig::spilled();
+        let mut spill_policy = ProverConfig::mapped_key_and_cosets();
         spill_policy.coset_spill_floor_k = 0;
         let empty_circuit = MyCircuit {
             a: Value::unknown(),
@@ -584,24 +584,26 @@ fn plonk_api() {
             (),
             &spill_policy,
         )
-        .unwrap()
-        .map_phase0_to_disk(None)
-        .expect("phase-0 key mapping should succeed");
+        .expect("the mapped-key load policy should succeed");
         assert_eq!(loaded_pk.to_bytes(SerdeFormat::Processed), serialized_key);
-        let failing_pk = ProvingKey::<Scalar, Scheme>::read_with_policy::<_, MyCircuit<Scalar>>(
-            &mut &serialized_key[..],
-            SerdeFormat::Processed,
-            #[cfg(feature = "circuit-params")]
-            (),
-            &spill_policy,
-        )
-        .unwrap();
+        let failing_policy = ProverConfig {
+            spill_dir: Some("/nonexistent-midnight-spill-dir/for-this-test".into()),
+            ..spill_policy.clone()
+        };
+        let failing_vk = keygen_vk::<Scalar, Scheme, _>(&mut params, &empty_circuit).unwrap();
+        assert_matches!(
+            keygen_pk_with(failing_vk, &empty_circuit, &failing_policy),
+            Err(Error::KeyStorage(_))
+        );
         assert!(
-            failing_pk
-                .map_phase0_to_disk(Some(std::path::Path::new(
-                    "/nonexistent-midnight-spill-dir/for-this-test",
-                )))
-                .is_err(),
+            ProvingKey::<Scalar, Scheme>::read_with_policy::<_, MyCircuit<Scalar>>(
+                &mut &serialized_key[..],
+                SerdeFormat::Processed,
+                #[cfg(feature = "circuit-params")]
+                (),
+                &failing_policy,
+            )
+            .is_err(),
             "an opted-in key mapping failure must be returned to the caller"
         );
         for (key, policy) in [&spill_pk, &loaded_pk].into_iter().zip([
@@ -630,6 +632,17 @@ fn plonk_api() {
                 key.get_vk(),
                 &proof,
             );
+            let wrong_inputs = [instance + Scalar::ONE];
+            let mut wrong_transcript = CircuitTranscript::<State>::init_from_bytes(&proof);
+            if let Ok(verifier) = prepare_plonk_proof(
+                key.get_vk(),
+                #[cfg(feature = "committed-instances")]
+                &[],
+                &[&wrong_inputs],
+                &mut wrong_transcript,
+            ) {
+                assert!(verifier.verify(&params.verifier_params()).is_err());
+            }
         }
     }
 

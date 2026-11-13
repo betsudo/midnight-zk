@@ -90,6 +90,7 @@ where
     let phase0_committed = pk.phase0_polys.committed(&vk_absorbed);
 
     let domain = &pk.vk.domain;
+    let fixed_views = pk.fixed_values.views();
 
     let instance = {
         let instances_clone = instances.to_vec();
@@ -150,7 +151,7 @@ where
                         argument_index,
                         pk,
                         advice_polys,
-                        &pk.fixed_values,
+                        &fixed_views,
                         instance_values,
                         blinds,
                     )
@@ -242,10 +243,10 @@ where
 
     // Compute the permutation accumulators.
     let compute_perm_z_polys = |perm_blindings: Vec<Vec<F>>| {
-        pk.vk.cs.permutation.compute_z_polys::<F, CS>(
+        pk.vk.cs.permutation.compute_z_polys::<F, CS, _>(
             pk,
             phase1_committed.polys_of(&advice_labels),
-            &pk.fixed_values,
+            &fixed_views,
             &instance.instance_values,
             beta,
             gamma,
@@ -270,8 +271,9 @@ where
         .collect();
 
     // Construct the lookup product polynomials. `compute_logderivative` returns
-    // the helper polynomials and the aggregator without touching the transcript;
-    // they are committed further below, as part of the phase2 argument group.
+    // the helper polynomials and the aggregator without touching the
+    // transcript; they are committed further below, as part of the phase2
+    // argument group.
     let logup_phase2_polys = |multiplicities: Vec<logup::prover::ComputedMultiplicities<F>>,
                               blindings: Vec<Vec<F>>|
      -> Result<Vec<PhaseGroupPolys<F>>, Error> {
@@ -351,7 +353,7 @@ where
                 domain,
                 trash_challenge,
                 advice_polys,
-                &pk.fixed_values,
+                &fixed_views,
                 instance_values,
             );
 
@@ -542,7 +544,8 @@ where
     });
     let phase0_evaluated = phase0_committed.evaluate(cs, &x_rotations, transcript)?;
 
-    // Evaluate the phase1 and phase2 arguments, if any, at their opening points.
+    // Evaluate the phase1 and phase2 arguments, if any, at their opening
+    // points.
     let phase1_evaluated = phase1_committed.evaluate(cs, &x_rotations, transcript)?;
     let phase2_evaluated = phase2_committed.evaluate(cs, &x_rotations, transcript)?;
     let mut quotient_evaluated = quotient_committed.evaluate(cs, &x_rotations, transcript)?;

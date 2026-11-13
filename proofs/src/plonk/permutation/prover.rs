@@ -7,7 +7,7 @@ use rayon::iter::{
 use super::{super::circuit::Any, Argument};
 use crate::{
     plonk,
-    poly::{LagrangeCoeff, Polynomial, commitment::PolynomialCommitmentScheme},
+    poly::{LagrangeCoeff, Polynomial, PolynomialRead, commitment::PolynomialCommitmentScheme},
     utils::arithmetic::parallelize,
 };
 
@@ -19,11 +19,12 @@ impl Argument {
     pub(crate) fn compute_z_polys<
         F: WithSmallOrderMulGroup<3>,
         CS: PolynomialCommitmentScheme<F>,
+        P: PolynomialRead<F, Basis = LagrangeCoeff> + Sync,
     >(
         &self,
         pk: &plonk::ProvingKey<F, CS>,
         advice: &[Polynomial<F, LagrangeCoeff>],
-        fixed: &[Polynomial<F, LagrangeCoeff>],
+        fixed: &[P],
         instance: &[Polynomial<F, LagrangeCoeff>],
         beta: F,
         gamma: F,
@@ -41,14 +42,17 @@ impl Argument {
         let chunk_len = pk.vk.cs_degree - 2;
         let blinding_factors = pk.vk.cs.blinding_factors();
 
-        let col_values = |column: &plonk::Column<Any>| match column.column_type() {
-            Any::Advice => advice,
-            Any::Fixed => fixed,
-            Any::Instance => instance,
+        let col_values = |column: &plonk::Column<Any>| -> &[F] {
+            match column.column_type() {
+                Any::Advice => &advice[column.index()],
+                Any::Fixed => fixed[column.index()].values(),
+                Any::Instance => &instance[column.index()],
+            }
         };
 
+        let sigma_views = pk.sigmas.values.views();
         let column_chunks: Vec<_> =
-            self.columns.chunks(chunk_len).zip(pk.sigmas.values.chunks(chunk_len)).collect();
+            self.columns.chunks(chunk_len).zip(sigma_views.chunks(chunk_len)).collect();
         let num_sets = column_chunks.len();
 
         assert_eq!(all_blindings.len(), num_sets);
@@ -72,7 +76,7 @@ impl Argument {
                     parallelize(&mut modified_values, |mv, start| {
                         for ((mv, value), pv) in mv
                             .iter_mut()
-                            .zip(values[column.index()][start..].iter())
+                            .zip(values[start..].iter())
                             .zip(permuted_column_values[start..].iter())
                         {
                             *mv *= &(beta * pv + &gamma + value);
@@ -90,8 +94,7 @@ impl Argument {
                     let values = col_values(&column);
                     parallelize(&mut modified_values, |mv, start| {
                         let mut dw = deltaomega * &omega.pow_vartime([start as u64, 0, 0, 0]);
-                        for (mv, value) in mv.iter_mut().zip(values[column.index()][start..].iter())
-                        {
+                        for (mv, value) in mv.iter_mut().zip(values[start..].iter()) {
                             *mv *= &(dw * &beta + &gamma + value);
                             dw *= &omega;
                         }
@@ -141,9 +144,9 @@ impl Argument {
             })
             .collect();
 
-        // Step B: Sequential prefix product over the S uncorrected_last_z values.
-        // This step accumulates the partial corrections to compute the actual
-        // corrections needed for each chunk.
+        // Step B: Sequential prefix product over the S uncorrected_last_z
+        // values. This step accumulates the partial corrections to
+        // compute the actual corrections needed for each chunk.
         // correction[0] = 1 (first set starts at 1).
         // correction[s] = ∏_{k<s} uncorrected_last_z[k].
         let mut corrections = Vec::with_capacity(num_sets);

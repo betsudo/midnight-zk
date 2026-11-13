@@ -17,10 +17,7 @@ use crate::{
     transcript::{Hashable, Transcript},
     utils::{
         SerdeFormat,
-        helpers::{
-            ProcessedSerdeObject, polynomial_slice_byte_length, read_polynomial_vec,
-            write_polynomial_slice,
-        },
+        helpers::{ProcessedSerdeObject, read_polynomial_vec},
     },
 };
 
@@ -30,6 +27,7 @@ mod circuit;
 mod cosets;
 mod error;
 pub(crate) mod evaluation;
+mod key_storage;
 mod keygen;
 pub(crate) mod logup;
 #[cfg(feature = "disk-spill")]
@@ -51,6 +49,7 @@ pub use circuit::*;
 pub use error::*;
 pub(crate) use evaluation::Evaluator;
 use ff::{PrimeField, WithSmallOrderMulGroup};
+use key_storage::KeyPolys;
 pub use keygen::*;
 use midnight_curves::serde::SerdeObject;
 pub use prover::*;
@@ -265,9 +264,9 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>> VerifyingK
             .write(&mut buffer, SerdeFormat::RawBytesUnchecked)
             .expect("Failed to write to buffer - this is a bug.");
 
-        // We use the debug implementation to add the gates and domain to the hashed
-        // buffer. We should eventually move away from debug implementation for
-        // this purpose. See https://github.com/midnightntwrk/halo2/issues/5
+        // We use the debug implementation to add the gates and domain to the
+        // hashed buffer. We should eventually move away from debug
+        // implementation for this purpose. See https://github.com/midnightntwrk/halo2/issues/5
         buffer.extend_from_slice(format!("{:?}", vk.get_domain().pinned()).as_bytes());
         buffer.extend_from_slice(format!("{:?}", vk.cs().pinned()).as_bytes());
 
@@ -332,7 +331,7 @@ pub struct ProvingKey<F: PrimeField, CS: PolynomialCommitmentScheme<F>> {
     pub(crate) l0: Polynomial<F, ExtendedLagrangeCoeff>,
     pub(crate) l_last: Polynomial<F, ExtendedLagrangeCoeff>,
     pub(crate) l_active_row: Polynomial<F, ExtendedLagrangeCoeff>,
-    pub(crate) fixed_values: Vec<Polynomial<F, LagrangeCoeff>>,
+    pub(crate) fixed_values: KeyPolys<F, LagrangeCoeff>,
     pub(crate) fixed_cosets: Vec<Polynomial<F, ExtendedLagrangeCoeff>>,
     pub(crate) phase0_polys: argument::prover::KeyGroup<F>,
     pub(crate) sigmas: permutation::Sigmas<F>,
@@ -409,16 +408,13 @@ pub(in crate::plonk) fn build_phase0_polys<F: WithSmallOrderMulGroup<3>>(
         argument::prover::KeyGroup::new(group, vk_repr),
         fixed_cosets,
         permutation::Sigmas {
-            values: sigmas,
+            values: KeyPolys::Owned(sigmas),
             cosets: sigma_cosets,
         },
     )
 }
 
-impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS>
-where
-    F: FromUniformBytes<64>,
-{
+impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// Move the phase-0 coefficient polynomials into a read-only mapped
     /// tempfile. Other key columns remain heap-backed at this stage.
     /// The serialized key and proving interface are unchanged.
@@ -450,6 +446,41 @@ where
         })
     }
 
+    /// Move the phase-0, fixed, and permutation key columns into separate
+    /// read-only mapped tempfiles. A failure returns an error instead of an
+    /// apparently mapped key that still owns some columns.
+    #[cfg(feature = "disk-spill")]
+    pub fn map_key_to_disk(self, spill_dir: Option<&std::path::Path>) -> io::Result<Self> {
+        let Self {
+            vk,
+            l0,
+            l_last,
+            l_active_row,
+            fixed_values,
+            fixed_cosets,
+            phase0_polys,
+            sigmas,
+            ev,
+            region_starts,
+        } = self;
+        let permutation::Sigmas { values, cosets } = sigmas;
+        let phase0_polys = phase0_polys.map_to_disk(spill_dir)?;
+        let fixed_values = fixed_values.map_to_disk(spill_dir)?;
+        let values = values.map_to_disk(spill_dir)?;
+        Ok(Self {
+            vk,
+            l0,
+            l_last,
+            l_active_row,
+            fixed_values,
+            fixed_cosets,
+            phase0_polys,
+            sigmas: permutation::Sigmas { values, cosets },
+            ev,
+            region_starts,
+        })
+    }
+
     /// Get the underlying [`VerifyingKey`].
     pub fn get_vk(&self) -> &VerifyingKey<F, CS> {
         &self.vk
@@ -460,8 +491,8 @@ where
         // `l0`, `l_last`, `l_active_row`, the fixed polynomials and their
         // cosets are not written: [`Self::read`] recomputes them.
         self.vk.bytes_length(format)
-            + polynomial_slice_byte_length(&self.fixed_values)
-            + polynomial_slice_byte_length(&self.sigmas.values)
+            + self.fixed_values.bytes_length()
+            + self.sigmas.values.bytes_length()
     }
 }
 
@@ -482,10 +513,10 @@ where
     ///   serializing the rest of the data (in the form of field polynomials)
     pub fn write<W: io::Write>(&self, writer: &mut W, format: SerdeFormat) -> io::Result<()> {
         self.vk.write(writer, format)?;
-        write_polynomial_slice(&self.fixed_values, writer)?;
+        self.fixed_values.write(writer)?;
         // Only the Lagrange form is written: [`Self::read`] derives the
         // coefficient form and the cosets from it.
-        write_polynomial_slice(&self.sigmas.values, writer)?;
+        self.sigmas.values.write(writer)?;
         Ok(())
     }
 
@@ -518,7 +549,7 @@ where
         )
     }
 
-    /// Read a proving key while selecting whether to cache extended cosets.
+    /// Read a proving key with explicit key storage and coset policies.
     /// The serialized key format is identical to [`Self::read`].
     pub fn read_with_policy<R: io::Read, ConcreteCircuit: Circuit<F>>(
         reader: &mut R,
@@ -554,12 +585,12 @@ where
             policy,
         );
         let ev = Evaluator::new(vk.cs());
-        Ok(Self {
+        let pk = Self {
             vk,
             l0,
             l_last,
             l_active_row,
-            fixed_values,
+            fixed_values: KeyPolys::Owned(fixed_values),
             fixed_cosets,
             phase0_polys,
             sigmas,
@@ -569,7 +600,17 @@ where
             // proofs from the same in-memory key still pay that cost unless
             // the caller caches the layout externally.
             region_starts: None,
-        })
+        };
+        if policy.map_prover_key {
+            #[cfg(feature = "disk-spill")]
+            return pk.map_key_to_disk(policy.spill_dir.as_deref());
+            #[cfg(not(feature = "disk-spill"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "mapped proving keys require the disk-spill feature",
+            ));
+        }
+        Ok(pk)
     }
 
     /// Writes a proving key to a vector of bytes using [`Self::write`].

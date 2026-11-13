@@ -8,7 +8,7 @@ use crate::{
     plonk::{Any, argument, cosets::build_cosets, logup},
     poly::{
         Coeff, EvaluationDomain, ExtendedLagrangeCoeff as B, Polynomial, PolynomialLabel,
-        PolynomialRepresentation, PolynomialView, Rotation,
+        PolynomialRead, PolynomialRepresentation, PolynomialView, Rotation,
     },
     utils::arithmetic::parallelize,
 };
@@ -386,12 +386,15 @@ impl<F: PrimeField> GraphEvaluator<F> {
                     c: 0,
                 }),
                 Calculation::Store(v) => {
-                    // Store is a copy from a column/constant/etc into an intermediate.
-                    // In the flattened format, the column read is pre-loaded, so this
+                    // Store is a copy from a column/constant/etc into an
+                    // intermediate. In the flattened
+                    // format, the column read is pre-loaded, so this
                     // is just a copy: dst = src.
                     let src = resolve(v);
-                    // Optimization: if dst == src, skip the copy. Otherwise emit Add with 0.
-                    // NOTE: This is relying in the first constant being  0, should be reviewed.
+                    // Optimization: if dst == src, skip the copy. Otherwise
+                    // emit Add with 0. NOTE: This is
+                    // relying in the first constant being  0, should be
+                    // reviewed.
                     if dst != src {
                         ops.push(FlatOp {
                             kind: FlatOpKind::Add,
@@ -701,7 +704,8 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
                 .map(|chunk| {
                     let mut graph = GraphEvaluator::default();
 
-                    // Each input expression gets compressed with θ and shifted by β
+                    // Each input expression gets compressed with θ and shifted
+                    // by β
                     let compressed_inputs_cosets: Vec<_> = chunk
                         .iter()
                         .map(|expressions| {
@@ -1119,13 +1123,15 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
                         let sum_partial_products = bufs[fi][spp_idx];
                         let product = bufs[fi][prod_idx];
 
-                        // We only resolve the table and selector in the first batch
+                        // We only resolve the table and selector in the first
+                        // batch
                         if fi == 0 {
                             table_value = bufs[fi][tbl_idx];
                             selector = bufs[fi][sel_idx];
                         }
 
-                        // Helper constraint: h(X) · ∏ⱼ(fⱼ(X) + β) = Σⱼ ∏_{k≠j}(fₖ(X) + β)
+                        // Helper constraint: h(X) · ∏ⱼ(fⱼ(X) + β) = Σⱼ
+                        // ∏_{k≠j}(fₖ(X) + β)
                         *value =
                             *value * y + helper_cosets[fi][idx] * product - sum_partial_products;
 
@@ -1327,11 +1333,11 @@ impl<F: PrimeField> GraphEvaluator<F> {
 }
 
 /// Simple evaluation of an expression
-pub fn evaluate<F: Field, B: PolynomialRepresentation>(
+pub fn evaluate<F: Field, B: PolynomialRepresentation, P: PolynomialRead<F, Basis = B> + Sync>(
     expression: &Expression<F>,
     size: usize,
     log_scale: u32,
-    fixed: &[Polynomial<F, B>],
+    fixed: &[P],
     advice: &[Polynomial<F, B>],
     instance: &[Polynomial<F, B>],
 ) -> Vec<F> {
@@ -1344,7 +1350,7 @@ pub fn evaluate<F: Field, B: PolynomialRepresentation>(
                 &|scalar| scalar,
                 &|_| panic!("virtual selectors are removed during optimization"),
                 &|query| {
-                    fixed[query.column_index]
+                    fixed[query.column_index].values()
                         [get_rotation_idx(idx, query.rotation.0, log_scale, log_n)]
                 },
                 &|query| {
@@ -1444,7 +1450,8 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
 
         let log_n = n.trailing_zeros();
-        // Log scaling factor for the extended domain. No extended domain log 1 = 0.
+        // Log scaling factor for the extended domain. No extended domain log 1
+        // = 0.
         let log_scale = 0u32;
 
         let fixed: Vec<_> = (0..3).map(|_| rand_poly(&mut rng, n)).collect();
@@ -1572,8 +1579,8 @@ mod tests {
         // Constant as a Calculation operand.
         let with_const = g.add_calculation(Calculation::Add(neg, ValueSource::Constant(2)));
 
-        // Horner calculation to compute linear combination on challenge Y of previous
-        // calculations.
+        // Horner calculation to compute linear combination on challenge Y of
+        // previous calculations.
         g.add_calculation(Calculation::Horner(
             ValueSource::PreviousValue(),
             vec![sq, dbl, neg, wc, with_const],

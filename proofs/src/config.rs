@@ -17,6 +17,9 @@ pub const DEFAULT_COSET_SPILL_FLOOR_K: u32 = 18;
 /// different storage and spill directories without changing process state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProverConfig {
+    /// Keep proving-key columns in read-only mapped tempfiles after keygen or
+    /// load.
+    pub map_prover_key: bool,
     /// Spill extended-domain cosets to unnamed, mapped temporary files.
     pub spill_cosets: bool,
     /// Minimum circuit `k` at which spilling is enabled.
@@ -35,6 +38,7 @@ impl ProverConfig {
     /// Use the original heap-backed proving path.
     pub const fn heap() -> Self {
         Self {
+            map_prover_key: false,
             spill_cosets: false,
             coset_spill_floor_k: DEFAULT_COSET_SPILL_FLOOR_K,
             spill_dir: None,
@@ -49,6 +53,22 @@ impl ProverConfig {
         }
     }
 
+    /// Map the proving key while retaining ordinary heap-backed cosets.
+    pub fn mapped_key() -> Self {
+        Self {
+            map_prover_key: true,
+            ..Self::heap()
+        }
+    }
+
+    /// Map the proving key and spill large extended-domain cosets.
+    pub fn mapped_key_and_cosets() -> Self {
+        Self {
+            spill_cosets: true,
+            ..Self::mapped_key()
+        }
+    }
+
     /// Whether the policy asks for coset spilling at `k`.
     pub const fn spills_cosets_at(&self, k: u32) -> bool {
         self.spill_cosets && k >= self.coset_spill_floor_k
@@ -59,6 +79,10 @@ impl ProverConfig {
     pub fn process() -> &'static Self {
         static PROCESS: OnceLock<ProverConfig> = OnceLock::new();
         PROCESS.get_or_init(|| Self {
+            map_prover_key: matches!(
+                std::env::var("MIDNIGHT_MAP_PK").as_deref(),
+                Ok("1") | Ok("true")
+            ),
             spill_cosets: matches!(
                 std::env::var("MIDNIGHT_SPILL_COSETS").as_deref(),
                 Ok("1") | Ok("true")
@@ -74,7 +98,8 @@ impl ProverConfig {
     }
 }
 
-/// A cancellation request shared only by the caller and proofs holding its clones.
+/// A cancellation request shared only by the caller and proofs holding its
+/// clones.
 #[derive(Clone, Debug, Default)]
 pub struct CancelToken(Arc<AtomicBool>);
 
@@ -134,5 +159,14 @@ mod tests {
         assert!(!ProverConfig::heap().spills_cosets_at(20));
         assert!(!ProverConfig::spilled().spills_cosets_at(17));
         assert!(ProverConfig::spilled().spills_cosets_at(18));
+    }
+
+    #[test]
+    fn mapped_key_profiles_are_explicit() {
+        assert!(!ProverConfig::heap().map_prover_key);
+        assert!(ProverConfig::mapped_key().map_prover_key);
+        assert!(!ProverConfig::mapped_key().spill_cosets);
+        assert!(ProverConfig::mapped_key_and_cosets().map_prover_key);
+        assert!(ProverConfig::mapped_key_and_cosets().spill_cosets);
     }
 }

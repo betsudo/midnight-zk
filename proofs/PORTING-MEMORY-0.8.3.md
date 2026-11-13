@@ -81,27 +81,24 @@ zkir3_mapped_params zkir3_heap_and_mapped_params_produce_the_same_valid_proof`.
 
 Ledger9 branch `sync/ledger9-proofs-083-v2-compat` subsequently fixed the
 in-tree v2 API break and passed three fixture-free v2 proofs plus an opt-in v3
-HTTP proof with forced coset spill. The broader server test still cannot
-compile because 0.8.3 has no mapped proving-key policy. In 0.8.3,
-`ProvingKey` owns `fixed_values`, `sigmas.values`, and the phase-0 coefficient
-group as separate polynomial collections. The existing `mmap_pk::MmappedPolys`
-provides checked read-only views over an unnamed mapping for proof-time
-cosets, but no key field uses it. The earlier 0.8.2 key mapper's forged `Vec`
-views must not be copied into this layout.
+HTTP proof with forced coset spill. That run preceded the local mapped-key
+port, so the broader server test must be retried against the new branch. The
+earlier 0.8.2 key mapper's forged `Vec` views were not copied into 0.8.3.
 
 The opening-query path now carries read-only `PolynomialView` descriptors
 through both KZG and fflonk while preserving `ProverQuery::new` for owned
-callers. The next local branch maps the phase-0 coefficient group through
-`map_phase0_to_disk`; the PLONK API test proves and verifies with that group
-mapped, checks identical key serialization, and rejects a missing spill
-directory. This is an explicit phase-0 operation, not the complete mapped-key
-policy. `fixed_values` and `sigmas.values` still own their Lagrange columns.
-The remaining port must move those two collections behind owned-or-mapped
-storage, adapt serialization and permutation reads to views, and choose the
-policy before building derived cosets. An opted-in mapping failure must reject
-the load so no partially converted key or silent heap result is reported.
-Check a wrong statement, inject reservation failures, and measure load/proof
-peak memory and disk bytes before claiming the 0.8.3 key policy is qualified.
+callers. The next branch maps the phase-0 coefficient group. The current branch
+also puts `fixed_values` and `sigmas.values` behind owned-or-mapped storage
+and uses typed views for lookup, trash, and permutation reads. Keygen and
+`read_with_policy` now honor `ProverConfig::mapped_key()` and
+`mapped_key_and_cosets()`; the ordinary heap policy remains the default.
+The PLONK API test generates and verifies with mapped key columns, checks
+identical serialization, rejects a wrong public statement, and checks that a
+missing mapping directory rejects the key load. This port still deserializes
+all Lagrange columns and builds the phase-0 group before moving them into
+mapped storage, so load-time peak memory is not yet bounded by one column.
+Reservation fault injection, load/proof RSS and disk measurements, the Ledger9
+consumer gate, and current-head CI remain before qualification.
 
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.

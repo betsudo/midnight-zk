@@ -21,6 +21,8 @@ pub enum Error {
     DuplicatedLabel,
     /// Transcript error
     Transcript(io::Error),
+    /// An opted-in proving-key mapping failed.
+    KeyStorage(io::Error),
     /// `k` is too small for the given circuit.
     NotEnoughRowsAvailable {
         /// The current value of `k` being used.
@@ -75,6 +77,7 @@ impl fmt::Display for Error {
             Error::Opening => write!(f, "Multi-opening proof was invalid"),
             Error::DuplicatedLabel => write!(f, "A polynomial label is duplicated"),
             Error::Transcript(e) => write!(f, "Transcript error: {e}"),
+            Error::KeyStorage(e) => write!(f, "Proving-key storage error: {e}"),
             Error::NotEnoughRowsAvailable { current_k } => write!(
                 f,
                 "k = {current_k} is too small for the given circuit. Try using a larger value of k",
@@ -108,6 +111,7 @@ impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Error::Transcript(e) => Some(e),
+            Error::KeyStorage(e) => Some(e),
             _ => None,
         }
     }
