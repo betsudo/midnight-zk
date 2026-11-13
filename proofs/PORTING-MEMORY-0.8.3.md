@@ -22,6 +22,41 @@ Upstream's [proofs changelog](CHANGELOG.md) says #513 changed the challenge and 
 
 ## Implementation sequence and acceptance gates
 
+### Local package release boundary
+
+The source-patched 0.8.3 adapter tests are not a package-resolution gate.
+At the current local heads, `midnight-proofs` is 0.8.3, while unchanged
+`midnight-circuits` 7.3.0 still accepts proofs from 0.8.0 and modified
+`midnight-zk-stdlib` 2.4.0 also accepts proofs from 0.8.0. The Ledger9
+`midnight-transient-crypto` adapter remains 3.1.0 with a proofs `^0.8.2`
+floor in both its common and native feature tables. The external
+`midnight-zkir` adapter remains 3.2.1 with proofs `^0.8.1` and transient
+crypto `3.0.0` floors; its Wasm package remains 3.2.1 with the same transient
+crypto floor. These declarations do not require the context APIs and new key
+format that the local adapter source uses. Temporary path patches have been
+selecting the local code instead of proving that a registry graph resolves.
+
+For a future release candidate, publish or otherwise make resolvable the
+compatible ZK dependencies first, then transient crypto, then ZKIR and its
+Wasm consumer, and only then select the new graph in Ledger9. At minimum the
+consumer manifests must require proofs 0.8.3, the first stdlib release that
+contains `prove_with_context`, and the first transient-crypto release that
+contains its 0.8.3 context and parameter adapter. ZKIR must require that
+transient-crypto release and the matching proofs/stdlib floors. Circuits has
+no local source changes on this branch; keep its existing version unless a
+separate change warrants a release. Assign fresh stdlib, transient-crypto,
+and ZKIR versions when their release candidates are actually prepared;
+do not silently republish changed source under 2.4.0, 3.1.0, or 3.2.1.
+
+The release gate must resolve the graph without local `[patch]` sections or
+Git-source overrides, inspect `cargo tree -d` for duplicate proof crates,
+and compile native proof-server and browser Wasm with the intended host-only
+feature split. It must also exercise the cross-version key rejection and
+the Compact v3 heap/mapped/forced-spill proof paths at those exact package
+sources. The released Ledger9 line remains on its separately qualified 0.8.2
+pin until these gates and current-head CI pass. Betsudo Ledger issue #30
+already owns the v2/v3 consumer acceptance gate.
+
 ### Local implementation status
 
 The `sync/proofs-0.8.3-memory` code branch begins with lazy materialization of the two derived affine bases (`LagrangeDelta` and `LagrangeDoubleDelta`). `ParamsKZG` now builds them on first use, while parameter generation, deserialization, and downsizing keep both caches empty. This avoids allocating those two full-size bases during an ordinary parameter read that does not use them. The serialized parameter format and commitment values are unchanged. The parameter round-trip, downsize invalidation, and both delta commitment identity tests passed. This is a first memory-policy step, **not** mmap or streamed spill. It does not qualify the new branch as a Ledger9 consumer.
