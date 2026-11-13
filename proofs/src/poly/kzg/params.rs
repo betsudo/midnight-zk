@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     io,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
 use ff::{Field, PrimeField};
@@ -14,7 +14,10 @@ use midnight_curves::{
 use rand_core::RngCore;
 
 use crate::{
-    poly::{Coeff, LagrangeCoeff, LagrangeDeltaCoeff, PolynomialBasis, PolynomialRepresentation},
+    poly::{
+        Coeff, LagrangeCoeff, LagrangeDeltaCoeff, PolynomialBasis, PolynomialRepresentation,
+        kzg::bases::BasesStorage,
+    },
     utils::{
         SerdeFormat,
         arithmetic::{CurveAffine, g_to_lagrange, parallelize},
@@ -25,18 +28,19 @@ use crate::{
 /// These are the public parameters for the polynomial commitment scheme.
 #[derive(Debug, Clone)]
 pub struct ParamsKZG<E: Engine> {
-    pub(crate) g: Vec<E::G1Affine>,
-    pub(crate) g_lagrange: Vec<E::G1Affine>,
+    pub(crate) g: BasesStorage<E::G1Affine>,
+    /// May be absent after a lazy read; derive it from `g` on first use.
+    pub(crate) g_lagrange: OnceLock<BasesStorage<E::G1Affine>>,
     /// Suffix-sum of `g_lagrange`:
     /// `g_lagrange_delta[i] = sum_{j=i}^{n-1} g_lagrange[j]`.
-    pub(crate) g_lagrange_delta: Vec<E::G1Affine>,
+    pub(crate) g_lagrange_delta: OnceLock<Vec<E::G1Affine>>,
     /// Suffix-sum of `g_lagrange_delta`:
     /// `g_lagrange_double_delta[i] = sum_{j=i}^{n-1} g_lagrange_delta[j]`.
     /// Used as the SRS for the `LagrangeDoubleDelta` basis. Same derivation
     /// as `g_lagrange_delta`, applied a second time:
     /// `sum_j a_j · L_j = sum_i c_i · g_lagrange_double_delta[i]`,
     /// where `c_i = b_i - b_{i-1}` and `b_i = a_i - a_{i-1}`.
-    pub(crate) g_lagrange_double_delta: Vec<E::G1Affine>,
+    pub(crate) g_lagrange_double_delta: OnceLock<Vec<E::G1Affine>>,
     pub(crate) g2: E::G2,
     pub(crate) s_g2: E::G2,
     /// The bases of every [`Residue`] committed to so far.
@@ -103,13 +107,45 @@ impl<E: Engine + Debug> ParamsKZG<E>
 where
     E::G1Affine: CurveAffine,
 {
+    fn g_lagrange_slice(&self) -> &[E::G1Affine] {
+        self.g_lagrange.get_or_init(|| {
+            // The FFT uses Rayon scopes. Running it on a proof's Rayon pool
+            // could steal another proof that asks for this same OnceLock and
+            // reenter initialization. Keep the one-time FFT on its own pool.
+            // `install` may itself run tasks from the caller's pool while it
+            // waits, so an ordinary scoped thread is the handoff boundary.
+            let workers = rayon::current_num_threads();
+            let lagrange = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(workers)
+                            .build()
+                            .expect("create SRS basis FFT pool");
+                        pool.install(|| g_to_lagrange(&self.g, self.max_k()))
+                    })
+                    .join()
+                    .expect("SRS basis FFT worker panicked")
+            });
+            BasesStorage::owned(lagrange)
+        })
+    }
+
     /// Return the SRS bases corresponding to the polynomial representation `B`.
     pub fn bases<B: PolynomialRepresentation>(&self) -> &[E::G1Affine] {
         match B::BASIS {
             PolynomialBasis::Coeff => &self.g,
-            PolynomialBasis::Lagrange => &self.g_lagrange,
-            PolynomialBasis::LagrangeDelta => &self.g_lagrange_delta,
-            PolynomialBasis::LagrangeDoubleDelta => &self.g_lagrange_double_delta,
+            PolynomialBasis::Lagrange => self.g_lagrange_slice(),
+            PolynomialBasis::LagrangeDelta => {
+                self.g_lagrange_delta.get_or_init(|| suffix_sum(self.g_lagrange_slice()))
+            }
+            PolynomialBasis::LagrangeDoubleDelta => {
+                self.g_lagrange_double_delta.get_or_init(|| {
+                    suffix_sum(
+                        self.g_lagrange_delta.get_or_init(|| suffix_sum(self.g_lagrange_slice())),
+                    )
+                })
+            }
             PolynomialBasis::ExtendedLagrange => {
                 unimplemented!("KZG does not support extended Lagrange bases")
             }
@@ -168,8 +204,10 @@ where
     /// Returns the size of the SRS, expressed as the exponent `k` such that it
     /// has `2^k` elements.
     pub fn max_k(&self) -> u32 {
-        assert_eq!(self.g.len(), self.g_lagrange.len());
-        self.g_lagrange.len().ilog2()
+        if let Some(lagrange) = self.g_lagrange.get() {
+            assert_eq!(self.g.len(), lagrange.len());
+        }
+        self.g.len().ilog2()
     }
 
     /// Downsize the current parameters to match a smaller `k`.
@@ -179,11 +217,11 @@ where
         }
 
         let n = 1 << new_k;
-        assert!(n < self.g_lagrange.len());
-        self.g.truncate(n);
-        self.g_lagrange = g_to_lagrange(&self.g, new_k);
-        self.g_lagrange_delta = suffix_sum(&self.g_lagrange);
-        self.g_lagrange_double_delta = suffix_sum(&self.g_lagrange_delta);
+        assert!(n < self.g.len());
+        self.g.truncate_into_owned(n);
+        self.g_lagrange = OnceLock::new();
+        self.g_lagrange_delta = OnceLock::new();
+        self.g_lagrange_double_delta = OnceLock::new();
         self.residue_bases = Default::default();
     }
 
@@ -231,17 +269,14 @@ where
         let mut g_lagrange_affine = vec![E::G1Affine::identity(); n as usize];
         E::G1::batch_normalize(&g_lagrange, &mut g_lagrange_affine);
 
-        let g_lagrange_delta = suffix_sum(&g_lagrange_affine);
-        let g_lagrange_double_delta = suffix_sum(&g_lagrange_delta);
-
         let g2 = E::G2::generator();
         let s_g2 = g2 * s;
 
         Self {
-            g: g_affine,
-            g_lagrange: g_lagrange_affine,
-            g_lagrange_delta,
-            g_lagrange_double_delta,
+            g: BasesStorage::owned(g_affine),
+            g_lagrange: OnceLock::from(BasesStorage::owned(g_lagrange_affine)),
+            g_lagrange_delta: OnceLock::new(),
+            g_lagrange_double_delta: OnceLock::new(),
             g2,
             s_g2,
             residue_bases: Default::default(),
@@ -268,13 +303,11 @@ where
             }
             None => g_to_lagrange(&g_affine, k),
         };
-        let g_lagrange_delta = suffix_sum(&g_lagrange_affine);
-        let g_lagrange_double_delta = suffix_sum(&g_lagrange_delta);
         Self {
-            g: g_affine,
-            g_lagrange: g_lagrange_affine,
-            g_lagrange_delta,
-            g_lagrange_double_delta,
+            g: BasesStorage::owned(g_affine),
+            g_lagrange: OnceLock::from(BasesStorage::owned(g_lagrange_affine)),
+            g_lagrange_delta: OnceLock::new(),
+            g_lagrange_double_delta: OnceLock::new(),
             g2,
             s_g2,
             residue_bases: Default::default(),
@@ -283,7 +316,7 @@ where
 
     /// Returns the committed lagrange polynomials of these KZG params.
     pub fn g_lagrange(&self) -> &[E::G1Affine] {
-        &self.g_lagrange
+        self.g_lagrange_slice()
     }
 
     /// Returns generator on G2
@@ -309,7 +342,7 @@ where
                 _ => el.write_raw(writer)?,
             }
         }
-        for el in self.g_lagrange.iter() {
+        for el in self.g_lagrange_slice().iter() {
             match format {
                 SerdeFormat::Processed => writer.write_all(el.to_bytes().as_ref())?,
                 _ => el.write_raw(writer)?,
@@ -329,60 +362,421 @@ where
         let mut k = [0u8; 4];
         reader.read_exact(&mut k[..])?;
         let k = u32::from_le_bytes(k);
-        let n = 1 << k;
+        if k > E::Fr::S {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("k = {k} exceeds the maximum supported value {}", E::Fr::S),
+            ));
+        }
+        let n = 1usize
+            .checked_shl(k)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS size overflows"))?;
+        const POINT_CHUNK: usize = 4096;
 
-        let (g, g_lagrange) = match format {
-            SerdeFormat::Processed => {
-                let load_points_from_file_parallelly =
-                    |reader: &mut R| -> io::Result<Vec<E::G1Affine>> {
-                        let mut points_compressed =
-                            vec![<E::G1Affine as GroupEncoding>::Repr::default(); n];
-                        for points_compressed in points_compressed.iter_mut() {
-                            reader.read_exact((*points_compressed).as_mut())?;
-                        }
-                        let mut points = vec![Option::<E::G1Affine>::None; n];
-                        parallelize(&mut points, |points, chunks| {
-                            for (i, point) in points.iter_mut().enumerate() {
-                                *point = Option::from(E::G1Affine::from_bytes(
-                                    &points_compressed[chunks + i],
-                                ));
+        let reserve_points = |points: &mut Vec<E::G1Affine>, remaining: usize| {
+            points
+                .try_reserve(remaining.min(POINT_CHUNK))
+                .map_err(|err| io::Error::other(format!("SRS allocation failed: {err}")))
+        };
+
+        let (g, g_lagrange) =
+            match format {
+                SerdeFormat::Processed => {
+                    let load_points_from_file_parallelly =
+                        |reader: &mut R| -> io::Result<Vec<E::G1Affine>> {
+                            let mut result = Vec::new();
+                            while result.len() < n {
+                                let count = (n - result.len()).min(POINT_CHUNK);
+                                let mut compressed =
+                                    vec![<E::G1Affine as GroupEncoding>::Repr::default(); count];
+                                for repr in &mut compressed {
+                                    reader.read_exact(repr.as_mut())?;
+                                }
+                                let mut points = vec![Option::<E::G1Affine>::None; count];
+                                parallelize(&mut points, |points, start| {
+                                    for (i, point) in points.iter_mut().enumerate() {
+                                        *point = Option::from(E::G1Affine::from_bytes(
+                                            &compressed[start + i],
+                                        ));
+                                    }
+                                });
+                                reserve_points(&mut result, count)?;
+                                for point in points {
+                                    result.push(point.ok_or_else(|| {
+                                        io::Error::other("invalid point encoding")
+                                    })?);
+                                }
                             }
-                        });
-                        points
-                            .into_iter()
-                            .map(|p| p.ok_or_else(|| io::Error::other("invalid point encoding")))
-                            .collect()
-                    };
+                            Ok(result)
+                        };
 
-                let g = load_points_from_file_parallelly(reader)?;
-                let g_lagrange = load_points_from_file_parallelly(reader)?;
-                (g, g_lagrange)
+                    let g = load_points_from_file_parallelly(reader)?;
+                    let g_lagrange = load_points_from_file_parallelly(reader)?;
+                    (g, g_lagrange)
+                }
+                SerdeFormat::RawBytes => {
+                    let read_points = |reader: &mut R| -> io::Result<Vec<E::G1Affine>> {
+                        let mut points = Vec::new();
+                        for i in 0..n {
+                            if i % POINT_CHUNK == 0 {
+                                reserve_points(&mut points, n - i)?;
+                            }
+                            points.push(E::G1Affine::read_raw(reader)?);
+                        }
+                        Ok(points)
+                    };
+                    let g = read_points(reader)?;
+                    let g_lagrange = read_points(reader)?;
+                    (g, g_lagrange)
+                }
+                SerdeFormat::RawBytesUnchecked => {
+                    let read_points = |reader: &mut R| -> io::Result<Vec<E::G1Affine>> {
+                        let mut points = Vec::new();
+                        let mut raw = vec![0u8; E::G1Affine::identity().to_raw_bytes().len()];
+                        for i in 0..n {
+                            if i % POINT_CHUNK == 0 {
+                                reserve_points(&mut points, n - i)?;
+                            }
+                            reader.read_exact(&mut raw)?;
+                            points.push(E::G1Affine::read_raw_unchecked(&mut &raw[..]));
+                        }
+                        Ok(points)
+                    };
+                    let g = read_points(reader)?;
+                    let g_lagrange = read_points(reader)?;
+                    (g, g_lagrange)
+                }
+            };
+
+        let read_g2 = |reader: &mut R| -> io::Result<E::G2> {
+            if matches!(format, SerdeFormat::RawBytesUnchecked) {
+                let mut raw = vec![0u8; E::G2::identity().byte_length(format)];
+                reader.read_exact(&mut raw)?;
+                E::G2::read(&mut &raw[..], format)
+            } else {
+                E::G2::read(reader, format)
+            }
+        };
+        let g2 = read_g2(reader)?;
+        let s_g2 = read_g2(reader)?;
+
+        Ok(Self {
+            g: BasesStorage::owned(g),
+            g_lagrange: OnceLock::from(BasesStorage::owned(g_lagrange)),
+            g_lagrange_delta: OnceLock::new(),
+            g_lagrange_double_delta: OnceLock::new(),
+            g2,
+            s_g2,
+            residue_bases: Default::default(),
+        })
+    }
+
+    /// Read a seekable parameter stream without materialising its on-disk
+    /// Lagrange basis. The basis is derived from `g` when first requested.
+    /// The serialized format is identical to [`Self::read_custom`].
+    pub fn read_custom_lazy<R: io::Read + io::Seek>(
+        reader: &mut R,
+        format: SerdeFormat,
+    ) -> io::Result<Self>
+    where
+        E::G1Affine: SerdeObject,
+        E::G2: ProcessedSerdeObject,
+    {
+        let mut k = [0u8; 4];
+        reader.read_exact(&mut k)?;
+        let k = u32::from_le_bytes(k);
+        if k > E::Fr::S {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid SRS k"));
+        }
+        let n = 1usize
+            .checked_shl(k)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS size overflows"))?;
+        let before_g = reader.stream_position()?;
+        // Check the complete wire length before materialising any basis. In
+        // particular, an otherwise valid k=32 header must not allocate a
+        // multi-gigabyte vector from a truncated stream.
+        let point_bytes = match format {
+            SerdeFormat::Processed => {
+                <E::G1Affine as GroupEncoding>::Repr::default().as_ref().len()
+            }
+            _ => E::G1Affine::identity().to_raw_bytes().len(),
+        };
+        let primary_bytes = n
+            .checked_mul(point_bytes)
+            .and_then(|size| size.checked_mul(2))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?;
+        let required = primary_bytes
+            .checked_add(
+                E::G2::identity()
+                    .byte_length(format)
+                    .checked_mul(2)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?,
+            )
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?;
+        let required = u64::try_from(required)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SRS too large"))?;
+        let end = reader.seek(io::SeekFrom::End(0))?;
+        reader.seek(io::SeekFrom::Start(before_g))?;
+        if end.saturating_sub(before_g) < required {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated SRS",
+            ));
+        }
+        let g = match format {
+            SerdeFormat::Processed => {
+                let mut encoded = vec![<E::G1Affine as GroupEncoding>::Repr::default(); n];
+                for point in &mut encoded {
+                    reader.read_exact(point.as_mut())?;
+                }
+                let mut points = vec![Option::<E::G1Affine>::None; n];
+                parallelize(&mut points, |points, start| {
+                    for (i, point) in points.iter_mut().enumerate() {
+                        *point = Option::from(E::G1Affine::from_bytes(&encoded[start + i]));
+                    }
+                });
+                points
+                    .into_iter()
+                    .map(|point| point.ok_or_else(|| io::Error::other("invalid point encoding")))
+                    .collect::<io::Result<Vec<_>>>()?
             }
             SerdeFormat::RawBytes => {
-                let g =
-                    (0..n).map(|_| E::G1Affine::read_raw(reader)).collect::<Result<Vec<_>, _>>()?;
-                let g_lagrange =
-                    (0..n).map(|_| E::G1Affine::read_raw(reader)).collect::<Result<Vec<_>, _>>()?;
-                (g, g_lagrange)
+                (0..n).map(|_| E::G1Affine::read_raw(reader)).collect::<io::Result<Vec<_>>>()?
             }
             SerdeFormat::RawBytesUnchecked => {
-                let g = (0..n).map(|_| E::G1Affine::read_raw_unchecked(reader)).collect::<Vec<_>>();
-                let g_lagrange =
-                    (0..n).map(|_| E::G1Affine::read_raw_unchecked(reader)).collect::<Vec<_>>();
-                (g, g_lagrange)
+                (0..n).map(|_| E::G1Affine::read_raw_unchecked(reader)).collect()
             }
         };
 
+        // Both primary bases have the same point count and encoding. Seek
+        // past the second block before reading the two G2 elements.
+        let g_bytes = reader.stream_position()?.checked_sub(before_g).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SRS reader position moved backwards",
+            )
+        })?;
+        let skip = i64::try_from(g_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SRS block too large"))?;
+        reader.seek(io::SeekFrom::Current(skip))?;
         let g2 = E::G2::read(reader, format)?;
         let s_g2 = E::G2::read(reader, format)?;
 
-        let g_lagrange_delta = suffix_sum(&g_lagrange);
-        let g_lagrange_double_delta = suffix_sum(&g_lagrange_delta);
+        Ok(Self {
+            g: BasesStorage::owned(g),
+            g_lagrange: OnceLock::new(),
+            g_lagrange_delta: OnceLock::new(),
+            g_lagrange_double_delta: OnceLock::new(),
+            g2,
+            s_g2,
+            residue_bases: Default::default(),
+        })
+    }
+
+    /// Identifies the private 0.8.3 affine companion layout for this curve and
+    /// k. It is a cache compatibility check, not a digest of the SRS
+    /// contents.
+    #[cfg(feature = "mmap")]
+    fn companion_identity(k: u32) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for part in [
+            b"MDNGHTV3".as_slice(),
+            env!("CARGO_PKG_VERSION").as_bytes(),
+            std::any::type_name::<E::G1Affine>().as_bytes(),
+            &std::mem::size_of::<E::G1Affine>().to_le_bytes(),
+            &std::mem::align_of::<E::G1Affine>().to_le_bytes(),
+            &k.to_le_bytes(),
+        ] {
+            for &byte in part {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    /// Writes the private, host-layout affine SRS companion format.
+    /// This is a local cache format, not a network or cross-device format.
+    /// Publish the completed file without replacing an existing inode, and
+    /// keep it in a private directory that other processes cannot modify.
+    #[cfg(feature = "mmap")]
+    #[allow(unsafe_code)]
+    pub fn write_mmap_companion<W: io::Write>(&self, writer: &mut W) -> io::Result<()>
+    where
+        E::G1Affine: crate::poly::kzg::bases::PlainBytes,
+        E::G2: ProcessedSerdeObject,
+    {
+        const HEADER_LEN: usize = 96;
+        const G_OFFSET: usize = 128;
+        let k = self.max_k();
+        let n = self.g.len();
+        let point_size = std::mem::size_of::<E::G1Affine>();
+        let block_bytes =
+            n.checked_mul(point_size).ok_or_else(|| io::Error::other("SRS too large"))?;
+        let gl_offset = G_OFFSET
+            .checked_add(block_bytes)
+            .ok_or_else(|| io::Error::other("SRS too large"))?;
+        let g2_offset = gl_offset
+            .checked_add(block_bytes)
+            .ok_or_else(|| io::Error::other("SRS too large"))?;
+        let mut g2_buf = Vec::new();
+        let mut s_g2_buf = Vec::new();
+        self.g2.write(&mut g2_buf, SerdeFormat::RawBytesUnchecked)?;
+        self.s_g2.write(&mut s_g2_buf, SerdeFormat::RawBytesUnchecked)?;
+        let s_g2_offset = g2_offset
+            .checked_add(g2_buf.len())
+            .ok_or_else(|| io::Error::other("SRS too large"))?;
+
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        header.extend_from_slice(b"MDNGHTV3");
+        header.extend_from_slice(&3u32.to_le_bytes());
+        header.extend_from_slice(&k.to_le_bytes());
+        header
+            .extend_from_slice(&u32::try_from(point_size).map_err(io::Error::other)?.to_le_bytes());
+        header.extend_from_slice(&1u32.to_le_bytes()); // both primary bases present
+        header.extend_from_slice(&Self::companion_identity(k).to_le_bytes());
+        for value in [
+            G_OFFSET,
+            n,
+            gl_offset,
+            n,
+            g2_offset,
+            g2_buf.len(),
+            s_g2_offset,
+            s_g2_buf.len(),
+        ] {
+            header
+                .extend_from_slice(&u64::try_from(value).map_err(io::Error::other)?.to_le_bytes());
+        }
+        debug_assert_eq!(header.len(), HEADER_LEN);
+        writer.write_all(&header)?;
+        writer.write_all(&[0u8; G_OFFSET - HEADER_LEN])?;
+        for points in [&self.g[..], self.g_lagrange_slice()] {
+            // SAFETY: PlainBytes guarantees no padding or invalid Rust bit
+            // patterns; these are live, initialized affine points.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    points.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(points),
+                )
+            };
+            writer.write_all(bytes)?;
+        }
+        writer.write_all(&g2_buf)?;
+        writer.write_all(&s_g2_buf)?;
+        Ok(())
+    }
+
+    /// Publishes a complete companion at `path` without replacing an existing
+    /// file. The caller must choose a private directory and keep the published
+    /// inode immutable while any process maps it.
+    #[cfg(feature = "mmap")]
+    pub fn publish_mmap_companion(&self, path: &std::path::Path) -> io::Result<()>
+    where
+        E::G1Affine: crate::poly::kzg::bases::PlainBytes,
+        E::G2: ProcessedSerdeObject,
+    {
+        let parent =
+            path.parent().ok_or_else(|| io::Error::other("companion path has no parent"))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        self.write_mmap_companion(&mut temporary)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist_noclobber(path).map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    /// Reads the private affine companion produced by `write_mmap_companion`.
+    /// Header, ranges, alignment, and format identity are checked before any
+    /// mapped point slice is exposed. Point *values* are not validated.
+    ///
+    /// # Safety
+    /// The caller must own the backing file and keep it immutable for every
+    /// clone and borrow of the returned parameters. Do not map downloaded or
+    /// attacker-writable files. A malicious or modified file can change proof
+    /// results despite a valid header.
+    #[cfg(feature = "mmap")]
+    #[allow(unsafe_code)]
+    pub unsafe fn read_mmap_arc(mmap: Arc<memmap2::Mmap>) -> io::Result<Self>
+    where
+        E::G1Affine: crate::poly::kzg::bases::PlainBytes,
+        E::G2: ProcessedSerdeObject,
+    {
+        const HEADER_LEN: usize = 96;
+        const G_OFFSET: usize = 128;
+        fn bad(message: &'static str) -> io::Error {
+            io::Error::new(io::ErrorKind::InvalidData, message)
+        }
+        let bytes = &mmap[..];
+        if bytes.len() < HEADER_LEN || &bytes[0..8] != b"MDNGHTV3" {
+            return Err(bad("not a v3 affine companion"));
+        }
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let usize_at = |at: usize| -> io::Result<usize> {
+            usize::try_from(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()))
+                .map_err(|_| bad("companion field overflows usize"))
+        };
+        if u32_at(8) != 3 || u32_at(20) != 1 {
+            return Err(bad("unsupported companion version or flags"));
+        }
+        let k = u32_at(12);
+        let expected = 1usize.checked_shl(k).ok_or_else(|| bad("invalid k"))?;
+        let point_size = std::mem::size_of::<E::G1Affine>();
+        if usize::try_from(u32_at(16)).ok() != Some(point_size) {
+            return Err(bad("affine point layout mismatch"));
+        }
+        if u64::from_le_bytes(bytes[24..32].try_into().unwrap()) != Self::companion_identity(k) {
+            return Err(bad("companion identity mismatch"));
+        }
+        let fields: Vec<usize> = (32..96).step_by(8).map(usize_at).collect::<io::Result<_>>()?;
+        let [
+            g_offset,
+            g_count,
+            gl_offset,
+            gl_count,
+            g2_offset,
+            g2_size,
+            s_g2_offset,
+            s_g2_size,
+        ]: [usize; 8] = fields.try_into().unwrap();
+        if g_offset != G_OFFSET || g_count != expected || gl_count != expected {
+            return Err(bad("companion base count or offset mismatch"));
+        }
+        let block_bytes =
+            expected.checked_mul(point_size).ok_or_else(|| bad("base length overflow"))?;
+        if gl_offset
+            != g_offset.checked_add(block_bytes).ok_or_else(|| bad("base range overflow"))?
+            || g2_offset
+                != gl_offset.checked_add(block_bytes).ok_or_else(|| bad("base range overflow"))?
+            || s_g2_offset
+                != g2_offset.checked_add(g2_size).ok_or_else(|| bad("g2 range overflow"))?
+            || bytes.len()
+                != s_g2_offset.checked_add(s_g2_size).ok_or_else(|| bad("s_g2 range overflow"))?
+        {
+            return Err(bad("companion blocks are truncated or not canonical"));
+        }
+        let base_addr = bytes.as_ptr() as usize;
+        let align = std::mem::align_of::<E::G1Affine>();
+        if base_addr.checked_add(g_offset).ok_or_else(|| bad("address overflow"))? % align != 0
+            || base_addr.checked_add(gl_offset).ok_or_else(|| bad("address overflow"))? % align != 0
+        {
+            return Err(bad("affine base block misaligned"));
+        }
+        let mut g2_bytes = &bytes[g2_offset..s_g2_offset];
+        let mut s_g2_bytes = &bytes[s_g2_offset..];
+        let g2 = E::G2::read(&mut g2_bytes, SerdeFormat::RawBytesUnchecked)?;
+        let s_g2 = E::G2::read(&mut s_g2_bytes, SerdeFormat::RawBytesUnchecked)?;
+        if !g2_bytes.is_empty() || !s_g2_bytes.is_empty() {
+            return Err(bad("trailing G2 bytes"));
+        }
+        // SAFETY: all ranges, lengths and alignment were checked above.
+        // PlainBytes covers point representation; the caller owns immutability.
+        let g = unsafe { BasesStorage::mapped(mmap.clone(), g_offset, expected) };
+        let g_lagrange = unsafe { BasesStorage::mapped(mmap, gl_offset, expected) };
         Ok(Self {
             g,
-            g_lagrange,
-            g_lagrange_delta,
-            g_lagrange_double_delta,
+            g_lagrange: OnceLock::from(g_lagrange),
+            g_lagrange_delta: OnceLock::new(),
+            g_lagrange_double_delta: OnceLock::new(),
             g2,
             s_g2,
             residue_bases: Default::default(),
@@ -446,16 +840,59 @@ impl<E: MultiMillerLoop + Debug> ParamsKZG<E> {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use rand_core::OsRng;
 
     use crate::{
         poly::{
-            PolynomialLabel,
+            LagrangeCoeff, LagrangeDeltaCoeff, LagrangeDoubleDeltaCoeff, PolynomialLabel,
             commitment::PolynomialCommitmentScheme,
             kzg::{KZGCommitmentScheme, params::ParamsKZG},
         },
         utils::SerdeFormat,
     };
+
+    #[test]
+    fn test_read_custom_rejects_oversized_k() {
+        use ff::PrimeField;
+        use midnight_curves::{Bls12, Fq};
+
+        let data = (Fq::S + 1).to_le_bytes();
+        for format in [
+            SerdeFormat::Processed,
+            SerdeFormat::RawBytes,
+            SerdeFormat::RawBytesUnchecked,
+        ] {
+            let err = ParamsKZG::<Bls12>::read_custom(&mut &data[..], format)
+                .expect_err("oversized k must be rejected");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+            let boundary = Fq::S.to_le_bytes();
+            assert!(
+                ParamsKZG::<Bls12>::read_custom(&mut &boundary[..], format).is_err(),
+                "k at the field limit must not allocate from a truncated stream"
+            );
+            assert!(
+                ParamsKZG::<Bls12>::read_custom_lazy(&mut std::io::Cursor::new(boundary), format,)
+                    .is_err(),
+                "lazy k at the field limit must not allocate from a truncated stream"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_custom_unchecked_truncation_is_an_io_error() {
+        use midnight_curves::Bls12;
+
+        let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(2, OsRng);
+        let mut bytes = Vec::new();
+        params.write_custom(&mut bytes, SerdeFormat::RawBytesUnchecked).unwrap();
+        bytes.truncate(bytes.len() - 1);
+        let err = ParamsKZG::<Bls12>::read_custom(&mut &bytes[..], SerdeFormat::RawBytesUnchecked)
+            .expect_err("truncated raw SRS must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
 
     #[test]
     fn test_commit_lagrange() {
@@ -572,18 +1009,226 @@ mod test {
         use midnight_curves::Bls12;
 
         let params0: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(K, OsRng);
+        assert!(params0.g_lagrange_delta.get().is_none());
+        assert!(params0.g_lagrange_double_delta.get().is_none());
         let mut data = vec![];
         ParamsKZG::write_custom(&params0, &mut data, SerdeFormat::RawBytesUnchecked).unwrap();
         let params1 =
             ParamsKZG::<Bls12>::read_custom::<_>(&mut &data[..], SerdeFormat::RawBytesUnchecked)
                 .unwrap();
+        assert!(params1.g_lagrange_delta.get().is_none());
+        assert!(params1.g_lagrange_double_delta.get().is_none());
 
         assert_eq!(params0.g.len(), params1.g.len());
-        assert_eq!(params0.g_lagrange.len(), params1.g_lagrange.len());
+        assert_eq!(params0.g_lagrange().len(), params1.g_lagrange().len());
 
         assert_eq!(params0.g, params1.g);
-        assert_eq!(params0.g_lagrange, params1.g_lagrange);
+        assert_eq!(params0.g_lagrange(), params1.g_lagrange());
         assert_eq!(params0.g2, params1.g2);
         assert_eq!(params0.s_g2, params1.s_g2);
+        assert_eq!(
+            params0.bases::<LagrangeDeltaCoeff>(),
+            params1.bases::<LagrangeDeltaCoeff>()
+        );
+        assert_eq!(
+            params0.bases::<LagrangeDoubleDeltaCoeff>(),
+            params1.bases::<LagrangeDoubleDeltaCoeff>()
+        );
+    }
+
+    #[test]
+    fn test_lazy_parameter_read_preserves_wire_and_derives_lagrange_on_use() {
+        use std::io::Cursor;
+
+        use midnight_curves::Bls12;
+
+        let original: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(4, OsRng);
+        for format in [
+            SerdeFormat::Processed,
+            SerdeFormat::RawBytes,
+            SerdeFormat::RawBytesUnchecked,
+        ] {
+            let mut bytes = Vec::new();
+            original.write_custom(&mut bytes, format).unwrap();
+            let mut reader = Cursor::new(&bytes);
+            let lazy = ParamsKZG::<Bls12>::read_custom_lazy(&mut reader, format).unwrap();
+            assert_eq!(reader.position() as usize, bytes.len());
+            assert!(lazy.g_lagrange.get().is_none(), "{format:?}");
+            assert_eq!(lazy.max_k(), 4);
+            assert!(
+                lazy.g_lagrange.get().is_none(),
+                "max_k materialised {format:?}"
+            );
+            assert_eq!(lazy.g, original.g);
+            assert_eq!(lazy.g2, original.g2);
+            assert_eq!(lazy.s_g2, original.s_g2);
+            assert_eq!(lazy.g_lagrange(), original.g_lagrange(), "{format:?}");
+            assert!(lazy.g_lagrange.get().is_some());
+            let mut rewritten = Vec::new();
+            lazy.write_custom(&mut rewritten, format).unwrap();
+            assert_eq!(rewritten, bytes, "wire changed for {format:?}");
+        }
+
+        let mut bytes = Vec::new();
+        original.write_custom(&mut bytes, SerdeFormat::RawBytes).unwrap();
+        bytes.truncate(bytes.len() - 1);
+        assert!(
+            ParamsKZG::<Bls12>::read_custom_lazy(&mut Cursor::new(bytes), SerdeFormat::RawBytes)
+                .is_err(),
+            "truncated lazy parameter stream was accepted"
+        );
+        let mut unchecked = Vec::new();
+        original.write_custom(&mut unchecked, SerdeFormat::RawBytesUnchecked).unwrap();
+        unchecked.truncate(unchecked.len() - 1);
+        assert_eq!(
+            ParamsKZG::<Bls12>::read_custom_lazy(
+                &mut Cursor::new(unchecked),
+                SerdeFormat::RawBytesUnchecked,
+            )
+            .err()
+            .unwrap()
+            .kind(),
+            std::io::ErrorKind::UnexpectedEof,
+        );
+    }
+
+    #[test]
+    fn test_lazy_lagrange_init_inside_shared_rayon_pool() {
+        use midnight_curves::Bls12;
+
+        let original: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(4, OsRng);
+        let expected = original.bases::<LagrangeCoeff>().to_vec();
+        let mut bytes = Vec::new();
+        original.write_custom(&mut bytes, SerdeFormat::RawBytes).unwrap();
+        let lazy = Arc::new(
+            ParamsKZG::<Bls12>::read_custom_lazy(
+                &mut std::io::Cursor::new(bytes),
+                SerdeFormat::RawBytes,
+            )
+            .unwrap(),
+        );
+        assert!(lazy.g_lagrange.get().is_none());
+
+        let proof_pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        proof_pool.scope(|scope| {
+            for _ in 0..2 {
+                let lazy = Arc::clone(&lazy);
+                let expected = &expected;
+                scope
+                    .spawn(move |_| assert_eq!(lazy.bases::<LagrangeCoeff>(), expected.as_slice()));
+            }
+        });
+        assert!(lazy.g_lagrange.get().is_some());
+    }
+
+    #[test]
+    fn test_downsize_invalidates_derived_bases() {
+        use midnight_curves::Bls12;
+
+        let mut params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(5, OsRng);
+        let _ = params.bases::<LagrangeDoubleDeltaCoeff>();
+        assert!(params.g_lagrange_delta.get().is_some());
+        assert!(params.g_lagrange_double_delta.get().is_some());
+
+        params.downsize(4);
+        assert!(params.g_lagrange_delta.get().is_none());
+        assert!(params.g_lagrange_double_delta.get().is_none());
+        assert_eq!(
+            params.bases::<LagrangeDeltaCoeff>(),
+            super::suffix_sum(params.g_lagrange())
+        );
+        assert_eq!(
+            params.bases::<LagrangeDoubleDeltaCoeff>(),
+            super::suffix_sum(params.bases::<LagrangeDeltaCoeff>())
+        );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[allow(unsafe_code)]
+    #[test]
+    fn test_affine_mmap_companion_round_trip_and_downsize() {
+        use std::sync::Arc;
+
+        use midnight_curves::Bls12;
+
+        let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(4, OsRng);
+        let mut file = tempfile::tempfile().unwrap();
+        params.write_mmap_companion(&mut file).unwrap();
+        file.sync_all().unwrap();
+        // SAFETY: this test owns the file and never mutates it after mapping.
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file) }.unwrap());
+        // SAFETY: the test owns the immutable companion for every clone.
+        let mut mapped = unsafe { ParamsKZG::<Bls12>::read_mmap_arc(mmap) }.unwrap();
+        assert!(mapped.g.is_mapped());
+        assert!(mapped.g_lagrange.get().unwrap().is_mapped());
+        assert_eq!(params.g, mapped.g);
+        assert_eq!(params.g_lagrange(), mapped.g_lagrange());
+        assert_eq!(params.g2, mapped.g2);
+        assert_eq!(params.s_g2, mapped.s_g2);
+        let cloned = mapped.clone();
+        assert!(cloned.g.is_mapped());
+        assert_eq!(
+            params.bases::<LagrangeDoubleDeltaCoeff>(),
+            mapped.bases::<LagrangeDoubleDeltaCoeff>()
+        );
+
+        mapped.downsize(3);
+        assert!(!mapped.g.is_mapped());
+        assert!(mapped.g_lagrange.get().is_none());
+        assert_eq!(mapped.max_k(), 3);
+        assert_eq!(cloned.max_k(), 4);
+    }
+
+    #[cfg(feature = "mmap")]
+    #[allow(unsafe_code)]
+    #[test]
+    fn test_affine_mmap_companion_rejects_old_and_damaged_layouts() {
+        use std::sync::Arc;
+
+        use midnight_curves::Bls12;
+
+        fn load(bytes: &[u8]) -> std::io::Result<ParamsKZG<Bls12>> {
+            let mut mapping = memmap2::MmapMut::map_anon(bytes.len().max(1)).unwrap();
+            mapping[..bytes.len()].copy_from_slice(bytes);
+            let mapping = Arc::new(mapping.make_read_only().unwrap());
+            // SAFETY: this test owns the read-only anonymous mapping.
+            unsafe { ParamsKZG::<Bls12>::read_mmap_arc(mapping) }
+        }
+
+        let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(4, OsRng);
+        let mut good = Vec::new();
+        params.write_mmap_companion(&mut good).unwrap();
+        assert!(load(&good).is_ok());
+        let mut old = good.clone();
+        old[..8].copy_from_slice(b"MDNGHTV2");
+        assert_eq!(
+            load(&old).err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        for at in [8, 16, 20, 24, 32, 40, 48] {
+            let mut damaged = good.clone();
+            damaged[at] ^= 1;
+            let error = load(&damaged).expect_err("damaged companion was accepted");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "offset {at}");
+        }
+        assert_eq!(
+            load(&good[..good.len() - 1]).err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn test_affine_mmap_companion_publication_does_not_replace() {
+        use midnight_curves::Bls12;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("params.mmap");
+        let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(4, OsRng);
+        params.publish_mmap_companion(&path).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        let error = params.publish_mmap_companion(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), first);
     }
 }

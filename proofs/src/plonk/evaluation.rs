@@ -1,12 +1,14 @@
 use ff::{PrimeField, WithSmallOrderMulGroup};
 use group::ff::Field;
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use super::{ConstraintSystem, Expression};
 use crate::{
-    plonk::{Any, argument},
+    config::ProverConfig,
+    plonk::{Any, argument, cosets::build_cosets, logup},
     poly::{
-        Coeff, EvaluationDomain, Polynomial, PolynomialLabel, PolynomialRepresentation, Rotation,
+        Coeff, EvaluationDomain, ExtendedLagrangeCoeff as B, Polynomial, PolynomialLabel,
+        PolynomialRead, PolynomialRepresentation, PolynomialView, Rotation,
     },
     utils::arithmetic::parallelize,
 };
@@ -384,12 +386,15 @@ impl<F: PrimeField> GraphEvaluator<F> {
                     c: 0,
                 }),
                 Calculation::Store(v) => {
-                    // Store is a copy from a column/constant/etc into an intermediate.
-                    // In the flattened format, the column read is pre-loaded, so this
+                    // Store is a copy from a column/constant/etc into an
+                    // intermediate. In the flattened
+                    // format, the column read is pre-loaded, so this
                     // is just a copy: dst = src.
                     let src = resolve(v);
-                    // Optimization: if dst == src, skip the copy. Otherwise emit Add with 0.
-                    // NOTE: This is relying in the first constant being  0, should be reviewed.
+                    // Optimization: if dst == src, skip the copy. Otherwise
+                    // emit Add with 0. NOTE: This is
+                    // relying in the first constant being  0, should be
+                    // reviewed.
                     if dst != src {
                         ops.push(FlatOp {
                             kind: FlatOpKind::Add,
@@ -476,12 +481,13 @@ impl<F: PrimeField> FlatGraphEvaluator<F> {
     /// across elements (only column reads and intermediates are overwritten).
     #[inline]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::extra_unused_type_parameters)] // Keep the existing basis-typed API.
     pub fn evaluate<B: PolynomialRepresentation>(
         &self,
         values: &mut [F],
-        fixed: &[Polynomial<F, B>],
-        advice: &[Polynomial<F, B>],
-        instance: &[Polynomial<F, B>],
+        fixed: &[impl std::ops::Deref<Target = [F]>],
+        advice: &[impl std::ops::Deref<Target = [F]>],
+        instance: &[impl std::ops::Deref<Target = [F]>],
         rotations: &[usize],
         previous_value: &F,
     ) -> F {
@@ -534,9 +540,9 @@ impl<F: PrimeField> FlatGraphEvaluator<F> {
         template_buf: &[F],
         output: &mut [F],
         start: usize,
-        fixed: &[Polynomial<F, Repr>],
-        advice: &[Polynomial<F, Repr>],
-        instance: &[Polynomial<F, Repr>],
+        fixed: &[impl std::ops::Deref<Target = [F]>],
+        advice: &[impl std::ops::Deref<Target = [F]>],
+        instance: &[impl std::ops::Deref<Target = [F]>],
         log_scale: u32,
         log_n: u32,
     ) {
@@ -699,7 +705,8 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
                 .map(|chunk| {
                     let mut graph = GraphEvaluator::default();
 
-                    // Each input expression gets compressed with θ and shifted by β
+                    // Each input expression gets compressed with θ and shifted
+                    // by β
                     let compressed_inputs_cosets: Vec<_> = chunk
                         .iter()
                         .map(|expressions| {
@@ -817,13 +824,13 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
     /// processing, `previous_value` is always `F::ZERO` and the leading
     /// `Add(prev, 0)` flat op is dead.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn evaluate_numerator<B: PolynomialRepresentation>(
+    pub(crate) fn evaluate_numerator(
         &self,
         domain: &EvaluationDomain<F>,
         cs: &ConstraintSystem<F>,
-        advice: &[Polynomial<F, B>],
-        instance: &[Polynomial<F, B>],
-        fixed: &[Polynomial<F, B>],
+        advice: &[PolynomialView<'_, F, B>],
+        instance: &[PolynomialView<'_, F, B>],
+        fixed: &[PolynomialView<'_, F, B>],
         y: F,
         beta: F,
         gamma: F,
@@ -834,7 +841,8 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
         l0: &Polynomial<F, B>,
         l_last: &Polynomial<F, B>,
         l_active_row: &Polynomial<F, B>,
-        permutation_cosets: &[Polynomial<F, B>],
+        permutation_cosets: &[PolynomialView<'_, F, B>],
+        config: &ProverConfig,
     ) -> Polynomial<F, B> {
         let log_scale = B::k(domain) - domain.k();
         let omega = B::omega(domain);
@@ -867,16 +875,19 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
 
             let num_sets = cs.permutation().num_sets(cs.degree());
 
-            let permutation_product_cosets: Vec<Polynomial<F, B>> = (0..num_sets)
-                .into_par_iter()
+            let permutation_product_coeffs: Vec<_> = (0..num_sets)
                 .map(|i| {
-                    let poly =
-                        phase2_committed.poly(&PolynomialLabel::PermutationAccumulator(i)).expect(
-                            "the phase-2 group has no polynomial for a permutation accumulator",
-                        );
-                    B::coeff_to_self(domain, poly.clone())
+                    let poly = phase2_committed
+                        .poly(&PolynomialLabel::PermutationAccumulator(i))
+                        .expect("the phase-2 group has no permutation accumulator");
+                    PolynomialView::<F, Coeff>::new(poly)
                 })
                 .collect();
+            let permutation_product_cosets =
+                build_cosets(&permutation_product_coeffs, domain.k(), config, |poly| {
+                    B::coeff_to_self(domain, poly.materialise())
+                });
+            let permutation_product_cosets = permutation_product_cosets.views();
 
             let first_set_permutation_product_coset = permutation_product_cosets.first().unwrap();
             let last_set_permutation_product_coset = permutation_product_cosets.last().unwrap();
@@ -951,54 +962,67 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
             });
         }
 
-        // Pre-compute all lookup cosets in parallel. This trades peak memory
-        // for parallelism: the FFTs for different lookups can now overlap.
-        let all_lookup_cosets: Vec<_> = cs
-            .lookups
+        // Keep each lookup's extended-domain polynomials in one spill holder.
+        // Spilling runs one lookup at a time to bound transient heap; the
+        // default heap path retains upstream's parallel lookup scheduling.
+        let lookup_jobs: Vec<_> =
+            cs.lookups.iter().map(|l| l.chunk_by_degree(cs.degree())).enumerate().collect();
+        let build_lookup = |(argument_index, lookup): &(usize, logup::ChunkedArgument<F>)| {
+            let multiplicities_poly = phase1_committed
+                .poly(&PolynomialLabel::LogupMultiplicities(*argument_index))
+                .unwrap();
+
+            let helper_polys: Vec<_> = (0..lookup.input_expression_chunks.len())
+                .map(|j| {
+                    phase2_committed
+                        .poly(&PolynomialLabel::LogupHelper(*argument_index, j))
+                        .unwrap()
+                })
+                .collect();
+
+            let aggregator_poly = phase2_committed
+                .poly(&PolynomialLabel::LogupAggregator(*argument_index))
+                .unwrap();
+
+            let helper_count = helper_polys.len();
+            let coeffs: Vec<_> = helper_polys
+                .into_iter()
+                .chain([aggregator_poly, multiplicities_poly])
+                .map(|poly| PolynomialView::<F, Coeff>::new(poly))
+                .collect();
+            (
+                build_cosets(&coeffs, domain.k(), config, |poly| {
+                    B::coeff_to_self(domain, poly.materialise())
+                }),
+                helper_count,
+            )
+        };
+        let all_lookup_cosets: Vec<_> =
+            if cfg!(feature = "disk-spill") && config.spills_cosets_at(domain.k()) {
+                lookup_jobs.iter().map(build_lookup).collect()
+            } else {
+                lookup_jobs.par_iter().map(build_lookup).collect()
+            };
+        let all_lookup_views: Vec<_> = all_lookup_cosets
             .iter()
-            .map(|l| l.chunk_by_degree(cs.degree()))
-            .enumerate()
-            .collect::<Vec<_>>()
-            .par_iter()
-            .map(|(argument_index, lookup)| {
-                let multiplicities_poly = phase1_committed
-                    .poly(&PolynomialLabel::LogupMultiplicities(*argument_index))
-                    .unwrap();
-
-                let helper_polys: Vec<_> = (0..lookup.input_expression_chunks.len())
-                    .map(|j| {
-                        phase2_committed
-                            .poly(&PolynomialLabel::LogupHelper(*argument_index, j))
-                            .unwrap()
-                    })
-                    .collect();
-
-                let aggregator_poly = phase2_committed
-                    .poly(&PolynomialLabel::LogupAggregator(*argument_index))
-                    .unwrap();
-
-                // Compute cosets
-
-                let multiplicities_coset = B::coeff_to_self(domain, multiplicities_poly.clone());
-
-                let helper_cosets: Vec<_> =
-                    helper_polys.into_iter().map(|h| B::coeff_to_self(domain, h.clone())).collect();
-
-                let aggregator_poly = B::coeff_to_self(domain, aggregator_poly.clone());
-
-                (helper_cosets, aggregator_poly, multiplicities_coset)
-            })
+            .map(|(cosets, helper_count)| (cosets.views(), *helper_count))
             .collect();
 
-        // Pre-compute all trash cosets in parallel (lookup cosets
-        // are already pre-computed above).
-        let trash_cosets: Vec<_> = phase2_committed
-            .par_polys()
-            .filter_map(|(label, trash_poly)| match label {
-                PolynomialLabel::Trash(_) => Some(B::coeff_to_self(domain, trash_poly.clone())),
-                _ => None,
+        // Preserve the constraint system's trash argument order explicitly.
+        let trash_coeffs: Vec<_> = cs
+            .trashcans
+            .iter()
+            .map(|argument| {
+                let poly = phase2_committed
+                    .poly(&PolynomialLabel::Trash(argument.argument_index))
+                    .expect("the phase-2 group has no trash polynomial");
+                PolynomialView::<F, Coeff>::new(poly)
             })
             .collect();
+        let trash_cosets = build_cosets(&trash_coeffs, domain.k(), config, |poly| {
+            B::coeff_to_self(domain, poly.materialise())
+        });
+        let trash_cosets = trash_cosets.views();
 
         // Pre-resolve lookup output indices for the flat evaluator.
         let lookup_output_indices: Vec<Vec<(usize, usize, usize, usize)>> = self
@@ -1070,9 +1094,10 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
                 let r_next = get_rotation_idx(idx, 1, log_scale, log_n);
 
                 // --- Lookup constraints ---
-                for (n, (helper_cosets, aggregator_coset, multiplicities_coset)) in
-                    all_lookup_cosets.iter().enumerate()
-                {
+                for (n, (lookup_cosets, helper_count)) in all_lookup_views.iter().enumerate() {
+                    let helper_cosets = &lookup_cosets[..*helper_count];
+                    let aggregator_coset = &lookup_cosets[*helper_count];
+                    let multiplicities_coset = &lookup_cosets[*helper_count + 1];
                     *value = *value * y + aggregator_coset[idx] * (l0[idx] + l_last[idx]);
 
                     let mut sum_helpers = F::ZERO;
@@ -1099,13 +1124,15 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
                         let sum_partial_products = bufs[fi][spp_idx];
                         let product = bufs[fi][prod_idx];
 
-                        // We only resolve the table and selector in the first batch
+                        // We only resolve the table and selector in the first
+                        // batch
                         if fi == 0 {
                             table_value = bufs[fi][tbl_idx];
                             selector = bufs[fi][sel_idx];
                         }
 
-                        // Helper constraint: h(X) · ∏ⱼ(fⱼ(X) + β) = Σⱼ ∏_{k≠j}(fₖ(X) + β)
+                        // Helper constraint: h(X) · ∏ⱼ(fⱼ(X) + β) = Σⱼ
+                        // ∏_{k≠j}(fₖ(X) + β)
                         *value =
                             *value * y + helper_cosets[fi][idx] * product - sum_partial_products;
 
@@ -1307,11 +1334,11 @@ impl<F: PrimeField> GraphEvaluator<F> {
 }
 
 /// Simple evaluation of an expression
-pub fn evaluate<F: Field, B: PolynomialRepresentation>(
+pub fn evaluate<F: Field, B: PolynomialRepresentation, P: PolynomialRead<F, Basis = B> + Sync>(
     expression: &Expression<F>,
     size: usize,
     log_scale: u32,
-    fixed: &[Polynomial<F, B>],
+    fixed: &[P],
     advice: &[Polynomial<F, B>],
     instance: &[Polynomial<F, B>],
 ) -> Vec<F> {
@@ -1324,7 +1351,7 @@ pub fn evaluate<F: Field, B: PolynomialRepresentation>(
                 &|scalar| scalar,
                 &|_| panic!("virtual selectors are removed during optimization"),
                 &|query| {
-                    fixed[query.column_index]
+                    fixed[query.column_index].values()
                         [get_rotation_idx(idx, query.rotation.0, log_scale, log_n)]
                 },
                 &|query| {
@@ -1424,7 +1451,8 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
 
         let log_n = n.trailing_zeros();
-        // Log scaling factor for the extended domain. No extended domain log 1 = 0.
+        // Log scaling factor for the extended domain. No extended domain log 1
+        // = 0.
         let log_scale = 0u32;
 
         let fixed: Vec<_> = (0..3).map(|_| rand_poly(&mut rng, n)).collect();
@@ -1552,8 +1580,8 @@ mod tests {
         // Constant as a Calculation operand.
         let with_const = g.add_calculation(Calculation::Add(neg, ValueSource::Constant(2)));
 
-        // Horner calculation to compute linear combination on challenge Y of previous
-        // calculations.
+        // Horner calculation to compute linear combination on challenge Y of
+        // previous calculations.
         g.add_calculation(Calculation::Horner(
             ValueSource::PreviousValue(),
             vec![sq, dbl, neg, wc, with_const],

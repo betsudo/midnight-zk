@@ -27,7 +27,7 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
     plonk::{Error, Expression, ProvingKey, evaluation::evaluate, logup::ChunkedArgument},
-    poly::{LagrangeCoeff, Polynomial, commitment::PolynomialCommitmentScheme},
+    poly::{LagrangeCoeff, Polynomial, PolynomialRead, commitment::PolynomialCommitmentScheme},
     utils::arithmetic::parallelize,
 };
 
@@ -67,17 +67,19 @@ impl<F: WithSmallOrderMulGroup<3> + Hash> ChunkedArgument<F> {
     /// blinding rows, so this method does not need `&mut rng` and can be
     /// called in parallel across lookups.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn compute_multiplicities_parallel<'a, CS: PolynomialCommitmentScheme<F>>(
+    pub(crate) fn compute_multiplicities_parallel<'a, CS, P>(
         &self,
         argument_index: usize,
         pk: &ProvingKey<F, CS>,
         advice_values: &'a [Polynomial<F, LagrangeCoeff>],
-        fixed_values: &'a [Polynomial<F, LagrangeCoeff>],
+        fixed_values: &'a [P],
         instance_values: &'a [Polynomial<F, LagrangeCoeff>],
         blinding_values: &[F],
     ) -> Result<ComputedMultiplicities<F>, Error>
     where
         F: WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
+        CS: PolynomialCommitmentScheme<F>,
+        P: PolynomialRead<F, Basis = LagrangeCoeff> + Sync,
     {
         assert_eq!(blinding_values.len(), pk.vk.cs.blinding_factors() + 1);
         let domain = pk.vk.get_domain();
@@ -165,8 +167,8 @@ impl<F: WithSmallOrderMulGroup<3> + Hash> ComputedMultiplicities<F> {
             .map(|chunk| chunk.iter().map(|evals| compress(evals)).collect())
             .collect();
 
-        // We need to compute the helper polynomial, for which we need to do batch
-        // inversion for the table.
+        // We need to compute the helper polynomial, for which we need to do
+        // batch inversion for the table.
         // T(X) = 1 / (t(X) + beta)
         let mut table_denoms = vec![F::ZERO; n];
         parallelize(&mut table_denoms, |input, start| {
@@ -210,11 +212,12 @@ impl<F: WithSmallOrderMulGroup<3> + Hash> ComputedMultiplicities<F> {
         // Polynomial over which we compute the running sum:
         //   logderivative_poly[i] = selector[i]·h[i] - m[i]/(t[i]+β)
         //
-        // The selector applies only to the input side (h), not to the multiplicities
-        // (m). m[i] counts how many selected inputs reference the table value
-        // t[i], so it lives on table rows — not input rows. Gating m by the
-        // selector would incorrectly exclude those table contributions,
-        // breaking the logup balance.
+        // The selector applies only to the input side (h), not to the
+        // multiplicities (m). m[i] counts how many selected inputs
+        // reference the table value t[i], so it lives on table rows —
+        // not input rows. Gating m by the selector would incorrectly
+        // exclude those table contributions, breaking the logup
+        // balance.
         let mut logderivative_poly = vec![F::ZERO; n];
         parallelize(&mut logderivative_poly, |poly, start| {
             for (i, coeff) in poly.iter_mut().enumerate() {
@@ -303,8 +306,8 @@ where
         *table_counts.entry(tuple).or_default() += 1;
     }
 
-    // Count how many times each tuple appears in inputs (only where the selector
-    // is non-zero).
+    // Count how many times each tuple appears in inputs (only where the
+    // selector is non-zero).
     let mut input_counts: FxHashMap<&[F], u32> =
         table_counts.keys().map(|tuple| (*tuple, 0)).collect();
     for input in values.iter() {
@@ -472,7 +475,8 @@ mod tests {
 
         assert_eq!(result.len(), 4);
         assert_eq!(result[0], Fq::from(1u64)); // table[0]=1 -> 1/1 = 1
-        // Value 2: looked up 2 times, appears 2 times in table -> each gets 2/2 = 1
+        // Value 2: looked up 2 times, appears 2 times in table -> each gets 2/2
+        // = 1
         assert_eq!(result[1], Fq::from(1u64)); // table[1]=2 -> 2/2 = 1
         assert_eq!(result[2], Fq::from(1u64)); // table[2]=2 -> 2/2 = 1
         assert_eq!(result[3], Fq::from(1u64)); // table[3]=3 -> 1/1 = 1

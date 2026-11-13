@@ -21,6 +21,8 @@ pub enum Error {
     DuplicatedLabel,
     /// Transcript error
     Transcript(io::Error),
+    /// An opted-in proving-key mapping failed.
+    KeyStorage(io::Error),
     /// `k` is too small for the given circuit.
     NotEnoughRowsAvailable {
         /// The current value of `k` being used.
@@ -44,6 +46,11 @@ pub enum Error {
     /// Completeness failure due to bad luck in random sampling.
     /// This error is expected to be almost impossible to trigger.
     CompletenessFailure,
+    /// The caller cancelled this proof at a stage boundary.
+    Cancelled {
+        /// The stage at which cancellation was observed.
+        phase: &'static str,
+    },
 }
 
 impl From<io::Error> for Error {
@@ -70,6 +77,7 @@ impl fmt::Display for Error {
             Error::Opening => write!(f, "Multi-opening proof was invalid"),
             Error::DuplicatedLabel => write!(f, "A polynomial label is duplicated"),
             Error::Transcript(e) => write!(f, "Transcript error: {e}"),
+            Error::KeyStorage(e) => write!(f, "Proving-key storage error: {e}"),
             Error::NotEnoughRowsAvailable { current_k } => write!(
                 f,
                 "k = {current_k} is too small for the given circuit. Try using a larger value of k",
@@ -94,6 +102,7 @@ impl fmt::Display for Error {
                 f,
                 "Completeness failure due to bad luck in random sampling. This error is expected to be almost impossible to trigger."
             ),
+            Self::Cancelled { phase } => write!(f, "Proof cancelled at phase {phase}"),
         }
     }
 }
@@ -102,6 +111,7 @@ impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Error::Transcript(e) => Some(e),
+            Error::KeyStorage(e) => Some(e),
             _ => None,
         }
     }

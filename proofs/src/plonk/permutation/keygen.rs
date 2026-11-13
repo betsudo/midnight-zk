@@ -182,7 +182,8 @@ pub(crate) fn compute_permutations<F: WithSmallOrderMulGroup<3>>(
 pub(crate) fn compute_polys_and_cosets<F: WithSmallOrderMulGroup<3>>(
     domain: &EvaluationDomain<F>,
     p: &Argument,
-    permutations: &[Polynomial<F, LagrangeCoeff>],
+    permutations: &[crate::poly::PolynomialView<'_, F, LagrangeCoeff>],
+    cache_cosets: bool,
 ) -> (
     Vec<Polynomial<F, Coeff>>,
     Vec<Polynomial<F, ExtendedLagrangeCoeff>>,
@@ -192,13 +193,17 @@ pub(crate) fn compute_polys_and_cosets<F: WithSmallOrderMulGroup<3>>(
         parallelize(&mut polys, |o, start| {
             for (x, poly) in o.iter_mut().enumerate() {
                 let i = start + x;
-                let permutation_poly = permutations[i].clone();
+                let permutation_poly = permutations[i].materialise();
                 *poly = domain.lagrange_to_coeff(permutation_poly);
             }
         });
     }
-    let mut cosets = vec![domain.empty_extended(); p.columns.len()];
-    {
+    let mut cosets = if cache_cosets {
+        vec![domain.empty_extended(); p.columns.len()]
+    } else {
+        Vec::new()
+    };
+    if cache_cosets {
         parallelize(&mut cosets, |o, start| {
             for (x, coset) in o.iter_mut().enumerate() {
                 let i = start + x;

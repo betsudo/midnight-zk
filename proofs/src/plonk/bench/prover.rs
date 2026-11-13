@@ -4,7 +4,8 @@ use std::{collections::BTreeMap, hash::Hash};
 
 use criterion::BenchmarkGroup;
 use ff::{FromUniformBytes, WithSmallOrderMulGroup};
-use rand_core::{CryptoRng, RngCore};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{CryptoRng, RngCore, SeedableRng};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
@@ -90,6 +91,7 @@ where
     let phase0_committed = pk.phase0_polys.committed(&vk_absorbed);
 
     let domain = &pk.vk.domain;
+    let fixed_views = pk.fixed_values.views();
 
     let instance = {
         let instances_clone = instances.to_vec();
@@ -150,7 +152,7 @@ where
                         argument_index,
                         pk,
                         advice_polys,
-                        &pk.fixed_values,
+                        &fixed_views,
                         instance_values,
                         blinds,
                     )
@@ -242,10 +244,10 @@ where
 
     // Compute the permutation accumulators.
     let compute_perm_z_polys = |perm_blindings: Vec<Vec<F>>| {
-        pk.vk.cs.permutation.compute_z_polys::<F, CS>(
+        pk.vk.cs.permutation.compute_z_polys::<F, CS, _>(
             pk,
             phase1_committed.polys_of(&advice_labels),
-            &pk.fixed_values,
+            &fixed_views,
             &instance.instance_values,
             beta,
             gamma,
@@ -270,8 +272,9 @@ where
         .collect();
 
     // Construct the lookup product polynomials. `compute_logderivative` returns
-    // the helper polynomials and the aggregator without touching the transcript;
-    // they are committed further below, as part of the phase2 argument group.
+    // the helper polynomials and the aggregator without touching the
+    // transcript; they are committed further below, as part of the phase2
+    // argument group.
     let logup_phase2_polys = |multiplicities: Vec<logup::prover::ComputedMultiplicities<F>>,
                               blindings: Vec<Vec<F>>|
      -> Result<Vec<PhaseGroupPolys<F>>, Error> {
@@ -351,7 +354,7 @@ where
                 domain,
                 trash_challenge,
                 advice_polys,
-                &pk.fixed_values,
+                &fixed_views,
                 instance_values,
             );
 
@@ -445,6 +448,7 @@ pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transc
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     trace: ProverTrace<'a, F>,
     transcript: &mut T,
+    rng: &mut (impl RngCore + CryptoRng),
     group: &mut BenchmarkGroup<'_, criterion::measurement::WallTime>,
 ) -> Result<(), Error>
 where
@@ -462,10 +466,10 @@ where
     let nu_poly = {
         group.bench_function("Compute numerator poly", |b| {
             b.iter(|| {
-                let _ = compute_nu_poly(pk, &trace);
+                let _ = compute_nu_poly(pk, &trace, crate::config::ProverConfig::process());
             })
         });
-        compute_nu_poly(pk, &trace)
+        compute_nu_poly(pk, &trace, crate::config::ProverConfig::process())
     };
 
     // Construct the quotient polynomial h(X) = nu(X)/(X^n-1), split it into
@@ -473,19 +477,20 @@ where
     let quotient_committed = {
         group.bench_function("Compute quotient poly", |b| {
             b.iter_batched(
-                || transcript.clone(),
-                |mut t| {
+                || (transcript.clone(), ChaCha20Rng::from_seed([42; 32])),
+                |(mut t, mut sample_rng)| {
                     let _ = compute_h_poly::<F, CS, T>(
                         params,
                         pk.get_vk().get_domain(),
                         nu_poly.clone(),
                         &mut t,
+                        &mut sample_rng,
                     );
                 },
                 criterion::BatchSize::SmallInput,
             )
         });
-        compute_h_poly::<F, CS, T>(params, pk.get_vk().get_domain(), nu_poly, transcript)?
+        compute_h_poly::<F, CS, T>(params, pk.get_vk().get_domain(), nu_poly, transcript, rng)?
     };
 
     let ProverTrace {
@@ -542,7 +547,8 @@ where
     });
     let phase0_evaluated = phase0_committed.evaluate(cs, &x_rotations, transcript)?;
 
-    // Evaluate the phase1 and phase2 arguments, if any, at their opening points.
+    // Evaluate the phase1 and phase2 arguments, if any, at their opening
+    // points.
     let phase1_evaluated = phase1_committed.evaluate(cs, &x_rotations, transcript)?;
     let phase2_evaluated = phase2_committed.evaluate(cs, &x_rotations, transcript)?;
     let mut quotient_evaluated = quotient_committed.evaluate(cs, &x_rotations, transcript)?;
@@ -638,7 +644,7 @@ where
         nb_committed_instances,
         instances,
         transcript,
-        rng,
+        &mut *rng,
         group,
     )?;
 
@@ -649,6 +655,7 @@ where
         nb_committed_instances,
         trace,
         transcript,
+        rng,
         group,
     )
 }

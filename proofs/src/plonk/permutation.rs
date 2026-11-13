@@ -12,7 +12,7 @@ use ff::PrimeField;
 pub use keygen::Assembly;
 
 use crate::{
-    plonk::{self, argument},
+    plonk::{self, argument, key_storage::KeyPolys},
     poly::{PolynomialLabel, commitment::PolynomialCommitmentScheme},
 };
 
@@ -108,7 +108,7 @@ impl Argument {
 pub(crate) struct Sigmas<F: PrimeField> {
     /// Evaluations over the domain, read row-wise when computing the
     /// accumulators. This is the form the proving key serializes.
-    pub(crate) values: Vec<Polynomial<F, LagrangeCoeff>>,
+    pub(crate) values: KeyPolys<F, LagrangeCoeff>,
     /// Evaluations over the extended domain, read when evaluating the
     /// numerator of the quotient polynomial.
     pub(crate) cosets: Vec<Polynomial<F, ExtendedLagrangeCoeff>>,

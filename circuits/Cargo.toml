@@ -1,6 +1,6 @@
 [package]
 name = "midnight-circuits"
-version = "7.3.0"
+version = "7.3.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -15,8 +15,8 @@ workspace = true
 group = { workspace = true }
 ff = { workspace = true }
 rustc-hash = "2"
-midnight-curves = "0.3.0"
-midnight-proofs = { version = "0.8.0", default-features = false, features = [
+midnight-curves = "0.3.2"
+midnight-proofs = { version = "0.8.4", default-features = false, features = [
     "circuit-params",
     "committed-instances",
 ] }

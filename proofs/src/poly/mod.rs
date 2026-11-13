@@ -19,6 +19,8 @@ use crate::utils::{SerdeFormat, arithmetic::parallelize};
 
 mod domain;
 mod query;
+mod view;
+pub(crate) use view::{PolynomialRead, PolynomialView, polynomial_views};
 
 /// KZG commitment scheme
 pub mod kzg;
@@ -552,6 +554,32 @@ impl<F: PrimeField + SerdeObject, B> Polynomial<F, B> {
         let poly_len = u32::from_be_bytes(poly_len);
 
         (0..poly_len)
+            .map(|_| read_f(reader, format))
+            .collect::<io::Result<Vec<_>>>()
+            .map(|values| Self {
+                values,
+                _marker: PhantomData,
+            })
+    }
+
+    /// Read a key column whose domain fixes its length. Check the serialized
+    /// length before allocating field values.
+    #[cfg(feature = "disk-spill")]
+    pub(crate) fn read_with_expected_len<R: io::Read>(
+        reader: &mut R,
+        format: SerdeFormat,
+        expected_len: usize,
+    ) -> io::Result<Self> {
+        let mut poly_len = [0u8; 4];
+        reader.read_exact(&mut poly_len)?;
+        let poly_len = u32::from_be_bytes(poly_len) as usize;
+        if poly_len != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("key polynomial length {poly_len}, expected {expected_len}"),
+            ));
+        }
+        (0..expected_len)
             .map(|_| read_f(reader, format))
             .collect::<io::Result<Vec<_>>>()
             .map(|values| Self {

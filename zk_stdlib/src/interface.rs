@@ -20,10 +20,11 @@ use midnight_circuits::types::ComposableChip;
 use midnight_curves::{Bls12, G1Projective};
 use midnight_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
+    config::{ProverConfig, ProverContext},
     dev::cost_model::{CircuitModel, circuit_model},
     plonk::{
-        self, Circuit, ConstraintSystem, Error, ProvingKey, VerifyingKey, create_proof, keygen_pk,
-        keygen_vk_with_k, prepare,
+        self, Circuit, ConstraintSystem, Error, ProvingKey, VerifyingKey,
+        create_proof_with_context, keygen_pk, keygen_pk_with, keygen_vk_with_k, prepare,
     },
     poly::{
         commitment::Guard,
@@ -222,6 +223,16 @@ impl<Rel: Relation, PCS: MidnightPCS> MidnightPK<Rel, PCS> {
     /// Fails if the key was written under a commitment scheme other than
     /// `PCS`.
     pub fn read<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self> {
+        Self::read_with_policy(reader, format, &ProverConfig::heap())
+    }
+
+    /// Read a proving key under an explicit memory policy. The serialized
+    /// format and commitment-scheme check are identical to [`Self::read`].
+    pub fn read_with_policy<R: io::Read>(
+        reader: &mut R,
+        format: SerdeFormat,
+        policy: &ProverConfig,
+    ) -> io::Result<Self> {
         let mut byte = [0u8; 1];
         reader.read_exact(&mut byte)?;
         if byte[0] != PCS::ID {
@@ -234,7 +245,7 @@ impl<Rel: Relation, PCS: MidnightPCS> MidnightPK<Rel, PCS> {
 
         let relation = Rel::read_relation(reader)?;
 
-        let pk = ProvingKey::read::<R, MidnightCircuit<Rel>>(
+        let pk = ProvingKey::read_with_policy::<R, MidnightCircuit<Rel>>(
             reader,
             format,
             MidnightCircuit::new(
@@ -244,6 +255,7 @@ impl<Rel: Relation, PCS: MidnightPCS> MidnightPK<Rel, PCS> {
                 Some(k as u32),
             )
             .params(),
+            policy,
         )?;
 
         Ok(MidnightPK { k, relation, pk })
@@ -557,9 +569,58 @@ pub fn setup_pk<R: Relation, PCS: MidnightPCS>(
     }
 }
 
+/// Generate a proving key with explicit storage and coset policy.
+///
+/// The original [`setup_pk`] keeps its signature and process-default
+/// behavior. Mapping failures are returned to the caller of this opt-in API.
+pub fn setup_pk_with_config<R: Relation, PCS: MidnightPCS>(
+    relation: &R,
+    vk: &MidnightVK<PCS>,
+    config: &ProverConfig,
+) -> Result<MidnightPK<R, PCS>, Error> {
+    let circuit = MidnightCircuit::new(
+        relation,
+        Value::unknown(),
+        Value::unknown(),
+        Some(vk.k() as u32),
+    );
+    let pk = keygen_pk_with(vk.vk.clone(), &circuit, config)?;
+    Ok(MidnightPK {
+        k: vk.k(),
+        relation: relation.clone(),
+        pk,
+    })
+}
+
 /// Produces a proof of relation `R` for the given instance (using the given
 /// proving key and witness).
 pub fn prove<R: Relation, H: TranscriptHash, PCS: MidnightPCS>(
+    params: &ParamsKZG<Bls12>,
+    pk: &MidnightPK<R, PCS>,
+    relation: &R,
+    instance: &R::Instance,
+    witness: R::Witness,
+    rng: impl RngCore + CryptoRng,
+) -> Result<Vec<u8>, R::Error>
+where
+    G1Projective: Hashable<H>,
+    F: Hashable<H> + Sampleable<H>,
+{
+    prove_with_context::<R, H, PCS>(
+        &ProverContext::new(ProverConfig::heap()),
+        params,
+        pk,
+        relation,
+        instance,
+        witness,
+        rng,
+    )
+}
+
+/// Produce a proof under an explicit memory and cancellation context.
+/// The original [`prove`] entry point keeps its signature and process policy.
+pub fn prove_with_context<R: Relation, H: TranscriptHash, PCS: MidnightPCS>(
+    context: &ProverContext,
     params: &ParamsKZG<Bls12>,
     pk: &MidnightPK<R, PCS>,
     relation: &R,
@@ -583,7 +644,8 @@ where
         Some(pk.k as u32),
     );
     let mut transcript = CircuitTranscript::<H>::init();
-    create_proof::<F, PCS, _, _>(
+    create_proof_with_context::<F, PCS, _, _>(
+        context,
         params,
         &pk.pk,
         &circuit,

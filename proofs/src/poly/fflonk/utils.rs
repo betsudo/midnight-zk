@@ -10,7 +10,7 @@ use std::{
 
 use ff::PrimeField;
 
-use crate::poly::{Coeff, Polynomial};
+use crate::poly::{Coeff, Polynomial, PolynomialView};
 
 /// The chunks of a group of `items`: the fewest chunks of at most `t_max`
 /// items, `⌈items.len() / t_max⌉`, of sizes that differ by at most one, the
@@ -32,12 +32,14 @@ pub fn balanced_chunks<T>(items: &[T], t_max: usize) -> impl Iterator<Item = &[T
 /// in coefficient form and `t` the next power of two of `k`: the coefficients
 /// of `g` interleave those of the `f_i`, with the slots of the `t - k` dummy
 /// polynomials padding the `k` given ones to `t` left zero.
-pub(super) fn compute_g<F: PrimeField>(polys: &[&Polynomial<F, Coeff>]) -> Polynomial<F, Coeff> {
+pub(super) fn compute_g<F: PrimeField>(
+    polys: &[&PolynomialView<'_, F, Coeff>],
+) -> Polynomial<F, Coeff> {
     let t = polys.len().next_power_of_two();
     let n = polys.iter().map(|poly| poly.len()).max().unwrap_or(0);
     let mut values = vec![F::ZERO; t * n];
     for (i, poly) in polys.iter().enumerate() {
-        for (j, coeff) in poly.values.iter().enumerate() {
+        for (j, coeff) in poly.iter().enumerate() {
             values[t * j + i] = *coeff;
         }
     }

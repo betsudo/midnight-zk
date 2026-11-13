@@ -15,6 +15,7 @@ use super::{
 };
 use crate::{
     circuit::Value,
+    config::ProverConfig,
     dev::cost_model::cost_model_options,
     poly::{
         EvaluationDomain, ExtendedLagrangeCoeff, batch_invert_rational,
@@ -267,8 +268,9 @@ where
     )?;
 
     let mut fixed = batch_invert_rational(assembly.fixed);
-    // After this, the ConstraintSystem should not have any selectors: `verify` does
-    // not need them, and `keygen_pk` regenerates `cs` from scratch anyways.
+    // After this, the ConstraintSystem should not have any selectors: `verify`
+    // does not need them, and `keygen_pk` regenerates `cs` from scratch
+    // anyways.
     let selectors = std::mem::take(&mut assembly.selectors);
     let (cs, selector_polys) = cs.directly_convert_selectors_to_fixed(selectors);
     fixed.extend(selector_polys.into_iter().map(|poly| domain.lagrange_from_vec(poly)));
@@ -291,11 +293,28 @@ where
     CS: PolynomialCommitmentScheme<F>,
     ConcreteCircuit: Circuit<F>,
 {
+    keygen_pk_with(vk, circuit, &ProverConfig::heap())
+}
+
+/// Generate a proving key with explicit key storage and coset policies.
+/// When spilling is enabled for this circuit size, the key omits the large
+/// extended-domain caches. Opting into key mapping returns a storage error if
+/// the temporary files cannot be reserved.
+pub fn keygen_pk_with<F, CS, ConcreteCircuit>(
+    vk: VerifyingKey<F, CS>,
+    circuit: &ConcreteCircuit,
+    policy: &ProverConfig,
+) -> Result<ProvingKey<F, CS>, Error>
+where
+    F: WithSmallOrderMulGroup<3>,
+    CS: PolynomialCommitmentScheme<F>,
+    ConcreteCircuit: Circuit<F>,
+{
     let mut cs = ConstraintSystem::default();
     #[cfg(feature = "circuit-params")]
-    let config = ConcreteCircuit::configure_with_params(&mut cs, circuit.params());
+    let circuit_config = ConcreteCircuit::configure_with_params(&mut cs, circuit.params());
     #[cfg(not(feature = "circuit-params"))]
-    let config = ConcreteCircuit::configure(&mut cs);
+    let circuit_config = ConcreteCircuit::configure(&mut cs);
 
     let cs = cs;
 
@@ -314,7 +333,7 @@ where
     let region_starts = ConcreteCircuit::FloorPlanner::synthesize_capturing_regions(
         &mut assembly,
         circuit,
-        config,
+        circuit_config,
         cs.constants.clone(),
     )?;
 
@@ -323,8 +342,59 @@ where
     fixed.extend(selector_polys.into_iter().map(|poly| vk.domain.lagrange_from_vec(poly)));
 
     let permutations = assembly.permutation.into_permutations::<F>(&vk.domain, &cs.permutation);
-    let (phase0_polys, fixed_cosets, sigmas) =
-        super::build_phase0_polys(&vk.domain, &cs, vk.transcript_repr, &fixed, permutations);
+    let fixed = super::key_storage::KeyPolys::Owned(fixed);
+    let permutations = super::key_storage::KeyPolys::Owned(permutations);
+
+    // Map the synthesized Lagrange columns before deriving phase-0
+    // coefficients. The mapped builder transforms one column at a time;
+    // building the whole coefficient group and mapping it afterward keeps
+    // all of those columns live on the heap during key generation.
+    #[cfg(feature = "disk-spill")]
+    let (fixed, phase0_polys, fixed_cosets, sigmas) = if policy.map_prover_key {
+        let fixed = fixed.map_to_disk(policy.spill_dir.as_deref()).map_err(Error::KeyStorage)?;
+        let permutations = permutations
+            .map_to_disk(policy.spill_dir.as_deref())
+            .map_err(Error::KeyStorage)?;
+        let (phase0_polys, fixed_cosets, sigmas) = super::build_phase0_polys_mapped(
+            &vk.domain,
+            &cs,
+            vk.transcript_repr,
+            &fixed,
+            permutations,
+            policy,
+        )
+        .map_err(Error::KeyStorage)?;
+        (fixed, phase0_polys, fixed_cosets, sigmas)
+    } else {
+        let (phase0_polys, fixed_cosets, sigmas) = super::build_phase0_polys(
+            &vk.domain,
+            &cs,
+            vk.transcript_repr,
+            &fixed,
+            permutations,
+            policy,
+        );
+        (fixed, phase0_polys, fixed_cosets, sigmas)
+    };
+
+    #[cfg(not(feature = "disk-spill"))]
+    let (fixed, phase0_polys, fixed_cosets, sigmas) = {
+        if policy.map_prover_key {
+            return Err(Error::KeyStorage(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "mapped proving keys require the disk-spill feature",
+            )));
+        }
+        let (phase0_polys, fixed_cosets, sigmas) = super::build_phase0_polys(
+            &vk.domain,
+            &cs,
+            vk.transcript_repr,
+            &fixed,
+            permutations,
+            policy,
+        );
+        (fixed, phase0_polys, fixed_cosets, sigmas)
+    };
 
     let [l0, l_last, l_active_row] = compute_lagrange_polys(&vk, &cs);
     // Compute the optimized evaluation data structure

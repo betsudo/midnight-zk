@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * `InterleavedCommit`, a `PolynomialCommitmentScheme` that commits to `Σ_i X^i f_i(X^t)` for chunks of polynomials `f_0, ..., f_{k-1}`, implemented by KZG from per-residue bases cached in `ParamsKZG` [#565](https://github.com/midnightntwrk/midnight-zk/pull/565)
 
 ### Fixed
+* LOCAL PORT: synchronize zero-filled spill reservations before mapping so delayed-allocation storage failures can be reported as I/O errors before a writable mapping fault.
 * LogUp verifier no longer panics when the prover makes some `fⱼ(x) + β` zero: the helper constraint folds products instead of inverting each term, which also saves the inversions [#562](https://github.com/midnightntwrk/midnight-zk/pull/562)
 * `KZGCommitmentScheme::multi_prepare` returns `Error::OpeningError` instead of panicking when a query names a polynomial its commitment group lacks [#562](https://github.com/midnightntwrk/midnight-zk/pull/562)
 * Under `truncated-challenges`, the collapse in the KZG verifier now keeps the terms of fixed and permutation columns apart, as the in-circuit verifier does, instead of folding them. The off-circuit accumulator no longer drops a fixed column queried at several rotations [#569](https://github.com/midnightntwrk/midnight-zk/pull/569)
@@ -53,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Fix cost-model [#435](https://github.com/midnightntwrk/midnight-zk/pull/435)
 
 ### Changed
+* LOCAL PORT: the new phase-0 VK/PK wire layout uses version byte `0x04`; the previous `0x03` tag was shared with the incompatible proofs 0.8.2 layout. Old keys reject before commitment parsing.
 * BREAKING: `PolynomialCommitmentScheme::Commitment` no longer requires `Add` and `Mul<F>`: no generic code combines commitments, so a scheme need not be homomorphic [#582](https://github.com/midnightntwrk/midnight-zk/pull/582)
 * The KZG multi-open takes first the point set with the most variable-base polynomials, then the others by cardinality, so that fewer scalars are products of two truncated challenges. This changes the proof [#583](https://github.com/midnightntwrk/midnight-zk/pull/583)
 * fflonk splits the polynomials of a `commit_many` call into the same number of chunks as before, of balanced sizes (e.g. 6, 6, 5 rather than 8, 8, 1), instead of chunks of `T_MAX` and a remainder. This changes fflonk verifying keys and proofs [#579](https://github.com/midnightntwrk/midnight-zk/pull/579)

@@ -18,6 +18,8 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
+/// Owned and mapped affine-basis storage contracts.
+pub mod bases;
 /// KZG commitment type
 pub mod commitment;
 /// Multiscalar multiplication engines
@@ -36,7 +38,7 @@ use rand_core::OsRng;
 
 use crate::{
     poly::{
-        Coeff, Error, Polynomial, PolynomialRepresentation, ProverQuery,
+        Coeff, Error, Polynomial, PolynomialRepresentation, PolynomialView, ProverQuery,
         commitment::{InterleavedCommit, PolynomialCommitmentScheme},
         kzg::{
             commitment::NB_POLYS_PREFIX_BYTES,
@@ -262,7 +264,7 @@ where
         /// scaled contributions directly into the output buffer, avoiding
         /// M intermediate allocations and the sequential reduce chain.
         fn poly_inner_product<F: ff::PrimeField>(
-            polys: &[&Polynomial<F, Coeff>],
+            polys: &[PolynomialView<'_, F, Coeff>],
             scalars: impl IntoIterator<Item = F>,
         ) -> Polynomial<F, Coeff> {
             let scalars: Vec<F> = scalars.into_iter().take(polys.len()).collect();
@@ -292,7 +294,7 @@ where
 
         // Map each label to the polynomial it identifies, so the per-set
         // grouping (keyed by label) can recover the actual polynomials.
-        let label_to_poly: HashMap<PolynomialLabel, &Polynomial<E::Fr, Coeff>> =
+        let label_to_poly: HashMap<PolynomialLabel, PolynomialView<'_, E::Fr, Coeff>> =
             queries.iter().map(|q| (q.label.clone(), q.poly())).collect();
 
         // `construct_intermediate_sets` is shared with the verifier, and the
@@ -338,7 +340,7 @@ where
                     _marker: PhantomData,
                 })
                 .collect();
-            poly_inner_product(&f_polys.iter().collect::<Vec<_>>(), powers(x2))
+            poly_inner_product(&crate::poly::polynomial_views(&f_polys), powers(x2))
         };
 
         let f_com = Self::commit(
@@ -361,8 +363,9 @@ where
         let x4: E::Fr = transcript.squeeze_challenge();
 
         let final_poly = {
-            let mut polys = q_polys;
-            polys.push(&f_poly);
+            let mut polys: Vec<_> =
+                q_polys.into_iter().map(|poly| PolynomialView::new(&poly.values)).collect();
+            polys.push(PolynomialView::new(&f_poly.values));
             let powers = truncated_powers(x4);
 
             poly_inner_product(&polys, powers)
@@ -822,7 +825,12 @@ mod tests {
         let labels = |name: &str| [PolynomialLabel::Custom(name.into())];
         let (la, lb, lc) = (labels("a"), labels("b"), labels("c"));
         let queries = [
-            ProverQuery::new(&la, slice::from_ref(&ax), x, la[0].clone()),
+            ProverQuery::new_views(
+                &la,
+                vec![super::PolynomialView::new(&ax.values)],
+                x,
+                la[0].clone(),
+            ),
             ProverQuery::new(&lb, slice::from_ref(&bx), x, lb[0].clone()),
             ProverQuery::new(&lc, slice::from_ref(&cx), y, lc[0].clone()),
         ]

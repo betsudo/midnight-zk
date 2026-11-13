@@ -173,7 +173,7 @@ where
         // points they are queried at, in query order: `labels -> (polys, points)`.
         let chunks_info = queries.iter().fold(BTreeMap::new(), |mut chunks_info, q| {
             let (labels, polys) = (balanced_chunks(q.group_labels, Self::T_MAX)
-                .zip(balanced_chunks(q.group_polys, Self::T_MAX)))
+                .zip(balanced_chunks(&q.group_polys, Self::T_MAX)))
             .find(|(labels, _)| labels.contains(&q.label))
             .expect("the queried group has no polynomial under the query label");
             let (_, points) = (chunks_info.entry(labels))

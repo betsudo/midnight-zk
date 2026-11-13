@@ -7,7 +7,7 @@ use std::{
 };
 
 use ff::{Field, FromUniformBytes, PrimeField, WithSmallOrderMulGroup};
-use rand_core::{CryptoRng, OsRng, RngCore};
+use rand_core::{CryptoRng, RngCore};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
@@ -22,10 +22,12 @@ use super::{
 };
 use crate::{
     circuit::Value,
-    plonk::{argument, traces::ProverTrace},
+    config::{ProverConfig, ProverContext},
+    plonk::{argument, cosets::build_cosets, traces::ProverTrace},
     poly::{
         Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, PolynomialLabel,
         ProverQuery, Rotation, batch_invert_rational, commitment::PolynomialCommitmentScheme,
+        polynomial_views,
     },
     transcript::{Hashable, Sampleable, Transcript},
     utils::{
@@ -59,6 +61,7 @@ where
 /// are zero-padded internally.
 ///
 /// The trace can then be used to finalise the proof.
+#[allow(clippy::too_many_arguments)] // Preserve the trace call shape across feature sets.
 pub(crate) fn compute_trace<
     'a,
     F,
@@ -76,6 +79,7 @@ pub(crate) fn compute_trace<
     instances: &[&[F]],
     transcript: &mut T,
     mut rng: impl RngCore + CryptoRng,
+    context: &ProverContext,
 ) -> Result<ProverTrace<'a, F>, Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -86,6 +90,7 @@ where
         + Ord
         + FromUniformBytes<64>,
 {
+    checkpoint(context, "trace.start")?;
     #[cfg(not(feature = "committed-instances"))]
     let nb_committed_instances: usize = 0;
 
@@ -99,9 +104,11 @@ where
     let phase0_committed = pk.phase0_polys.committed(&vk_absorbed);
 
     let domain = &pk.vk.domain;
+    let fixed_views = pk.fixed_values.views();
 
     let instance = compute_instances(params, pk, instances, nb_committed_instances, transcript)?;
 
+    checkpoint(context, "trace.advice")?;
     let advice_polys = parse_advices(pk, circuit, instances, &mut rng)?;
 
     // Helper: sample `num_sets` blinding vectors, each of length `inner_len`.
@@ -119,6 +126,7 @@ where
 
     // Compute the multiplicities columns in parallel. They are committed to
     // below, as the phase1 argument group.
+    checkpoint(context, "trace.lookup_multiplicities")?;
     let logup_multiplicities: Vec<logup::prover::ComputedMultiplicities<F>> = {
         let logup_args: Vec<_> =
             pk.vk.cs.lookups.iter().map(|l| l.chunk_by_degree(pk.vk.cs.degree())).collect();
@@ -131,7 +139,7 @@ where
                     argument_index,
                     pk,
                     &advice_polys,
-                    &pk.fixed_values,
+                    &fixed_views,
                     &instance.instance_values,
                     blinds,
                 )
@@ -159,6 +167,7 @@ where
         }
     }
 
+    checkpoint(context, "trace.phase1_commit")?;
     let phase1_committed = argument::prover::Committed::commit::<CS, T, _>(
         params,
         phase1_polys_map,
@@ -186,10 +195,11 @@ where
     let mut phase2_polys_map: BTreeMap<PolynomialLabel, Polynomial<F, LagrangeCoeff>> =
         BTreeMap::new();
 
-    let perm_z_polys = pk.vk.cs.permutation.compute_z_polys::<F, CS>(
+    checkpoint(context, "trace.permutation")?;
+    let perm_z_polys = pk.vk.cs.permutation.compute_z_polys::<F, CS, _>(
         pk,
         phase1_committed.polys_of(&advice_labels),
-        &pk.fixed_values,
+        &fixed_views,
         &instance.instance_values,
         beta,
         gamma,
@@ -205,6 +215,7 @@ where
         }
     }
 
+    checkpoint(context, "trace.lookup_logderivative")?;
     let logup_polys_maps = logup_multiplicities
         .into_par_iter()
         .zip(logup_blindings.into_par_iter())
@@ -243,11 +254,12 @@ where
     }
 
     for (i, trash) in pk.vk.cs.trashcans.iter().enumerate() {
+        checkpoint(context, "trace.trash")?;
         let p = trash.compute_trash_poly(
             domain,
             trash_challenge,
             phase1_committed.polys_of(&advice_labels),
-            &pk.fixed_values,
+            &fixed_views,
             &instance.instance_values,
         );
 
@@ -256,6 +268,7 @@ where
         }
     }
 
+    checkpoint(context, "trace.phase2_commit")?;
     let phase2_committed = argument::prover::Committed::commit::<CS, T, _>(
         params,
         phase2_polys_map,
@@ -304,6 +317,8 @@ pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transc
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     trace: ProverTrace<'a, F>,
     transcript: &mut T,
+    context: &ProverContext,
+    rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<(), Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -317,12 +332,14 @@ where
     #[cfg(not(feature = "committed-instances"))]
     let nb_committed_instances: usize = 0;
 
-    let nu_poly = compute_nu_poly(pk, &trace);
+    checkpoint(context, "finalise.nu")?;
+    let nu_poly = compute_nu_poly(pk, &trace, &context.config);
 
-    // Construct the quotient polynomial h(X) = nu(X)/(X^n-1), split it into limbs,
-    // and commit to the limbs as one group
+    // Construct the quotient polynomial h(X) = nu(X)/(X^n-1), split it into
+    // limbs, and commit to the limbs as one group
+    checkpoint(context, "finalise.quotient")?;
     let quotient_committed =
-        compute_h_poly::<F, CS, T>(params, pk.get_vk().get_domain(), nu_poly, transcript)?;
+        compute_h_poly::<F, CS, T>(params, pk.get_vk().get_domain(), nu_poly, transcript, rng)?;
 
     let ProverTrace {
         instance_polys,
@@ -341,6 +358,7 @@ where
         .map(|rotation| (rotation, domain.rotate_omega(x, rotation)))
         .collect();
 
+    checkpoint(context, "finalise.instance_evaluations")?;
     write_instance_evals_to_transcript(
         pk,
         nb_committed_instances,
@@ -349,12 +367,16 @@ where
         transcript,
     )?;
 
+    checkpoint(context, "finalise.phase0_evaluations")?;
     let phase0_evaluated = phase0_committed.evaluate(cs, &x_rotations, transcript)?;
 
+    checkpoint(context, "finalise.phase1_evaluations")?;
     let phase1_evaluated = phase1_committed.evaluate(cs, &x_rotations, transcript)?;
 
+    checkpoint(context, "finalise.phase2_evaluations")?;
     let phase2_evaluated = phase2_committed.evaluate(cs, &x_rotations, transcript)?;
 
+    checkpoint(context, "finalise.quotient_evaluations")?;
     let mut quotient_evaluated = quotient_committed.evaluate(cs, &x_rotations, transcript)?;
 
     // h_0(x) is not written to the proof, the verifier derives it.
@@ -379,7 +401,15 @@ where
         &x_rotations,
     );
 
+    checkpoint(context, "finalise.multi_open")?;
     CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure)
+}
+
+fn checkpoint(context: &ProverContext, phase: &'static str) -> Result<(), Error> {
+    if context.is_cancelled() {
+        return Err(Error::Cancelled { phase });
+    }
+    Ok(())
 }
 
 /// This creates a proof for the provided `circuit` when given the public
@@ -395,6 +425,92 @@ pub fn create_proof<
     T: Transcript,
     ConcreteCircuit: Circuit<F>,
 >(
+    params: &CS::Parameters,
+    pk: &ProvingKey<F, CS>,
+    circuit: &ConcreteCircuit,
+    #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
+    instances: &[&[F]],
+    transcript: &mut T,
+    rng: impl RngCore + CryptoRng,
+) -> Result<(), Error>
+where
+    CS::Commitment: Hashable<T::Hash>,
+    F: WithSmallOrderMulGroup<3>
+        + Sampleable<T::Hash>
+        + Hashable<T::Hash>
+        + Hash
+        + Ord
+        + FromUniformBytes<64>,
+{
+    create_proof_with(
+        params,
+        pk,
+        &ProverConfig::heap(),
+        circuit,
+        #[cfg(feature = "committed-instances")]
+        nb_committed_instances,
+        instances,
+        transcript,
+        rng,
+    )
+}
+
+/// Create a proof with a request-scoped extended-coset storage policy.
+///
+/// The existing [`create_proof`] entry point retains its original signature.
+/// With `disk-spill` disabled, this policy takes the heap path.
+#[allow(clippy::too_many_arguments)] // Public policy-aware entry point.
+pub fn create_proof_with<
+    F,
+    CS: PolynomialCommitmentScheme<F>,
+    T: Transcript,
+    ConcreteCircuit: Circuit<F>,
+>(
+    params: &CS::Parameters,
+    pk: &ProvingKey<F, CS>,
+    config: &ProverConfig,
+    circuit: &ConcreteCircuit,
+    #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
+    instances: &[&[F]],
+    transcript: &mut T,
+    rng: impl RngCore + CryptoRng,
+) -> Result<(), Error>
+where
+    CS::Commitment: Hashable<T::Hash>,
+    F: WithSmallOrderMulGroup<3>
+        + Sampleable<T::Hash>
+        + Hashable<T::Hash>
+        + Hash
+        + Ord
+        + FromUniformBytes<64>,
+{
+    create_proof_with_context(
+        &ProverContext::new(config.clone()),
+        params,
+        pk,
+        circuit,
+        #[cfg(feature = "committed-instances")]
+        nb_committed_instances,
+        instances,
+        transcript,
+        rng,
+    )
+}
+
+/// Create a proof under an explicit memory policy and request-owned
+/// cancellation token.
+///
+/// The policy-only [`create_proof_with`] and original [`create_proof`] entry
+/// points retain their signatures. Cancellation is checked between the main
+/// trace and finalisation stages; an in-progress stage runs to its next check.
+#[allow(clippy::too_many_arguments)] // Public request-context entry point.
+pub fn create_proof_with_context<
+    F,
+    CS: PolynomialCommitmentScheme<F>,
+    T: Transcript,
+    ConcreteCircuit: Circuit<F>,
+>(
+    context: &ProverContext,
     params: &CS::Parameters,
     pk: &ProvingKey<F, CS>,
     circuit: &ConcreteCircuit,
@@ -421,6 +537,7 @@ where
         instances,
         transcript,
         &mut rng,
+        context,
     )?;
     finalise_proof(
         params,
@@ -429,6 +546,8 @@ where
         nb_committed_instances,
         trace,
         transcript,
+        context,
+        &mut rng,
     )
 }
 
@@ -568,6 +687,7 @@ where
 pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>>(
     pk: &ProvingKey<F, CS>,
     trace: &ProverTrace<'_, F>,
+    config: &ProverConfig,
 ) -> Polynomial<F, ExtendedLagrangeCoeff> {
     let ProverTrace {
         instance_polys,
@@ -582,25 +702,53 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
     } = &trace;
     let domain = pk.vk.get_domain();
     // Calculate the advice and instance cosets
-    let advice_cosets: Vec<Polynomial<F, ExtendedLagrangeCoeff>> = phase1_committed
-        .polys_of(&pk.vk.cs.advice_labels())
-        .par_iter()
-        .map(|poly| domain.coeff_to_extended(poly.clone()))
-        .collect();
-    let instance_cosets: Vec<Polynomial<F, ExtendedLagrangeCoeff>> = instance_polys
-        .par_iter()
-        .map(|poly| domain.coeff_to_extended(poly.clone()))
-        .collect();
+    let advice_cosets = build_cosets(
+        phase1_committed.polys_of(&pk.vk.cs.advice_labels()),
+        domain.k(),
+        config,
+        |poly| domain.coeff_to_extended(poly.materialise()),
+    );
+    let instance_cosets = build_cosets(instance_polys, domain.k(), config, |poly| {
+        domain.coeff_to_extended(poly.materialise())
+    });
+    let advice_views = advice_cosets.views();
+    let instance_views = instance_cosets.views();
+    let fixed_labels: Vec<_> =
+        (0..pk.vk.cs.num_fixed_columns()).map(PolynomialLabel::Fixed).collect();
+    let fixed_cosets = pk.fixed_cosets.is_empty().then(|| {
+        build_cosets(
+            &pk.phase0_polys.views_of(&fixed_labels),
+            domain.k(),
+            config,
+            |poly| domain.coeff_to_extended(poly.materialise()),
+        )
+    });
+    let permutation_cosets = pk.sigmas.cosets.is_empty().then(|| {
+        build_cosets(
+            &pk.phase0_polys.views_of(&pk.vk.cs.permutation.polynomial_labels()),
+            domain.k(),
+            config,
+            |poly| domain.coeff_to_extended(poly.materialise()),
+        )
+    });
+    let fixed_views = fixed_cosets
+        .as_ref()
+        .map(|cosets| cosets.views())
+        .unwrap_or_else(|| polynomial_views(&pk.fixed_cosets));
+    let permutation_views = permutation_cosets
+        .as_ref()
+        .map(|cosets| cosets.views())
+        .unwrap_or_else(|| polynomial_views(&pk.sigmas.cosets));
 
     // Evaluate the numerator polynomial nu(X) of the quotient polynomial
     // h(X) = nu(X) / (X^n-1): nu(X) is a random linear combination of all
     // independent identities
-    pk.ev.evaluate_numerator::<ExtendedLagrangeCoeff>(
+    pk.ev.evaluate_numerator(
         &pk.vk.domain,
         &pk.vk.cs,
-        &advice_cosets,
-        &instance_cosets,
-        &pk.fixed_cosets,
+        &advice_views,
+        &instance_views,
+        &fixed_views,
         *y,
         *beta,
         *gamma,
@@ -611,7 +759,8 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
         &pk.l0,
         &pk.l_last,
         &pk.l_active_row,
-        &pk.sigmas.cosets,
+        &permutation_views,
+        config,
     )
 }
 
@@ -636,6 +785,7 @@ pub(crate) fn compute_h_poly<
     domain: &EvaluationDomain<F>,
     nu_poly: Polynomial<F, ExtendedLagrangeCoeff>,
     transcript: &mut T,
+    rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<argument::prover::Committed<F, Coeff>, Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -665,7 +815,7 @@ where
     let mut h_limbs = h_poly.chunks_exact(limb_len).map(|v| v.to_vec()).collect::<Vec<_>>();
     drop(h_poly);
 
-    blind_quotient_limbs(&mut h_limbs);
+    blind_quotient_limbs(&mut h_limbs, rng);
 
     let h_limbs = (h_limbs.into_iter().enumerate())
         .map(|(i, h_limb)| {
@@ -683,12 +833,15 @@ where
 /// coefficients each, without changing `h(X)`: each boundary between two limbs
 /// gets two random `t`, `t'`, added as `t X^{n-2} + t' X^{n-1}` to the lower
 /// limb and subtracted as `t + t' X` from the upper one.
-fn blind_quotient_limbs<F: PrimeField>(quotient_limbs: &mut [Vec<F>]) {
+fn blind_quotient_limbs<F: PrimeField>(
+    quotient_limbs: &mut [Vec<F>],
+    rng: &mut (impl RngCore + CryptoRng),
+) {
     let nr_limbs = quotient_limbs.len();
     assert!(nr_limbs >= 2);
 
     for i in 1..nr_limbs {
-        let (t, t_prime) = (F::random(OsRng), F::random(OsRng));
+        let (t, t_prime) = (F::random(&mut *rng), F::random(&mut *rng));
         quotient_limbs[i - 1].extend([t, t_prime]);
         quotient_limbs[i][0] -= t;
         quotient_limbs[i][1] -= t_prime;
@@ -907,6 +1060,7 @@ fn test_create_proof() {
 
     use crate::{
         circuit::SimpleFloorPlanner,
+        config::{CancelToken, ProverConfig, ProverContext},
         plonk::{keygen_pk, keygen_vk_with_k},
         poly::kzg::{KZGCommitmentScheme, params::ParamsKZG},
         transcript::CircuitTranscript,
@@ -941,6 +1095,8 @@ fn test_create_proof() {
     let vk = keygen_vk_with_k::<Fr, KZGCommitmentScheme<Bn256>, _>(&params, &MyCircuit, K)
         .expect("keygen_vk should not fail");
     let pk = keygen_pk(vk, &MyCircuit).expect("keygen_pk should not fail");
+    #[cfg(feature = "disk-spill")]
+    let pk = pk.map_key_to_disk(None).expect("empty key columns may stay on the heap");
     let mut transcript = CircuitTranscript::<_>::init();
 
     // Create proof with wrong number of instances (extra column).
@@ -968,4 +1124,143 @@ fn test_create_proof() {
         OsRng,
     )
     .expect("proof generation should not fail");
+
+    // A cancelled request must not poison a concurrent request using the
+    // same parameters and key. Each call owns its transcript and RNG.
+    let cancelled_token = CancelToken::new();
+    cancelled_token.cancel();
+    let cancelled_context = ProverContext::new(ProverConfig::heap()).with_cancel(cancelled_token);
+    let live_context = ProverContext::new(ProverConfig::heap());
+    std::thread::scope(|scope| {
+        let cancelled = scope.spawn(|| {
+            let mut transcript = CircuitTranscript::<_>::init();
+            matches!(
+                create_proof_with_context(
+                    &cancelled_context,
+                    &params,
+                    &pk,
+                    &MyCircuit,
+                    #[cfg(feature = "committed-instances")]
+                    0,
+                    &[],
+                    &mut transcript,
+                    OsRng,
+                ),
+                Err(Error::Cancelled {
+                    phase: "trace.start"
+                })
+            )
+        });
+        let live = scope.spawn(|| {
+            let mut transcript = CircuitTranscript::<_>::init();
+            create_proof_with_context(
+                &live_context,
+                &params,
+                &pk,
+                &MyCircuit,
+                #[cfg(feature = "committed-instances")]
+                0,
+                &[],
+                &mut transcript,
+                OsRng,
+            )
+            .is_ok()
+        });
+        assert!(cancelled.join().expect("cancelled proof thread panicked"));
+        assert!(live.join().expect("live proof thread panicked"));
+    });
+
+    // Pause after the proof has crossed trace.start, then cancel it while a
+    // separate request uses the same parameters and key. The next checkpoint
+    // must observe only the paused request's token.
+    #[derive(Clone)]
+    struct PausingCircuit {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl<F: Field> Circuit<F> for PausingCircuit {
+        type Config = ();
+        type FloorPlanner = SimpleFloorPlanner;
+        #[cfg(feature = "circuit-params")]
+        type Params = ();
+
+        fn without_witnesses(&self) -> Self {
+            self.clone()
+        }
+
+        fn configure(_meta: &mut ConstraintSystem<F>) -> Self::Config {}
+
+        fn synthesize(
+            &self,
+            _config: Self::Config,
+            _layouter: impl crate::circuit::Layouter<F>,
+        ) -> Result<(), Error> {
+            self.entered.send(()).expect("proof test receiver disappeared");
+            self.release
+                .lock()
+                .expect("proof test release mutex poisoned")
+                .recv()
+                .expect("proof test release sender disappeared");
+            Ok(())
+        }
+    }
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let pausing_circuit = PausingCircuit {
+        entered: entered_tx,
+        release: std::sync::Arc::new(std::sync::Mutex::new(release_rx)),
+    };
+    let in_flight_token = CancelToken::new();
+    let in_flight_context =
+        ProverContext::new(ProverConfig::heap()).with_cancel(in_flight_token.clone());
+    std::thread::scope(|scope| {
+        let paused = scope.spawn(|| {
+            let mut transcript = CircuitTranscript::<_>::init();
+            create_proof_with_context(
+                &in_flight_context,
+                &params,
+                &pk,
+                &pausing_circuit,
+                #[cfg(feature = "committed-instances")]
+                0,
+                &[],
+                &mut transcript,
+                OsRng,
+            )
+        });
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let live = scope.spawn(|| {
+            let mut transcript = CircuitTranscript::<_>::init();
+            create_proof_with_context(
+                &live_context,
+                &params,
+                &pk,
+                &MyCircuit,
+                #[cfg(feature = "committed-instances")]
+                0,
+                &[],
+                &mut transcript,
+                OsRng,
+            )
+        });
+        if entered.is_ok() {
+            in_flight_token.cancel();
+        }
+        release_tx.send(()).expect("paused proof thread disappeared");
+        assert!(
+            entered.is_ok(),
+            "proof never entered synthesis: {entered:?}"
+        );
+        assert!(matches!(
+            paused.join().expect("paused proof thread panicked"),
+            Err(Error::Cancelled {
+                phase: "trace.lookup_multiplicities"
+            })
+        ));
+        live.join()
+            .expect("independent proof thread panicked")
+            .expect("independent proof must complete");
+    });
 }
