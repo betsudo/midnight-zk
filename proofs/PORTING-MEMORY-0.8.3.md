@@ -152,6 +152,18 @@ The fixtures and provenance live in `proofs/tests/fixtures/legacy_082`.
 This does not qualify production SRS files or all cross-version circuit
 shapes.
 
+After that key-version change, the local adapter stack at proofs `120539fe`,
+Ledger transient-crypto `c21aeb5`, and ZKIR v3 adapter `9976f4c` passed
+all 53 ZKIR library tests, the three `proofs_083_memory` tests, and the
+`midnight-zkir-wasm` browser compile check. The focused tests now require
+seeded heap and mapped/spilled proofs to have identical bytes for both the
+small v3 IR and the Compact-generated Ledger9 counter, while verifying each
+proof and rejecting a wrong public input. Cargo used temporary local path
+patches and a transient-crypto 3.1.0 lock update; this is not a released
+dependency graph, browser runtime proof, or current-head CI. The edited
+ZKIR test passed `rustfmt --check`; workspace-wide formatting still reports
+differences in unrelated upstream files.
+
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
 3. Port streamed coset construction to each new 0.8.3 trace/evaluation owner. Force spill at a known `k`, assert that the spill arm ran, inject storage failures at creation and reservation, and verify both normal and fallback proofs. Measure disk bytes and RSS as well as time. The local code, fault injection, and small-circuit proof gates are in place; measurements remain.
