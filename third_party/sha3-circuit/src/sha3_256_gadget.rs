@@ -6,10 +6,9 @@ use midnight_proofs::{
     plonk::Error,
 };
 
-use crate::{constants::KECCAK_ABSORB_BYTES, instructions::Keccackf1600Instructions};
-
 #[cfg(not(doctest))]
 use crate::packed_chip::PackedChip;
+use crate::{constants::KECCAK_ABSORB_BYTES, instructions::Keccackf1600Instructions};
 
 #[derive(Debug, Clone, Copy)]
 /// Enum that represents the two supported hash modes. These are:

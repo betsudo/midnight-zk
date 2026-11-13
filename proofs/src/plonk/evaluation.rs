@@ -481,6 +481,7 @@ impl<F: PrimeField> FlatGraphEvaluator<F> {
     /// across elements (only column reads and intermediates are overwritten).
     #[inline]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::extra_unused_type_parameters)] // Keep the existing basis-typed API.
     pub fn evaluate<B: PolynomialRepresentation>(
         &self,
         values: &mut [F],

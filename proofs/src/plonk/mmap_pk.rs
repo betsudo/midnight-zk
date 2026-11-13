@@ -376,7 +376,7 @@ where
     #[allow(unsafe_code)]
     let mut mmap = unsafe { memmap2::MmapOptions::new().len(total_bytes).map_mut(&tmp)? };
     let base_ptr = mmap.as_mut_ptr() as *mut F;
-    if (base_ptr as usize) % std::mem::align_of::<F>() != 0 {
+    if !(base_ptr as usize).is_multiple_of(std::mem::align_of::<F>()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "spill mapping is misaligned for polynomial elements",

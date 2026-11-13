@@ -24,10 +24,14 @@ pub(super) fn configure_decomposition_lookup<F: PrimeField>(
     t_spread: TableColumn,
 ) {
     // enable lookups for full size limbs
-        meta.batched_lookup(format!("decomposition lookup"), Some(q_spread), |meta| {
-            let limbs = dc_advice_cols.iter().take(NUM_FULL_LIMBS).map(|adv_col| meta.query_advice(*adv_col, Rotation::cur())).collect();
-            vec![(limbs, t_spread)]
-        });
+    meta.batched_lookup(format!("decomposition lookup"), Some(q_spread), |meta| {
+        let limbs = dc_advice_cols
+            .iter()
+            .take(NUM_FULL_LIMBS)
+            .map(|adv_col| meta.query_advice(*adv_col, Rotation::cur()))
+            .collect();
+        vec![(limbs, t_spread)]
+    });
     // enable lookup for lo limbs
     meta.lookup(
         format!("decomposition lookup: limb {}", NUM_FULL_LIMBS),
@@ -45,17 +49,14 @@ pub(super) fn configure_decomposition_lookup<F: PrimeField>(
             }
         },
     );
-        meta.batched_lookup(
-            "decomposition lookup",
-            Some(q_spread),
-            |meta| {
-                // the tag is explicit and depends on the rotation
-                let tags_small = (0..=1).map(|i| meta.query_fixed(tag_cols[i], Rotation::cur())).collect();
-                let small_limbs =
-                    (0..=1).map(|i| meta.query_advice(dc_advice_cols[NUM_LIMBS - 2 + i], Rotation::cur())).collect();
-                vec![(tags_small, t_tag), (small_limbs, t_spread)]
-            },
-        );
+    meta.batched_lookup("decomposition lookup", Some(q_spread), |meta| {
+        // the tag is explicit and depends on the rotation
+        let tags_small = (0..=1).map(|i| meta.query_fixed(tag_cols[i], Rotation::cur())).collect();
+        let small_limbs = (0..=1)
+            .map(|i| meta.query_advice(dc_advice_cols[NUM_LIMBS - 2 + i], Rotation::cur()))
+            .collect();
+        vec![(tags_small, t_tag), (small_limbs, t_spread)]
+    });
 }
 
 /// Configures a gate to perform linear combination

@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use ff::{PrimeField, WithSmallOrderMulGroup};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
+#[cfg(feature = "disk-spill")]
+use crate::plonk::mmap_pk::{MmappedPolys, spill_iter_to_disk};
 use crate::{
     plonk::{
         AbsorbedVk, ConstraintSystem, Error,
@@ -16,9 +18,6 @@ use crate::{
     transcript::{Hashable, Transcript},
     utils::arithmetic::eval_polynomial,
 };
-
-#[cfg(feature = "disk-spill")]
-use crate::plonk::mmap_pk::{MmappedPolys, spill_iter_to_disk};
 
 #[derive(Debug)]
 enum CommittedPolys<F, B> {

@@ -554,8 +554,9 @@ where
         })
     }
 
-    /// Identifies the private 0.8.3 affine companion layout for this curve and k.
-    /// It is a cache compatibility check, not a digest of the SRS contents.
+    /// Identifies the private 0.8.3 affine companion layout for this curve and
+    /// k. It is a cache compatibility check, not a digest of the SRS
+    /// contents.
     #[cfg(feature = "mmap")]
     fn companion_identity(k: u32) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -843,8 +844,7 @@ mod test {
             SerdeFormat::RawBytesUnchecked,
         ] {
             let err = ParamsKZG::<Bls12>::read_custom(&mut &data[..], format)
-                .err()
-                .expect("oversized k must be rejected");
+                .expect_err("oversized k must be rejected");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 
             let boundary = Fq::S.to_le_bytes();
@@ -869,8 +869,7 @@ mod test {
         params.write_custom(&mut bytes, SerdeFormat::RawBytesUnchecked).unwrap();
         bytes.truncate(bytes.len() - 1);
         let err = ParamsKZG::<Bls12>::read_custom(&mut &bytes[..], SerdeFormat::RawBytesUnchecked)
-            .err()
-            .expect("truncated raw SRS must fail");
+            .expect_err("truncated raw SRS must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
@@ -1018,8 +1017,9 @@ mod test {
 
     #[test]
     fn test_lazy_parameter_read_preserves_wire_and_derives_lagrange_on_use() {
-        use midnight_curves::Bls12;
         use std::io::Cursor;
+
+        use midnight_curves::Bls12;
 
         let original: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(4, OsRng);
         for format in [
@@ -1097,8 +1097,9 @@ mod test {
     #[allow(unsafe_code)]
     #[test]
     fn test_affine_mmap_companion_round_trip_and_downsize() {
-        use midnight_curves::Bls12;
         use std::sync::Arc;
+
+        use midnight_curves::Bls12;
 
         let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(4, OsRng);
         let mut file = tempfile::tempfile().unwrap();
@@ -1132,8 +1133,9 @@ mod test {
     #[allow(unsafe_code)]
     #[test]
     fn test_affine_mmap_companion_rejects_old_and_damaged_layouts() {
-        use midnight_curves::Bls12;
         use std::sync::Arc;
+
+        use midnight_curves::Bls12;
 
         fn load(bytes: &[u8]) -> std::io::Result<ParamsKZG<Bls12>> {
             let mut mapping = memmap2::MmapMut::map_anon(bytes.len().max(1)).unwrap();
@@ -1156,7 +1158,7 @@ mod test {
         for at in [8, 16, 20, 24, 32, 40, 48] {
             let mut damaged = good.clone();
             damaged[at] ^= 1;
-            let error = load(&damaged).err().expect("damaged companion was accepted");
+            let error = load(&damaged).expect_err("damaged companion was accepted");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "offset {at}");
         }
         assert_eq!(

@@ -61,6 +61,7 @@ where
 /// are zero-padded internally.
 ///
 /// The trace can then be used to finalise the proof.
+#[allow(clippy::too_many_arguments)] // Preserve the trace call shape across feature sets.
 pub(crate) fn compute_trace<
     'a,
     F,
@@ -458,6 +459,7 @@ where
 ///
 /// The existing [`create_proof`] entry point retains its original signature.
 /// With `disk-spill` disabled, this policy takes the heap path.
+#[allow(clippy::too_many_arguments)] // Public policy-aware entry point.
 pub fn create_proof_with<
     F,
     CS: PolynomialCommitmentScheme<F>,
@@ -501,6 +503,7 @@ where
 /// The policy-only [`create_proof_with`] and original [`create_proof`] entry
 /// points retain their signatures. Cancellation is checked between the main
 /// trace and finalisation stages; an in-progress stage runs to its next check.
+#[allow(clippy::too_many_arguments)] // Public request-context entry point.
 pub fn create_proof_with_context<
     F,
     CS: PolynomialCommitmentScheme<F>,

@@ -419,9 +419,11 @@ pub(in crate::plonk) fn build_phase0_polys<F: WithSmallOrderMulGroup<3>>(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // Keep the policy regression next to its helper.
 mod keygen_coset_cache_tests {
-    use super::*;
     use midnight_curves::Fq;
+
+    use super::*;
 
     fn build_with_policy(policy: &ProverConfig) -> (usize, usize) {
         let domain = EvaluationDomain::<Fq>::new(4, 4);

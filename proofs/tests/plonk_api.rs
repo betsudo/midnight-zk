@@ -697,7 +697,7 @@ fn plonk_api() {
             a: Value::unknown(),
             lookup_table: circuit.lookup_table.clone(),
         };
-        let spill_vk = keygen_vk::<Scalar, Scheme, _>(&mut params, &empty_circuit).unwrap();
+        let spill_vk = keygen_vk::<Scalar, Scheme, _>(&params, &empty_circuit).unwrap();
         let spill_pk = keygen_pk_with(spill_vk, &empty_circuit, &spill_policy).unwrap();
         let serialized_key = spill_pk.to_bytes(SerdeFormat::Processed);
         let loaded_pk = ProvingKey::<Scalar, Scheme>::read_with_policy::<_, MyCircuit<Scalar>>(
@@ -714,12 +714,12 @@ fn plonk_api() {
             SerdeFormat::Processed,
             #[cfg(feature = "circuit-params")]
             (),
-            &ProverConfig::process(),
+            ProverConfig::process(),
         )
         .expect("the heap-key load policy should succeed");
         assert_eq!(heap_pk.to_bytes(SerdeFormat::Processed), serialized_key);
         let mapped_only_policy = ProverConfig::mapped_key();
-        let mapped_only_vk = keygen_vk::<Scalar, Scheme, _>(&mut params, &empty_circuit).unwrap();
+        let mapped_only_vk = keygen_vk::<Scalar, Scheme, _>(&params, &empty_circuit).unwrap();
         let generated_mapped_only_pk =
             keygen_pk_with(mapped_only_vk, &empty_circuit, &mapped_only_policy).unwrap();
         assert_eq!(
@@ -741,9 +741,9 @@ fn plonk_api() {
         );
         let failing_policy = ProverConfig {
             spill_dir: Some("/nonexistent-midnight-spill-dir/for-this-test".into()),
-            ..spill_policy.clone()
+            ..spill_policy
         };
-        let failing_vk = keygen_vk::<Scalar, Scheme, _>(&mut params, &empty_circuit).unwrap();
+        let failing_vk = keygen_vk::<Scalar, Scheme, _>(&params, &empty_circuit).unwrap();
         assert_matches!(
             keygen_pk_with(failing_vk, &empty_circuit, &failing_policy),
             Err(Error::KeyStorage(_))
