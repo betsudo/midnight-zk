@@ -564,6 +564,17 @@ fn plonk_api() {
         params.write_custom(&mut roundtrip, SerdeFormat::RawBytes).unwrap();
         assert_eq!(roundtrip, bytes, "ordinary SRS bytes changed on round trip");
 
+        // Ledger9's trusted-file loader uses this unchecked mode. Compare
+        // its result to the checked file bytes before downsizing.
+        let unchecked = ParamsKZG::<Bls12>::read_custom(
+            &mut Cursor::new(&bytes),
+            SerdeFormat::RawBytesUnchecked,
+        )
+        .expect("read ceremony SRS through the Ledger9 loader format");
+        let mut unchecked_roundtrip = Vec::new();
+        unchecked.write_custom(&mut unchecked_roundtrip, SerdeFormat::RawBytes).unwrap();
+        assert_eq!(unchecked_roundtrip, bytes);
+
         let lazy =
             ParamsKZG::<Bls12>::read_custom_lazy(&mut Cursor::new(&bytes), SerdeFormat::RawBytes)
                 .expect("read ceremony SRS with deferred Lagrange basis");
@@ -573,6 +584,16 @@ fn plonk_api() {
             lazy_roundtrip, bytes,
             "lazy SRS basis differs from the file"
         );
+        let lazy_unchecked = ParamsKZG::<Bls12>::read_custom_lazy(
+            &mut Cursor::new(&bytes),
+            SerdeFormat::RawBytesUnchecked,
+        )
+        .expect("read ceremony SRS through the Ledger9 lazy loader format");
+        let mut lazy_unchecked_roundtrip = Vec::new();
+        lazy_unchecked
+            .write_custom(&mut lazy_unchecked_roundtrip, SerdeFormat::RawBytes)
+            .unwrap();
+        assert_eq!(lazy_unchecked_roundtrip, bytes);
 
         #[cfg(feature = "mmap")]
         {

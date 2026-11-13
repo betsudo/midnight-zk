@@ -161,12 +161,13 @@ modified. Set `MIDNIGHT_PROOFS_TEST_CEREMONY_SRS` to that tracked file and run
 `cargo test -p midnight-proofs --test plonk_api -- plonk_api --exact` with
 default features or add `--features mmap,disk-spill`. Both local gates passed.
 The test read and byte-round-tripped the full k=14 file through ordinary and
-lazy readers; the mmap gate also built and round-tripped a full-size affine
-companion. It then downsized the parameters to the test circuit's k=5 and
-generated and verified a proof, including the mapped-parameter branch with
-the native features. This checks compatibility with the exact tracked file,
-not ceremony provenance, a k=14 circuit, a k>=18 SRS, or a Ledger9 server
-request using these bytes.
+lazy readers in both checked `RawBytes` and Ledger9's trusted-file
+`RawBytesUnchecked` modes; the mmap gate also built and round-tripped a
+full-size affine companion. It then downsized the parameters to the test
+circuit's k=5 and generated and verified a proof, including the mapped
+parameter branch with the native features. This checks compatibility with
+the exact tracked file, not ceremony provenance, a k=14 circuit, a k>=18
+SRS, or a Ledger9 server request using these bytes.
 
 After that key-version change, the local adapter stack at proofs `120539fe`,
 Ledger transient-crypto `c21aeb5`, and ZKIR v3 adapter `9976f4c` passed
