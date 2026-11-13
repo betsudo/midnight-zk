@@ -30,3 +30,19 @@ be pinned by an immutable betsudo commit or a reviewed release. The 0.8.2
 Compact v3 key/proof artifacts are incompatible with this source line; stored
 keys require a versioned conversion or regeneration policy before rollout.
 Exact-head CI and released-package qualification remain open.
+
+## Focused native safety gate
+
+On the local 0.8.4 source based on `ef4cc33e`, the locked proof workspace
+passed `cargo test --offline --locked -p midnight-proofs --features disk-spill
+mmap_pk::test::` (8 tests) and the `affine_mmap_companion` filter (3 tests).
+The spill tests cover round trips, zero-fill fallback, reservation errors
+before exposing a mapping, empty batches, mapped lifetime, and malformed
+length/count rejection. The companion tests cover round trip/downsize,
+damaged or older layouts, and no-replace publication. A default-feature
+`cargo check --offline --locked -p midnight-proofs` also passed.
+
+These focused checks validate the local code paths; they do not simulate an
+actual full filesystem or an external process rewriting a trusted mapped
+file. The caller's immutable-file obligation remains part of the unsafe
+mapping contract.
