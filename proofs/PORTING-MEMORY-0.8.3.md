@@ -126,8 +126,10 @@ The local `sync/proofs-083-phase0-stream` build gate passed native
 no-default features using Homebrew LLVM 20.1.6 as `CC` for `blst`. Opting
 into `mmap` or `disk-spill` on Wasm failed only at the crate's intended
 capability `compile_error!` declarations. This checks the proofs crate at a
-local head; it does not qualify the external ZKIR/stdlib browser consumer or
-replace exact-head CI.
+local head. `cargo check -p midnight-zk-stdlib --target
+wasm32-unknown-unknown` also passed at this head and resolved
+`midnight-proofs` from this workspace. These checks do not qualify the
+external ZKIR browser consumer or replace exact-head CI.
 
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
