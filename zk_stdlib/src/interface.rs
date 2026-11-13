@@ -24,7 +24,7 @@ use midnight_proofs::{
     dev::cost_model::{CircuitModel, circuit_model},
     plonk::{
         self, Circuit, ConstraintSystem, Error, ProvingKey, VerifyingKey,
-        create_proof_with_context, keygen_pk, keygen_vk_with_k, prepare,
+        create_proof_with_context, keygen_pk, keygen_pk_with, keygen_vk_with_k, prepare,
     },
     poly::{
         commitment::Guard,
@@ -567,6 +567,29 @@ pub fn setup_pk<R: Relation, PCS: MidnightPCS>(
         relation: relation.clone(),
         pk,
     }
+}
+
+/// Generate a proving key with explicit storage and coset policy.
+///
+/// The original [`setup_pk`] keeps its signature and process-default
+/// behavior. Mapping failures are returned to the caller of this opt-in API.
+pub fn setup_pk_with_config<R: Relation, PCS: MidnightPCS>(
+    relation: &R,
+    vk: &MidnightVK<PCS>,
+    config: &ProverConfig,
+) -> Result<MidnightPK<R, PCS>, Error> {
+    let circuit = MidnightCircuit::new(
+        relation,
+        Value::unknown(),
+        Value::unknown(),
+        Some(vk.k() as u32),
+    );
+    let pk = keygen_pk_with(vk.vk.clone(), &circuit, config)?;
+    Ok(MidnightPK {
+        k: vk.k(),
+        relation: relation.clone(),
+        pk,
+    })
 }
 
 /// Produces a proof of relation `R` for the given instance (using the given

@@ -229,8 +229,16 @@ circuit), generated mapped keys both with and without coset spill, compared
 their serialized keys and seeded proofs with loaded/heap variants, verified
 the proofs, and checked a failing mapping directory. Circuit synthesis still
 owns all fixed and permutation Lagrange columns before mapping, and the three
-extended-domain selectors remain heap-backed. No representative keygen RSS
-or disk peak has been measured for this change.
+extended-domain selectors remain heap-backed. The subsequent opt-in stdlib
+`setup_pk_with_config` entry point exposes the typed keygen policy to external
+ZKIR v3 without changing `setup_pk`. The Ledger9 Compact k=18 / 147,048-row
+fixture measured this path on one macOS host: sampled keygen RSS was
+3,270,160 KiB for heap and 2,934,336 KiB for mapped keygen, with 721,420,288
+bytes of sampled live keygen spill. Keygen took 14.03 and 23.16 seconds
+respectively. Both arms verified a proof using the same mapped-key and
+coset-spill proving policy. The fixture, raw samples, and limitations are
+recorded in Ledger `proof-server/tests/compact-v3-hash-chain-k18/README.md`;
+these exploratory one-run measurements do not select a release default.
 
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
