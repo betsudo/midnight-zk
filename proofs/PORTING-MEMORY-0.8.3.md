@@ -128,8 +128,19 @@ into `mmap` or `disk-spill` on Wasm failed only at the crate's intended
 capability `compile_error!` declarations. This checks the proofs crate at a
 local head. `cargo check -p midnight-zk-stdlib --target
 wasm32-unknown-unknown` also passed at this head and resolved
-`midnight-proofs` from this workspace. These checks do not qualify the
-external ZKIR browser consumer or replace exact-head CI.
+`midnight-proofs` from this workspace. These checks do not replace
+exact-head CI.
+
+The external ZKIR v3 browser consumer also passed `cargo check --locked
+-p midnight-zkir-wasm --target wasm32-unknown-unknown` with ZKIR adapter
+`ead311c`, Ledger transient-crypto adapter `c21aeb5`, and this proofs
+branch at `a4438343`. The disposable build patched the local ZK proofs,
+curves, circuits, stdlib, and Ledger base/serialize/storage/transient crates
+into ZKIR's Cargo graph, including the Git-sourced proofs dependency in
+`sha3-circuit`. Its temporary lockfile was updated from transient-crypto
+3.0.0 to 3.1.0; the resulting Wasm graph contained only proofs 0.8.3 and
+did not enable `mmap` or `disk-spill`. This is a browser **compile** gate,
+not a browser runtime proof, a released-package build, or current-head CI.
 
 1. Create a code branch from the recorded 0.8.3 baseline. Add the capability features and read-only affine SRS storage with a new, versioned companion format. Test ordinary parameter and companion round trips, corrupt/truncated input, and immutable publication. No serialized 0.8.2 artifact is accepted by accident.
 2. Port the policy-aware key loader and keygen behavior to the new phase-0 key. Prove and verify the same generated circuit with heap and mapped parameters. Test the default heap path for the #2 regression.
