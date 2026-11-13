@@ -204,6 +204,19 @@ parameter branch with the native features. This checks compatibility with
 the exact tracked file, not ceremony provenance, a k=14 circuit, a k>=18
 SRS, or a Ledger9 server request using these bytes.
 
+An additional opt-in `plonk_api` gate now retains that tracked SRS at its
+native k=14 instead of downsizing it. Set both
+`MIDNIGHT_PROOFS_TEST_CEREMONY_SRS` to the tracked Ledger9 file and
+`MIDNIGHT_PROOFS_TEST_CEREMONY_FULL_K=1`, then run `cargo test -p
+midnight-proofs --features mmap --test plonk_api plonk_api -- --exact`.
+It explicitly constructs k=14 verifying keys (`n=16,384`) and generates and
+verifies one proof with ordinary heap parameters and one with the immutable
+mapped affine companion. The full-k mode returns before the small-circuit
+storage-policy and FFLONK variants; those remain in the ordinary test path.
+Both the full-k mode and ordinary `mmap` path passed locally. The circuit
+still has only the original small test's rows, and this gate does not exercise
+Ledger's parameter provider, a production proof request, or current-head CI.
+
 After that key-version change, the local adapter stack at proofs `120539fe`,
 Ledger transient-crypto `c21aeb5`, and ZKIR v3 adapter `9976f4c` passed
 all 53 ZKIR library tests, the three `proofs_083_memory` tests, and the

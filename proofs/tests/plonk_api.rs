@@ -443,6 +443,7 @@ fn plonk_api() {
 
     fn keygen<F, Scheme: PolynomialCommitmentScheme<F>>(
         params: &mut Scheme::Parameters,
+        explicit_k: Option<u32>,
     ) -> ProvingKey<F, Scheme>
     where
         F: FromUniformBytes<64> + WithSmallOrderMulGroup<3> + Ord,
@@ -454,7 +455,12 @@ fn plonk_api() {
         };
 
         // Initialize the proving key
-        let vk = keygen_vk(params, &empty_circuit).expect("keygen_vk should not fail");
+        let vk = if let Some(k) = explicit_k {
+            keygen_vk_with_k(params, &empty_circuit, k)
+        } else {
+            keygen_vk(params, &empty_circuit)
+        }
+        .expect("keygen_vk should not fail");
 
         keygen_pk(vk, &empty_circuit).expect("keygen_pk should not fail")
     }
@@ -547,6 +553,11 @@ fn plonk_api() {
     bad_keys!(Scalar, Scheme);
 
     let rng = OsRng;
+    let full_ceremony_k = std::env::var_os("MIDNIGHT_PROOFS_TEST_CEREMONY_FULL_K").is_some();
+    assert!(
+        !full_ceremony_k || std::env::var_os("MIDNIGHT_PROOFS_TEST_CEREMONY_SRS").is_some(),
+        "full-k gate requires a ceremony SRS file"
+    );
     // Opt-in gate for a translated ceremony SRS. Keep the ordinary test
     // self-contained, but exercise exact Ledger9 parameter bytes when the
     // file is available locally.
@@ -615,13 +626,20 @@ fn plonk_api() {
             assert_eq!(mapped_roundtrip, bytes, "mapped SRS differs from the file");
         }
 
-        params.downsize(K);
+        if full_ceremony_k {
+            assert_eq!(params.max_k(), 14, "full-k gate expects Ledger9's k=14 SRS");
+        } else {
+            params.downsize(K);
+        }
         params
     } else {
         ParamsKZG::<Bls12>::unsafe_setup(K, rng)
     };
 
-    let pk = keygen::<Scalar, Scheme>(&mut params);
+    let pk = keygen::<Scalar, Scheme>(&mut params, full_ceremony_k.then_some(14));
+    if full_ceremony_k {
+        assert_eq!(pk.get_vk().n(), 1 << 14);
+    }
 
     let proof = create_proof::<Scalar, Scheme, CircuitTranscript<State>, _>(rng, &params, &pk);
 
@@ -630,6 +648,35 @@ fn plonk_api() {
         pk.get_vk(),
         &proof[..],
     );
+
+    if full_ceremony_k {
+        // Keep this opt-in gate to one heap proof and one mapped-parameter
+        // proof. The ordinary test below covers the other storage policies
+        // and FFLONK on its small synthetic circuit.
+        #[cfg(feature = "mmap")]
+        {
+            let mut companion = Vec::new();
+            params.write_mmap_companion(&mut companion).unwrap();
+            let mut mapping = memmap2::MmapMut::map_anon(companion.len()).unwrap();
+            mapping[..companion.len()].copy_from_slice(&companion);
+            let mapping = std::sync::Arc::new(mapping.make_read_only().unwrap());
+            // SAFETY: this test owns the immutable mapping until the mapped
+            // parameters and proof have both been dropped.
+            let mut mapped = unsafe { ParamsKZG::<Bls12>::read_mmap_arc(mapping) }.unwrap();
+            assert_eq!(mapped.max_k(), 14);
+            let mapped_pk = keygen::<Scalar, Scheme>(&mut mapped, Some(14));
+            assert_eq!(mapped_pk.get_vk().n(), 1 << 14);
+            let mapped_proof = create_proof::<Scalar, Scheme, CircuitTranscript<State>, _>(
+                OsRng, &mapped, &mapped_pk,
+            );
+            verify_proof::<_, _, CircuitTranscript<State>>(
+                &mapped.verifier_params(),
+                mapped_pk.get_vk(),
+                &mapped_proof,
+            );
+        }
+        return;
+    }
 
     #[cfg(feature = "disk-spill")]
     {
@@ -777,7 +824,7 @@ fn plonk_api() {
         // SAFETY: the test owns this immutable anonymous mapping until the
         // mapped parameters and proof are dropped.
         let mut mapped = unsafe { ParamsKZG::<Bls12>::read_mmap_arc(mapping) }.unwrap();
-        let mapped_pk = keygen::<Scalar, Scheme>(&mut mapped);
+        let mapped_pk = keygen::<Scalar, Scheme>(&mut mapped, None);
         let mapped_proof =
             create_proof::<Scalar, Scheme, CircuitTranscript<State>, _>(OsRng, &mapped, &mapped_pk);
         verify_proof::<_, _, CircuitTranscript<State>>(
@@ -793,7 +840,7 @@ fn plonk_api() {
 
         let mut params = Fflonk::<Scheme, LOG2_T_MAX>::gen_params(K);
 
-        let pk = keygen::<Scalar, Fflonk<Scheme, LOG2_T_MAX>>(&mut params);
+        let pk = keygen::<Scalar, Fflonk<Scheme, LOG2_T_MAX>>(&mut params, None);
 
         let proof = create_proof::<Scalar, Fflonk<Scheme, LOG2_T_MAX>, CircuitTranscript<State>, _>(
             OsRng, &params, &pk,
