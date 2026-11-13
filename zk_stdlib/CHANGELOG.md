@@ -9,6 +9,7 @@ We use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 ### Added
 * `prove_with_context` on the relation and PLONK adapters forwards a caller-owned memory and cancellation policy to `midnight-proofs` 0.8.2; the existing `prove` entry points keep their process defaults.
+* `MidnightPK::read_with_policy` forwards an explicit key-load storage policy; `read` retains the process policy.
 ### Changed
 ### Removed
 

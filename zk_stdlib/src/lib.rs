@@ -100,7 +100,7 @@ use midnight_curves::{
 };
 use midnight_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
-    config::ProverContext,
+    config::{ProverConfig, ProverContext},
     dev::cost_model::{circuit_model, CircuitModel},
     plonk::{
         self, keygen_vk_with_k, prepare, Circuit, ConstraintSystem, Error, ProvingKey, VerifyingKey,
@@ -1642,6 +1642,20 @@ impl<Rel: Relation> MidnightPK<Rel> {
     /// # WARNING
     /// Use `RawBytesUnchecked` only if you trust the party who wrote the key.
     pub fn read<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self> {
+        Self::read_with_policy(reader, format, ProverConfig::process())
+    }
+
+    /// Reads a proving key using the caller's storage policy.
+    ///
+    /// The compatibility [`Self::read`] method retains the process policy.
+    /// A request that selects mapped key storage must pass the same policy
+    /// here and to the prover context; otherwise key loading can eagerly
+    /// materialize cosets on the heap before proving begins.
+    pub fn read_with_policy<R: io::Read>(
+        reader: &mut R,
+        format: SerdeFormat,
+        policy: &ProverConfig,
+    ) -> io::Result<Self> {
         let mut byte = [0u8; 1];
 
         reader.read_exact(&mut byte)?;
@@ -1649,7 +1663,7 @@ impl<Rel: Relation> MidnightPK<Rel> {
 
         let relation = Rel::read_relation(reader)?;
 
-        let pk = ProvingKey::read::<R, MidnightCircuit<Rel>>(
+        let pk = ProvingKey::read_with_policy::<R, MidnightCircuit<Rel>>(
             reader,
             format,
             MidnightCircuit::new(
@@ -1659,6 +1673,7 @@ impl<Rel: Relation> MidnightPK<Rel> {
                 Some(k as u32),
             )
             .params(),
+            policy,
         )?;
 
         Ok(MidnightPK { k, relation, pk })
