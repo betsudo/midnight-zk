@@ -810,9 +810,9 @@ mod tests {
     #[test]
     fn cost_model() {
         let k = 9;
-        let mut random_byte = [0u8; 1];
-        OsRng::fill_bytes(&mut OsRng, &mut random_byte);
-        let circuit = StandardPlonk::<1>(Fq::from(random_byte[0] as u64));
+        // The lookup table contains 1..=256, so zero is not a valid witness.
+        // Circuit size is independent of the witness value; keep this stable.
+        let circuit = StandardPlonk::<1>(Fq::from(7u64));
 
         let params = ParamsKZG::<Bls12>::unsafe_setup(k, OsRng);
         let vk = keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&params, &circuit, k)
