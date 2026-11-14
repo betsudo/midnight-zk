@@ -7,16 +7,18 @@
 use midnight_curves::{Bls12, Fq};
 use midnight_proofs::{
     circuit::{Layouter, Value},
-    config::{CancelToken, ProverConfig, ProverContext},
+    config::{CancelToken, ProverConfig, ProverContext, DISK_SPILL_AVAILABLE},
     plonk::Error,
     poly::kzg::params::ParamsKZG,
 };
 use midnight_zk_stdlib::{Relation, ZkStdLib};
 use rand::{rngs::StdRng, SeedableRng};
 
-#[cfg(not(feature = "disk-spill"))]
 #[test]
 fn mapped_key_load_requires_disk_spill_capability() {
+    if DISK_SPILL_AVAILABLE {
+        return;
+    }
     use std::io::ErrorKind;
 
     use midnight_proofs::utils::SerdeFormat;
@@ -110,8 +112,7 @@ fn released_stdlib_context_and_compatibility_proofs_verify() {
     let vk = midnight_zk_stdlib::setup_vk(&params, &relation);
     let pk = midnight_zk_stdlib::setup_pk(&relation, &vk);
 
-    #[cfg(not(feature = "disk-spill"))]
-    {
+    if !DISK_SPILL_AVAILABLE {
         let policy = ProverConfig {
             spill_cosets: true,
             coset_spill_floor_k: 0,

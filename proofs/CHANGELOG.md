@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 ### Added
 * Request policy calls now return an explicit error when mapped proving keys or
-  coset disk spill are requested without the `disk-spill` build feature.
+  coset disk spill are requested without the `disk-spill` build feature,
+  including explicit-policy key generation.
 * `keygen_pk_with_policy`: generate a proving key under an explicit
   `ProverConfig`, the same seam `ProvingKey::read_with_policy` gives key
   loading. `keygen_pk` calls it with the process policy, so existing callers
@@ -19,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/memory-profile.md`.
 
 ### Changed
+* Context-free entry points continue to ignore spill environment flags when
+  this build lacks `disk-spill`; explicit policies report the missing feature.
+  Adding a request token to a process context keeps observing the legacy
+  host-wide cancellation flag without letting that request set the flag.
 * **`keygen_pk` no longer defers the extended-domain cosets under every
   policy.** It deferred them unconditionally, so a key from keygen and a key
   read back from its own bytes disagreed: every prove from a generated key paid
