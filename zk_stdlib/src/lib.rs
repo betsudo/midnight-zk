@@ -2042,6 +2042,8 @@ where
     prove_with_context_inner::<R, H>(context, params, pk, relation, instance, witness, rng, true)
 }
 
+// Keep the public proving signatures unchanged while sharing their implementation.
+#[allow(clippy::too_many_arguments)]
 fn prove_with_context_inner<R: Relation, H: TranscriptHash>(
     context: &ProverContext,
     params: &ParamsKZG<midnight_curves::Bls12>,
