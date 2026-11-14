@@ -100,6 +100,7 @@ use midnight_curves::{
 };
 use midnight_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
+    config::{ProverConfig, ProverContext},
     dev::cost_model::{circuit_model, CircuitModel},
     plonk::{
         self, keygen_vk_with_k, prepare, Circuit, ConstraintSystem, Error, ProvingKey, VerifyingKey,
@@ -1130,14 +1131,6 @@ where
     ) -> Result<(), Error> {
         self.native_gadget.constrain_as_public_input(layouter, assigned)
     }
-
-    fn assign_as_public_input(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        value: Value<<T>::Element>,
-    ) -> Result<T, Error> {
-        self.native_gadget.assign_as_public_input(layouter, value)
-    }
 }
 
 impl<T> CommittedInstanceInstructions<F, T> for ZkStdLib
@@ -1621,6 +1614,8 @@ pub struct MidnightPK<R: Relation> {
     k: u8,
     relation: R,
     pk: ProvingKey<midnight_curves::Fq, KZGCommitmentScheme<midnight_curves::Bls12>>,
+    /// In-memory provenance only; the serialized key format is unchanged.
+    mapped_loaded: bool,
 }
 
 impl<Rel: Relation> MidnightPK<Rel> {
@@ -1649,6 +1644,23 @@ impl<Rel: Relation> MidnightPK<Rel> {
     /// # WARNING
     /// Use `RawBytesUnchecked` only if you trust the party who wrote the key.
     pub fn read<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self> {
+        Self::read_with_policy(reader, format, ProverConfig::process())
+    }
+
+    /// Reads a proving key using the caller's storage policy.
+    ///
+    /// The compatibility [`Self::read`] method retains the process policy.
+    /// An explicit mapped proof request needs a key read under the mapped
+    /// policy. The context prover rejects a generated or heap-loaded key so
+    /// its stored polynomials cannot silently remain on the heap.
+    /// Mapped key requests fail with `Unsupported` unless the dependency graph
+    /// enables `midnight-proofs/disk-spill` (for example through this crate's
+    /// opt-in `disk-spill` feature).
+    pub fn read_with_policy<R: io::Read>(
+        reader: &mut R,
+        format: SerdeFormat,
+        policy: &ProverConfig,
+    ) -> io::Result<Self> {
         let mut byte = [0u8; 1];
 
         reader.read_exact(&mut byte)?;
@@ -1656,7 +1668,7 @@ impl<Rel: Relation> MidnightPK<Rel> {
 
         let relation = Rel::read_relation(reader)?;
 
-        let pk = ProvingKey::read::<R, MidnightCircuit<Rel>>(
+        let pk = ProvingKey::read_with_policy::<R, MidnightCircuit<Rel>>(
             reader,
             format,
             MidnightCircuit::new(
@@ -1666,9 +1678,15 @@ impl<Rel: Relation> MidnightPK<Rel> {
                 Some(k as u32),
             )
             .params(),
+            policy,
         )?;
 
-        Ok(MidnightPK { k, relation, pk })
+        Ok(MidnightPK {
+            k,
+            relation,
+            pk,
+            mapped_loaded: policy.map_prover_key,
+        })
     }
 
     /// The size of the domain associated to this proving key.
@@ -1976,6 +1994,8 @@ pub fn setup_pk<R: Relation>(relation: &R, vk: &MidnightVK) -> MidnightPK<R> {
         k: vk.k(),
         relation: relation.clone(),
         pk,
+        // Keygen may defer cosets, but does not map the stored key polynomials.
+        mapped_loaded: false,
     }
 }
 
@@ -1993,6 +2013,58 @@ where
     G1Projective: Hashable<H>,
     F: Hashable<H> + Sampleable<H>,
 {
+    prove_with_context_inner::<R, H>(
+        &ProverContext::process(),
+        params,
+        pk,
+        relation,
+        instance,
+        witness,
+        rng,
+        false,
+    )
+}
+
+/// Produce a proof with a request-owned memory and cancellation context.
+pub fn prove_with_context<R: Relation, H: TranscriptHash>(
+    context: &ProverContext,
+    params: &ParamsKZG<midnight_curves::Bls12>,
+    pk: &MidnightPK<R>,
+    relation: &R,
+    instance: &R::Instance,
+    witness: R::Witness,
+    rng: impl RngCore + CryptoRng,
+) -> Result<Vec<u8>, R::Error>
+where
+    G1Projective: Hashable<H>,
+    F: Hashable<H> + Sampleable<H>,
+{
+    prove_with_context_inner::<R, H>(context, params, pk, relation, instance, witness, rng, true)
+}
+
+// Keep the public proving signatures unchanged while sharing their
+// implementation.
+#[allow(clippy::too_many_arguments)]
+fn prove_with_context_inner<R: Relation, H: TranscriptHash>(
+    context: &ProverContext,
+    params: &ParamsKZG<midnight_curves::Bls12>,
+    pk: &MidnightPK<R>,
+    relation: &R,
+    instance: &R::Instance,
+    witness: R::Witness,
+    rng: impl RngCore + CryptoRng,
+    require_mapped_load: bool,
+) -> Result<Vec<u8>, R::Error>
+where
+    G1Projective: Hashable<H>,
+    F: Hashable<H> + Sampleable<H>,
+{
+    if require_mapped_load && context.config.map_prover_key && !pk.mapped_loaded {
+        return Err(Error::Synthesis(
+            "mapped proof request requires a key loaded under the mapped policy".into(),
+        )
+        .into());
+    }
     let pi = R::format_instance(instance)?;
     let com_inst = R::format_committed_instances(&witness);
     let circuit = MidnightCircuit::new(
@@ -2001,7 +2073,8 @@ where
         Value::known(witness),
         Some(pk.k as u32),
     );
-    BlstPLONK::<MidnightCircuit<R>>::prove::<H>(
+    BlstPLONK::<MidnightCircuit<R>>::prove_with_context::<H>(
+        context,
         params,
         &pk.pk,
         &circuit,

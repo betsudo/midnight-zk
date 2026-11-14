@@ -331,6 +331,12 @@ where
     CS: PolynomialCommitmentScheme<F>,
     ConcreteCircuit: Circuit<F>,
 {
+    #[cfg(not(feature = "disk-spill"))]
+    if policy.map_prover_key {
+        return Err(Error::Synthesis(
+            "mapped prover keys require the midnight-proofs/disk-spill feature".into(),
+        ));
+    }
     crate::plonk::prover::log_phase_pub("keygen_pk.start");
     let mut cs = ConstraintSystem::default();
     #[cfg(feature = "circuit-params")]

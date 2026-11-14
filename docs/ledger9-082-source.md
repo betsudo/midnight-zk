@@ -1,0 +1,16 @@
+# Ledger9 ZK 0.8.2 source alignment
+
+Ledger 9.1.0.1 resolves `midnight-proofs` 0.8.2, `midnight-circuits` 7.3.0, and `midnight-zk-stdlib` 2.4.0. This branch keeps the fork's optimized proofs 0.8.2 implementation and replaces the local circuits and stdlib source with the exact published 7.3.0 and 2.4.0 crate contents. The original, pre-normalization `Cargo.toml.orig` from each crate is used as its workspace manifest. The released package checksums recorded in the Ledger tag's `Cargo.lock` are:
+
+| Package | crates.io checksum |
+| --- | --- |
+| `midnight-circuits` 7.3.0 | `79ba23314560e105bb1da33551199ae9abaa25188589d8308caddbcd8d1f3448` |
+| `midnight-zk-stdlib` 2.4.0 | `73819f4cd779e365545109dbbd759fe0055df4ea73f6e0ddb873281c1c8014ec` |
+
+The published circuit source and original manifest compare byte-for-byte with this branch, excluding Cargo's registry metadata and crate-local `LICENSE` copy (the workspace license remains). The published stdlib source was the starting point; fork changes add `prove_with_context`, `MidnightPK::read_with_policy`, the opt-in `disk-spill` manifest feature, context tests, and changelog entries. The adapter keeps the prior `prove` signatures and delegates them to process defaults. The tracked static VK fixtures were aligned with the published stdlib source; the context adapter did not regenerate them.
+
+The upstream `main` tree at `24a1eb5a` is **not** the released 7.3.0/2.4.0 source: it already uses the later 0.8.3/FFLONK API despite retaining those crate version labels. Transplanting that tree onto proofs 0.8.2 fails to compile. The released crate contents are the reference for this stable compatibility line; upstream `main` continues separately.
+
+The opt-in `midnight-zk-stdlib/disk-spill` feature enables the underlying `midnight-proofs/disk-spill` capability for native consumers. Default and wasm consumers keep the heap path. If that capability is absent, a mapped-key load returns `Unsupported` before the expensive key body is read, and a proof requesting mapped keys or coset spill returns an explicit error instead of silently using heap storage. The stdlib key wrapper records whether its stored polynomials were loaded under the mapped policy; an explicit mapped proof request rejects a generated or heap-loaded key. The legacy context-free entry point keeps its process-policy behavior, and the serialized key format is unchanged. Ledger's native `transient-crypto` dependency also enables the underlying capability through Cargo feature unification. Consumers of this fork must pin the coordinated proofs, circuits, and stdlib sources by immutable revision in their root Cargo graph; the unchanged published version numbers alone do not identify the fork-only APIs.
+
+Local checks after source alignment: `cargo check -p midnight-zk-stdlib -p midnight-circuits -p midnight-aggregation`, the release-mode `context_prove` test, all 14 release-mode `check_vks` tests using CI's Filecoin SRS fixture, release-mode aggregation tests, and strict Clippy for aggregation and stdlib all passed on the aligned source. Ledger #36 passed released V2/V3 serialized proof-and-key fixture tests on its prior `893c060c` graph; its current ZK pin, exact-head CI, and review are tracked in that PR.

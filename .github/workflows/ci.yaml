@@ -96,6 +96,13 @@ jobs:
           package: midnight-zk-stdlib
           args: --release --test serialization -- --test-threads=1
 
+      # Exercise the opt-in mapped-key context API in the released stdlib.
+      # The proofs feature matrix does not run stdlib integration tests.
+      - uses: ./.github/actions/cargo-test
+        with:
+          package: midnight-zk-stdlib
+          args: --release --features disk-spill --test context_prove
+
   test-vk-consistency:
     needs: download-srs
     if: github.event.pull_request.draft == false

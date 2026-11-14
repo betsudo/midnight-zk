@@ -624,6 +624,18 @@ where
         + FromUniformBytes<64>,
 {
     checkpoint(ctx, "create_proof.compute_trace.start")?;
+    #[cfg(not(feature = "disk-spill"))]
+    if ctx.config.map_prover_key {
+        return Err(Error::Synthesis(
+            "mapped prover keys require the midnight-proofs/disk-spill feature".into(),
+        ));
+    }
+    #[cfg(not(feature = "disk-spill"))]
+    if ctx.config.spills_cosets_at(pk.vk.domain.k()) {
+        return Err(Error::Synthesis(
+            "coset disk spill requires the midnight-proofs/disk-spill feature".into(),
+        ));
+    }
     let trace = compute_trace(
         params,
         pk,

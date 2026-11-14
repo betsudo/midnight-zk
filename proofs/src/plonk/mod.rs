@@ -642,6 +642,14 @@ where
         #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
         policy: &crate::config::ProverConfig,
     ) -> io::Result<Self> {
+        #[cfg(not(feature = "disk-spill"))]
+        if policy.map_prover_key {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "mapped prover keys require the midnight-proofs/disk-spill feature",
+            ));
+        }
+
         let mut hwm = 0u64;
         read_stage("start", &mut hwm);
         let vk = VerifyingKey::<F, CS>::read::<R, ConcreteCircuit>(
@@ -665,10 +673,7 @@ where
         #[cfg(feature = "disk-spill")]
         let defer_cosets = policy.map_prover_key;
         #[cfg(not(feature = "disk-spill"))]
-        let defer_cosets = {
-            let _ = policy;
-            false
-        };
+        let defer_cosets = false;
         let fixed_cosets = if defer_cosets {
             Vec::new()
         } else {

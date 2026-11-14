@@ -25,8 +25,9 @@ use std::{
 
 use midnight_curves::Bls12;
 use midnight_proofs::{
+    config::ProverContext,
     plonk::{
-        create_proof, keygen_pk, keygen_vk, prepare, Circuit, Error, ProvingKey, VerifyingKey,
+        create_proof_with, keygen_pk, keygen_vk, prepare, Circuit, Error, ProvingKey, VerifyingKey,
     },
     poly::{
         commitment::Guard,
@@ -98,16 +99,43 @@ macro_rules! plonk_api {
                 $projective: Hashable<H>,
                 $native: Hashable<H> + Sampleable<H>,
             {
+                Self::prove_with_context::<H>(
+                    &ProverContext::process(),
+                    params,
+                    pk,
+                    circuit,
+                    nb_instance_commitments,
+                    pi,
+                    rng,
+                )
+            }
+
+            /// PLONK proving with a request-owned memory and cancellation context.
+            pub fn prove_with_context<H>(
+                context: &ProverContext,
+                params: &ParamsKZG<$engine>,
+                pk: &ProvingKey<$native, KZGCommitmentScheme<$engine>>,
+                circuit: &Relation,
+                nb_instance_commitments: usize,
+                pi: &[&[$native]],
+                rng: impl RngCore + CryptoRng,
+            ) -> Result<Vec<u8>, Error>
+            where
+                H: TranscriptHash,
+                $projective: Hashable<H>,
+                $native: Hashable<H> + Sampleable<H>,
+            {
                 #[cfg(test)]
                 let start = Instant::now();
                 let proof = {
                     let mut transcript = CircuitTranscript::init();
-                    create_proof::<
+                    create_proof_with::<
                         $native,
                         KZGCommitmentScheme<$engine>,
                         CircuitTranscript<H>,
                         Relation,
                     >(
+                        context,
                         params,
                         pk,
                         std::slice::from_ref(circuit),
