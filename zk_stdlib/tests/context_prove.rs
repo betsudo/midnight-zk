@@ -113,6 +113,18 @@ fn released_stdlib_context_and_compatibility_proofs_verify() {
     let pk = midnight_zk_stdlib::setup_pk(&relation, &vk);
 
     if !DISK_SPILL_AVAILABLE {
+        let error = midnight_zk_stdlib::prove_with_context::<EmptyRelation, blake2b_simd::State>(
+            &ProverContext::new(ProverConfig::mapped_key()),
+            &params,
+            &pk,
+            &relation,
+            &(),
+            (),
+            StdRng::seed_from_u64(8),
+        )
+        .expect_err("requested mapped key must not silently use heap storage");
+        assert!(matches!(error, Error::Synthesis(message) if message.contains("disk-spill")));
+
         let policy = ProverConfig {
             spill_cosets: true,
             coset_spill_floor_k: 0,
