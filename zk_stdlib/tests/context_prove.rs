@@ -48,6 +48,24 @@ fn mapped_key_round_trip_proves_with_context() {
         .expect("serialize generated key");
 
     let policy = ProverConfig::mapped_key();
+    let heap = MidnightPK::<EmptyRelation>::read_with_policy(
+        &mut bytes.as_slice(),
+        SerdeFormat::RawBytesUnchecked,
+        &ProverConfig::heap(),
+    )
+    .expect("load heap key");
+    let error = midnight_zk_stdlib::prove_with_context::<EmptyRelation, blake2b_simd::State>(
+        &ProverContext::new(policy.clone()),
+        &params,
+        &heap,
+        &relation,
+        &(),
+        (),
+        StdRng::seed_from_u64(9),
+    )
+    .expect_err("mapped request must reject a heap-loaded key");
+    assert!(matches!(error, Error::Synthesis(message) if message.contains("storage policy")));
+
     let mapped = MidnightPK::<EmptyRelation>::read_with_policy(
         &mut bytes.as_slice(),
         SerdeFormat::RawBytesUnchecked,
@@ -123,7 +141,7 @@ fn released_stdlib_context_and_compatibility_proofs_verify() {
             StdRng::seed_from_u64(8),
         )
         .expect_err("requested mapped key must not silently use heap storage");
-        assert!(matches!(error, Error::Synthesis(message) if message.contains("disk-spill")));
+        assert!(matches!(error, Error::Synthesis(message) if message.contains("storage policy")));
 
         let policy = ProverConfig {
             spill_cosets: true,

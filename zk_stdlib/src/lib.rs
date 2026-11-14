@@ -1614,6 +1614,8 @@ pub struct MidnightPK<R: Relation> {
     k: u8,
     relation: R,
     pk: ProvingKey<midnight_curves::Fq, KZGCommitmentScheme<midnight_curves::Bls12>>,
+    /// In-memory provenance only; the serialized key format is unchanged.
+    map_prover_key: bool,
 }
 
 impl<Rel: Relation> MidnightPK<Rel> {
@@ -1649,8 +1651,8 @@ impl<Rel: Relation> MidnightPK<Rel> {
     ///
     /// The compatibility [`Self::read`] method retains the process policy.
     /// A request that selects mapped key storage must pass the same policy
-    /// here and to the prover context; otherwise key loading can eagerly
-    /// materialize cosets on the heap before proving begins.
+    /// here and to the prover context. The context prover rejects a mismatch
+    /// so key loading cannot silently materialize cosets on the heap.
     /// Mapped key requests fail with `Unsupported` unless the dependency graph
     /// enables `midnight-proofs/disk-spill` (for example through this crate's
     /// opt-in `disk-spill` feature).
@@ -1679,7 +1681,12 @@ impl<Rel: Relation> MidnightPK<Rel> {
             policy,
         )?;
 
-        Ok(MidnightPK { k, relation, pk })
+        Ok(MidnightPK {
+            k,
+            relation,
+            pk,
+            map_prover_key: policy.map_prover_key,
+        })
     }
 
     /// The size of the domain associated to this proving key.
@@ -1987,6 +1994,7 @@ pub fn setup_pk<R: Relation>(relation: &R, vk: &MidnightVK) -> MidnightPK<R> {
         k: vk.k(),
         relation: relation.clone(),
         pk,
+        map_prover_key: ProverConfig::process().map_prover_key,
     }
 }
 
@@ -2029,6 +2037,12 @@ where
     G1Projective: Hashable<H>,
     F: Hashable<H> + Sampleable<H>,
 {
+    if pk.map_prover_key != context.config.map_prover_key {
+        return Err(Error::Synthesis(
+            "prover key storage policy differs from the proof request; reload the key under the requested policy".into(),
+        )
+        .into());
+    }
     let pi = R::format_instance(instance)?;
     let com_inst = R::format_committed_instances(&witness);
     let circuit = MidnightCircuit::new(
