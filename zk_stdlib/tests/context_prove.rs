@@ -64,7 +64,7 @@ fn mapped_key_round_trip_proves_with_context() {
         StdRng::seed_from_u64(9),
     )
     .expect_err("mapped request must reject a heap-loaded key");
-    assert!(matches!(error, Error::Synthesis(message) if message.contains("storage policy")));
+    assert!(matches!(error, Error::Synthesis(message) if message.contains("mapped policy")));
 
     let mapped = MidnightPK::<EmptyRelation>::read_with_policy(
         &mut bytes.as_slice(),
@@ -141,7 +141,7 @@ fn released_stdlib_context_and_compatibility_proofs_verify() {
             StdRng::seed_from_u64(8),
         )
         .expect_err("requested mapped key must not silently use heap storage");
-        assert!(matches!(error, Error::Synthesis(message) if message.contains("storage policy")));
+        assert!(matches!(error, Error::Synthesis(message) if message.contains("mapped policy")));
 
         let policy = ProverConfig {
             spill_cosets: true,
