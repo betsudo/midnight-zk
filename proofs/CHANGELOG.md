@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this build lacks `disk-spill`; explicit policies report the missing feature.
   Adding a request token to a process context keeps observing the legacy
   host-wide cancellation flag without letting that request set the flag.
+  A token extracted from a process context also cannot write the host flag.
 * **`keygen_pk` no longer defers the extended-domain cosets under every
   policy.** It deferred them unconditionally, so a key from keygen and a key
   read back from its own bytes disagreed: every prove from a generated key paid

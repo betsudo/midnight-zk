@@ -248,66 +248,42 @@ impl ProverConfig {
 /// proof — so cancellation lands within one phase, which is the same
 /// granularity the process-wide flag offered, without the process-wide part.
 #[derive(Clone, Debug)]
-pub struct CancelToken(TokenFlag);
-
-#[derive(Clone, Debug)]
-enum TokenFlag {
-    /// A flag this token owns, shared only with its clones.
-    Owned(Arc<AtomicBool>),
-    /// The process-wide flag behind [`ProverContext::process`], kept so the
-    /// pre-existing host protocol — set a static, expect the prover to stop —
-    /// keeps working while callers move to per-request tokens.
-    Shared(&'static AtomicBool),
-    /// Observe a host-wide cancel as well as this request's own token. A
-    /// request cancellation only writes the request flag.
-    WithShared(Box<TokenFlag>, &'static AtomicBool),
+pub struct CancelToken {
+    /// Only this flag is written by `cancel`; clones intentionally share it.
+    request: Arc<AtomicBool>,
+    /// Legacy host cancellation remains observable, but never writable through
+    /// a request token, including one obtained from a process context.
+    host: Option<&'static AtomicBool>,
 }
 
 impl CancelToken {
     /// A fresh token, not cancelled.
     pub fn new() -> Self {
-        Self(TokenFlag::Owned(Arc::new(AtomicBool::new(false))))
+        Self {
+            request: Arc::new(AtomicBool::new(false)),
+            host: None,
+        }
     }
 
-    /// A token over a process-wide flag. This is how the legacy
-    /// `MIDNIGHT_CANCEL` static participates; new callers want
-    /// [`new`](Self::new).
-    pub(crate) const fn shared(flag: &'static AtomicBool) -> Self {
-        Self(TokenFlag::Shared(flag))
+    /// A request token that also observes a process-wide flag. This is how
+    /// the legacy `MIDNIGHT_CANCEL` static participates; new callers want
+    /// [`new`](Self::new). Cancelling this token never sets the host flag.
+    pub(crate) fn shared(flag: &'static AtomicBool) -> Self {
+        Self {
+            request: Arc::new(AtomicBool::new(false)),
+            host: Some(flag),
+        }
     }
 
     /// Ask the proof holding this token to stop at its next checkpoint.
     pub fn cancel(&self) {
-        self.flag().store(true, Ordering::Release);
+        self.request.store(true, Ordering::Release);
     }
 
     /// Whether [`cancel`](Self::cancel) has been called.
     pub fn is_cancelled(&self) -> bool {
-        self.0.is_cancelled()
-    }
-
-    fn flag(&self) -> &AtomicBool {
-        self.0.flag()
-    }
-}
-
-impl TokenFlag {
-    fn is_cancelled(&self) -> bool {
-        match self {
-            Self::Owned(flag) => flag.load(Ordering::Acquire),
-            Self::Shared(flag) => flag.load(Ordering::Acquire),
-            Self::WithShared(request, host) => {
-                request.is_cancelled() || host.load(Ordering::Acquire)
-            }
-        }
-    }
-
-    fn flag(&self) -> &AtomicBool {
-        match self {
-            Self::Owned(flag) => flag,
-            Self::Shared(flag) => flag,
-            Self::WithShared(request, _) => request.flag(),
-        }
+        self.request.load(Ordering::Acquire)
+            || self.host.is_some_and(|host| host.load(Ordering::Acquire))
     }
 }
 
@@ -352,14 +328,8 @@ impl ProverContext {
     /// Attach a cancellation token. A process context also keeps observing
     /// the legacy host-wide flag; cancelling this token never sets that flag.
     pub fn with_cancel(mut self, token: CancelToken) -> Self {
-        let host = self.cancel.take().and_then(|old| match old.0 {
-            TokenFlag::Shared(host) | TokenFlag::WithShared(_, host) => Some(host),
-            TokenFlag::Owned(_) => None,
-        });
-        self.cancel = Some(match host {
-            Some(host) => CancelToken(TokenFlag::WithShared(Box::new(token.0), host)),
-            None => token,
-        });
+        let host = self.cancel.take().and_then(|old| old.host).or(token.host);
+        self.cancel = Some(CancelToken { host, ..token });
         self
     }
 
@@ -512,10 +482,7 @@ mod test {
             config: ProverConfig::heap(),
             cancel: Some(CancelToken::shared(&HOST_CANCEL)),
         };
-        assert!(matches!(
-            ProverContext::process().cancel,
-            Some(CancelToken(TokenFlag::Shared(_)))
-        ));
+        assert!(ProverContext::process().cancel.unwrap().host.is_some());
 
         let request_context = host_context.with_cancel(request.clone());
         let unrelated = ProverContext::new(ProverConfig::heap());
@@ -534,6 +501,24 @@ mod test {
         assert!(fresh_request.is_cancelled());
         assert!(!unrelated.is_cancelled());
         HOST_CANCEL.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn a_process_token_cannot_write_the_host_cancel_flag() {
+        static HOST_CANCEL: AtomicBool = AtomicBool::new(false);
+        let process = || ProverContext {
+            config: ProverConfig::heap(),
+            cancel: Some(CancelToken::shared(&HOST_CANCEL)),
+        };
+        let original = process().cancel.unwrap();
+        let unrelated = process();
+        let combined = process().with_cancel(original.clone());
+
+        combined.cancel.as_ref().unwrap().cancel();
+        assert!(combined.is_cancelled());
+        assert!(original.is_cancelled(), "the supplied token remains linked");
+        assert!(!HOST_CANCEL.load(Ordering::Acquire));
+        assert!(!unrelated.is_cancelled());
     }
 
     #[test]
