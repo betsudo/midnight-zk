@@ -1,4 +1,9 @@
-use std::{fmt::Debug, io};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    io,
+    sync::{Arc, RwLock},
+};
 
 use ff::{Field, PrimeField};
 use group::{Curve, Group, GroupEncoding, prime::PrimeCurveAffine};
@@ -9,7 +14,7 @@ use midnight_curves::{
 use rand_core::RngCore;
 
 use crate::{
-    poly::{PolynomialBasis, PolynomialRepresentation, commitment::Params},
+    poly::{Coeff, LagrangeCoeff, LagrangeDeltaCoeff, PolynomialBasis, PolynomialRepresentation},
     utils::{
         SerdeFormat,
         arithmetic::{CurveAffine, g_to_lagrange, parallelize},
@@ -34,7 +39,45 @@ pub struct ParamsKZG<E: Engine> {
     pub(crate) g_lagrange_double_delta: Vec<E::G1Affine>,
     pub(crate) g2: E::G2,
     pub(crate) s_g2: E::G2,
+    /// The bases of every [`Residue`] committed to so far.
+    residue_bases: ResidueBases<E::G1Affine>,
 }
+
+/// Residue `i` modulo `t`, identifying the bases for committing to `X^i f(X^t)`
+/// from the `n` values of `f`, the `i`-th part of `g(X) = Σ_i X^i f_i(X^t)`.
+/// These bases depend heavily on the representation `basis` of the values, as
+/// detailed below. The name comes from `X^i f(X^t)` being made of the monomials
+/// `X^e` with `e ≡ i (mod t)`.
+///
+/// - `Coeff`: the strided monomials `[s^(i + t·j)]`. For `f = Σ_j c_j X^j`,
+///   `X^i f(X^t) = Σ_j c_j X^(i + t·j)`.
+///
+/// - `Lagrange`: `[s^i L_j(s^t)]`, for `L_j` the Lagrange basis of the domain
+///   of size `n`: the Lagrange basis built from the strided monomials.
+///
+/// - `LagrangeDelta`: `[s^i Σ_{k ≥ j} L_k(s^t)]`, the suffix sums of the
+///   `Lagrange` bases, as `g_lagrange_delta` is of `g_lagrange`.
+///
+/// - `LagrangeDoubleDelta`: `[s^i Σ_{k ≥ j} (k - j + 1) L_k(s^t)]`, the suffix
+///   sums of the `LagrangeDelta` bases.
+///
+/// Committing to every `f_i` on its own bases keeps the zeros of its values
+/// free. The bases are computed on first use, as the `Lagrange` ones take a
+/// group FFT of size `n`, and cached in `ParamsKZG`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Residue {
+    /// The representation of the values of `f_i`.
+    basis: PolynomialBasis,
+    /// The modulus, a power of two.
+    t: usize,
+    /// The number of values of `f_i`.
+    n: usize,
+    /// The residue, smaller than `t`.
+    i: usize,
+}
+
+/// The bases of every [`Residue`] committed to so far.
+type ResidueBases<C> = Arc<RwLock<HashMap<Residue, Arc<[C]>>>>;
 
 /// Builds the suffix-sum of an affine SRS: `out[i] = sum_{j=i}^{n-1} input[j]`.
 ///
@@ -56,27 +99,9 @@ fn suffix_sum<C: CurveAffine>(input: &[C]) -> Vec<C> {
     acc_affine
 }
 
-impl<E: Engine> Params for ParamsKZG<E>
+impl<E> ParamsKZG<E>
 where
-    E::G1Affine: CurveAffine,
-{
-    fn max_k(&self) -> u32 {
-        #[cfg(not(feature = "single-h-commitment"))]
-        assert_eq!(self.g.len(), self.g_lagrange.len());
-        self.g_lagrange.len().ilog2()
-    }
-
-    fn g_monomial_size(&self) -> usize {
-        self.g.len()
-    }
-
-    fn downsize(&mut self, new_k: u32) {
-        ParamsKZG::<E>::downsize(self, new_k)
-    }
-}
-
-impl<E: Engine + Debug> ParamsKZG<E>
-where
+    E: Engine + Debug,
     E::G1Affine: CurveAffine,
 {
     /// Return the SRS bases corresponding to the polynomial representation `B`.
@@ -92,6 +117,62 @@ where
         }
     }
 
+    /// The bases of the [`Residue`] `i` modulo `t`, for committing to
+    /// `X^i f(X^t)` from the `n` values of `f` in the representation `B`.
+    ///
+    /// # Panics
+    ///
+    /// If `B` is the extended Lagrange basis, if `t·n` is larger than the SRS,
+    /// or if `B` is Lagrange or one of its delta forms and `n` is not a power
+    /// of two.
+    pub(crate) fn residue_bases<B: PolynomialRepresentation>(
+        &self,
+        t: usize,
+        n: usize,
+        i: usize,
+    ) -> Arc<[E::G1Affine]> {
+        let residue = Residue {
+            basis: B::BASIS,
+            t,
+            n,
+            i,
+        };
+        if let Some(bases) =
+            self.residue_bases.read().expect("residue bases lock poisoned").get(&residue)
+        {
+            return bases.clone();
+        }
+        let bases: Arc<[_]> = match B::BASIS {
+            PolynomialBasis::Coeff => {
+                assert!(
+                    t * n <= self.g.len(),
+                    "no residue bases of size {n} modulo {t}"
+                );
+                self.g[i..].iter().step_by(t).take(n).copied().collect()
+            }
+            PolynomialBasis::Lagrange => {
+                assert!(n.is_power_of_two(), "no Lagrange residue bases of size {n}");
+                g_to_lagrange(&self.residue_bases::<Coeff>(t, n, i), n.ilog2()).into()
+            }
+            PolynomialBasis::LagrangeDelta => {
+                suffix_sum(&self.residue_bases::<LagrangeCoeff>(t, n, i)).into()
+            }
+            PolynomialBasis::LagrangeDoubleDelta => {
+                suffix_sum(&self.residue_bases::<LagrangeDeltaCoeff>(t, n, i)).into()
+            }
+            basis => panic!("no residue bases in the {basis:?} basis"),
+        };
+        let mut cache = self.residue_bases.write().expect("residue bases lock poisoned");
+        cache.entry(residue).or_insert(bases).clone()
+    }
+
+    /// Returns the size of the SRS, expressed as the exponent `k` such that it
+    /// has `2^k` elements.
+    pub fn max_k(&self) -> u32 {
+        assert_eq!(self.g.len(), self.g_lagrange.len());
+        self.g_lagrange.len().ilog2()
+    }
+
     /// Downsize the current parameters to match a smaller `k`.
     pub fn downsize(&mut self, new_k: u32) {
         if self.max_k() == new_k {
@@ -104,47 +185,7 @@ where
         self.g_lagrange = g_to_lagrange(&self.g, new_k);
         self.g_lagrange_delta = suffix_sum(&self.g_lagrange);
         self.g_lagrange_double_delta = suffix_sum(&self.g_lagrange_delta);
-    }
-
-    /// Recompute the Lagrange basis for a smaller circuit domain `new_k` while
-    /// keeping the full monomial basis `g` intact.
-    ///
-    /// Use this when the `single-h-commitment` feature is enabled: generate an
-    /// SRS large enough for the whole quotient polynomial (i.e. with `k'`
-    /// such that `2^{k'} ≥ (n-1) * quotient_poly_degree`), then call
-    /// `downsize_lagrange(k)` so that `max_k()` equals the circuit domain size
-    /// `k` while `g` retains its original length for the H-polynomial
-    /// commitment.
-    pub fn downsize_lagrange(&mut self, new_k: u32) {
-        let n = 1usize << new_k;
-        assert!(
-            self.g.len() >= n,
-            "g is too small to build a Lagrange basis of size 2^{new_k}"
-        );
-        self.g_lagrange = g_to_lagrange(&self.g[..n], new_k);
-        self.g_lagrange_delta = suffix_sum(&self.g_lagrange);
-        self.g_lagrange_double_delta = suffix_sum(&self.g_lagrange_delta);
-    }
-
-    /// Combine the monomial basis from `extended` with the Lagrange basis from
-    /// `self`, consuming both. This avoids the FFT that `downsize_lagrange`
-    /// would otherwise require.
-    ///
-    /// # Panics
-    ///
-    /// If `extended.g` is not strictly larger than `self.g`, or if the shared
-    /// prefix of the monomial bases does not match.
-    pub fn with_extended_monomial(mut self, extended: Self) -> Self {
-        assert!(
-            extended.g.len() > self.g.len(),
-            "extended SRS must be strictly larger than the base SRS"
-        );
-        assert!(
-            self.g[..] == extended.g[..self.g.len()],
-            "monomial bases of the two SRSs do not match"
-        );
-        self.g = extended.g;
-        self
+        self.residue_bases = Default::default();
     }
 
     /// Initializes parameters for the curve, draws toxic secret from given rng.
@@ -204,6 +245,7 @@ where
             g_lagrange_double_delta,
             g2,
             s_g2,
+            residue_bases: Default::default(),
         }
     }
 
@@ -236,6 +278,7 @@ where
             g_lagrange_double_delta,
             g2,
             s_g2,
+            residue_bases: Default::default(),
         }
     }
 
@@ -255,10 +298,11 @@ where
     }
 
     /// Writes parameters to buffer
-    pub fn write_custom<W: io::Write>(&self, writer: &mut W, format: SerdeFormat) -> io::Result<()>
+    pub fn write_custom<W>(&self, writer: &mut W, format: SerdeFormat) -> io::Result<()>
     where
         E::G1Affine: SerdeObject,
         E::G2: ProcessedSerdeObject,
+        W: io::Write,
     {
         writer.write_all(&self.g.len().ilog2().to_le_bytes())?;
         for el in self.g.iter() {
@@ -279,14 +323,21 @@ where
     }
 
     /// Reads params from a buffer.
-    pub fn read_custom<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self>
+    pub fn read_custom<R>(reader: &mut R, format: SerdeFormat) -> io::Result<Self>
     where
         E::G1Affine: SerdeObject,
         E::G2: ProcessedSerdeObject,
+        R: io::Read,
     {
         let mut k = [0u8; 4];
         reader.read_exact(&mut k[..])?;
         let k = u32::from_le_bytes(k);
+        if k > E::Fr::S {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("k = {k} exceeds the maximum supported value {}", E::Fr::S),
+            ));
+        }
         let n = 1 << k;
 
         let (g, g_lagrange) = match format {
@@ -343,6 +394,7 @@ where
             g_lagrange_double_delta,
             g2,
             s_g2,
+            residue_bases: Default::default(),
         })
     }
 }
@@ -358,8 +410,9 @@ pub struct ParamsVerifierKZG<E: MultiMillerLoop> {
     pub(crate) s_g2_prepared: E::G2Prepared,
 }
 
-impl<E: MultiMillerLoop + Debug> ParamsVerifierKZG<E>
+impl<E> ParamsVerifierKZG<E>
 where
+    E: MultiMillerLoop + Debug,
     E::G2: Curve + ProcessedSerdeObject,
 {
     /// Returns \[τ\]₂, a commitment to τ in G2.
@@ -542,5 +595,22 @@ mod test {
         assert_eq!(params0.g_lagrange, params1.g_lagrange);
         assert_eq!(params0.g2, params1.g2);
         assert_eq!(params0.s_g2, params1.s_g2);
+    }
+
+    #[test]
+    fn test_read_custom_rejects_oversized_k() {
+        use ff::PrimeField;
+        use midnight_curves::{Bls12, Fq};
+
+        let data = (Fq::S + 1).to_le_bytes();
+        for format in [
+            SerdeFormat::Processed,
+            SerdeFormat::RawBytes,
+            SerdeFormat::RawBytesUnchecked,
+        ] {
+            let err = ParamsKZG::<Bls12>::read_custom::<_>(&mut &data[..], format).err().unwrap();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("exceeds the maximum supported value"));
+        }
     }
 }

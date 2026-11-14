@@ -4,7 +4,6 @@ use std::{
 };
 
 use ff::Field;
-use group::Group;
 use midnight_curves::{CurveAffine, pairing::MultiMillerLoop};
 
 use crate::{
@@ -46,8 +45,9 @@ pub enum KZGCommitment<E: MultiMillerLoop> {
 //
 // This comparison is literal. Two equivalent commitments are considered
 // different if their representation is different.
-impl<E: MultiMillerLoop> PartialEq for KZGCommitment<E>
+impl<E> PartialEq for KZGCommitment<E>
 where
+    E: MultiMillerLoop,
     E::G1: PartialEq,
     E::Fr: PartialEq,
 {
@@ -63,15 +63,6 @@ where
 }
 
 impl<E: MultiMillerLoop> KZGCommitment<E> {
-    /// Extracts the inner curve point, panicking if this is a `Linear`
-    /// commitment.
-    pub fn into_point(self) -> E::G1 {
-        match self {
-            Self::Simple(p, _) => p,
-            Self::Linear(..) => panic!("expected KZGCommitment::Simple"),
-        }
-    }
-
     /// Returns a reference to the inner curve point, panicking if this is a
     /// `Linear` commitment.
     pub fn as_point(&self) -> &E::G1 {
@@ -82,12 +73,14 @@ impl<E: MultiMillerLoop> KZGCommitment<E> {
     }
 }
 
-impl<E: MultiMillerLoop> KZGCommitment<E>
+impl<E> KZGCommitment<E>
 where
+    E: MultiMillerLoop,
     E::G1Affine: CurveAffine<ScalarExt = E::Fr, CurveExt = E::G1>,
 {
-    /// Collapses a `Linear` combination into a `Simple` commitment by computing
-    /// the MSM `∑ scalars[i] * points[i]`, labeling the result with `label`.
+    /// Collapses a `Linear` combination as [`MSMKZG::collapse`] does: the
+    /// non-fixed terms become one point labeled with `label`, the fixed terms
+    /// are kept. The result is `Simple` when no fixed term is left.
     ///
     /// A `Simple` commitment is left unchanged (its existing label is kept).
     pub fn collapse(&mut self, label: PolynomialLabel) {
@@ -96,9 +89,10 @@ where
             Self::Linear(points, scalars, labels) => {
                 let mut msm = MSMKZG::<E>::new(scalars, points, labels);
                 msm.collapse(label);
-                debug_assert_eq!(msm.bases.len(), 1);
-                debug_assert_eq!(msm.scalars, vec![E::Fr::ONE]);
-                *self = Self::Simple(msm.bases[0], msm.labels[0].clone());
+                *self = match msm.bases.len() {
+                    1 => Self::Simple(msm.bases[0], msm.labels.remove(0)),
+                    _ => Self::Linear(msm.bases, msm.scalars, msm.labels),
+                };
             }
         }
     }
@@ -115,8 +109,9 @@ impl<E: MultiMillerLoop> From<KZGCommitment<E>> for MSMKZG<E> {
     }
 }
 
-impl<E: MultiMillerLoop> Default for KZGCommitment<E>
+impl<E> Default for KZGCommitment<E>
 where
+    E: MultiMillerLoop,
     E::G1: Default,
 {
     fn default() -> Self {
@@ -131,8 +126,9 @@ where
 /// deserializing a commitment without its labels would produce a value that
 /// cannot reach the MSM layer. Use `deserialize_commitment` instead, which
 /// labels each polynomial as it reads it.
-impl<E: MultiMillerLoop> ProcessedSerdeObject for KZGCommitment<E>
+impl<E> ProcessedSerdeObject for KZGCommitment<E>
 where
+    E: MultiMillerLoop,
     E::G1: Default + ProcessedSerdeObject,
 {
     fn read<R: io::Read>(_reader: &mut R, _format: SerdeFormat) -> io::Result<Self> {
@@ -159,8 +155,10 @@ where
 /// Only `Simple` commitments are hashed into transcripts; see the type-level
 /// doc for why `Linear` is never hashed directly. Labels are not part of the
 /// transcript.
-impl<H: TranscriptHash, E: MultiMillerLoop> Hashable<H> for KZGCommitment<E>
+impl<H, E> Hashable<H> for KZGCommitment<E>
 where
+    H: TranscriptHash,
+    E: MultiMillerLoop,
     E::G1: Hashable<H>,
 {
     fn to_input(&self) -> H::Input {
@@ -242,16 +240,11 @@ impl<E: MultiMillerLoop> KZGMultiCommitment<E> {
         self.assert_single();
         self.0.into_iter().next().unwrap()
     }
-
-    /// A commitment to the zero polynomial (the identity point), tagged with
-    /// `label`. Used e.g. for empty committed-instance columns.
-    pub fn commitment_to_zero(label: PolynomialLabel) -> Self {
-        Self(vec![KZGCommitment::Simple(E::G1::identity(), label)])
-    }
 }
 
-impl<E: MultiMillerLoop> PartialEq for KZGMultiCommitment<E>
+impl<E> PartialEq for KZGMultiCommitment<E>
 where
+    E: MultiMillerLoop,
     E::G1: PartialEq,
     E::Fr: PartialEq,
 {
@@ -260,8 +253,9 @@ where
     }
 }
 
-impl<E: MultiMillerLoop> Default for KZGMultiCommitment<E>
+impl<E> Default for KZGMultiCommitment<E>
 where
+    E: MultiMillerLoop,
     E::G1: Default,
 {
     fn default() -> Self {
@@ -274,8 +268,9 @@ where
 /// therefore unimplemented; commitments are read through `read_commitment`
 /// (from a transcript) or `deserialize_commitment` (from keys), whose `labels`
 /// argument supplies the count and tags each polynomial.
-impl<E: MultiMillerLoop> ProcessedSerdeObject for KZGMultiCommitment<E>
+impl<E> ProcessedSerdeObject for KZGMultiCommitment<E>
 where
+    E: MultiMillerLoop,
     E::G1: Default + ProcessedSerdeObject,
 {
     fn read<R: io::Read>(_reader: &mut R, _format: SerdeFormat) -> io::Result<Self> {
@@ -296,25 +291,31 @@ where
     }
 }
 
-impl<H: TranscriptHash, E: MultiMillerLoop> Hashable<H> for KZGMultiCommitment<E>
+/// Width of the little-endian prefix that frames a [`KZGMultiCommitment`] in a
+/// proof transcript, holding the number of polynomials the commitment covers.
+/// Only the points that follow it are hashed; the prefix delimits them for
+/// `Hashable::read`.
+pub(crate) const NB_POLYS_PREFIX_BYTES: usize = 4;
+
+impl<H, E> Hashable<H> for KZGMultiCommitment<E>
 where
+    H: TranscriptHash,
+    E: MultiMillerLoop,
     E::G1: Hashable<H>,
 {
     fn to_input(&self) -> H::Input {
-        // Without batching every commitment holds a single polynomial, so we
-        // hash its sole inner commitment. Hashing a batched commitment (which
-        // would require concatenating per-polynomial inputs) is left for when
-        // batching is introduced.
-        assert_eq!(
-            self.0.len(),
-            1,
-            "hashing a KZGMultiCommitment with more than one polynomial is not yet supported"
-        );
-        self.0[0].to_input()
+        // The per-polynomial inputs are concatenated with no count prefix,
+        // matching `ProcessedSerdeObject::write`.
+        self.0.iter().flat_map(|c| c.to_input()).collect()
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        // The proof declares how many polynomials the group holds, so that
+        // `read` knows where the group ends. The count is not part of the
+        // hashed transcript; `read_commitment` checks it against the labels
+        // the verifying key expects.
+        let nb_polys = u32::try_from(self.0.len()).expect("more than 2^32 polynomials in a group");
+        let mut bytes = nb_polys.to_le_bytes().to_vec();
         for c in &self.0 {
             bytes.extend_from_slice(&c.to_bytes());
         }
@@ -322,7 +323,19 @@ where
     }
 
     fn read(buffer: &mut impl Read) -> io::Result<Self> {
-        Ok(Self(vec![<KZGCommitment<E> as Hashable<H>>::read(buffer)?]))
+        let mut nb_polys_bytes = [0u8; NB_POLYS_PREFIX_BYTES];
+        buffer.read_exact(&mut nb_polys_bytes)?;
+        let nb_polys = u32::from_le_bytes(nb_polys_bytes) as usize;
+
+        // The count is declared by the prover, so grow the vector as the points
+        // arrive instead of reserving `nb_polys` of them upfront: reading each
+        // point consumes proof bytes, which bounds the work by the proof length,
+        // whereas reserving would let a short proof ask for gigabytes.
+        let mut commitments = Vec::new();
+        for _ in 0..nb_polys {
+            commitments.push(<KZGCommitment<E> as Hashable<H>>::read(buffer)?);
+        }
+        Ok(Self(commitments))
     }
 }
 

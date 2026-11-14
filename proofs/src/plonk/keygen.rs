@@ -2,8 +2,7 @@
 
 use std::ops::Range;
 
-use ff::{Field, FromUniformBytes, WithSmallOrderMulGroup};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use ff::{Field, FromUniformBytes, PrimeField, WithSmallOrderMulGroup};
 
 use super::{
     Error, LagrangeCoeff, Polynomial, ProvingKey, VerifyingKey,
@@ -18,8 +17,8 @@ use crate::{
     circuit::Value,
     dev::cost_model::cost_model_options,
     poly::{
-        EvaluationDomain, ExtendedLagrangeCoeff, PolynomialLabel, batch_invert_rational,
-        commitment::{Params, PolynomialCommitmentScheme},
+        EvaluationDomain, ExtendedLagrangeCoeff, batch_invert_rational,
+        commitment::PolynomialCommitmentScheme,
     },
     utils::{arithmetic::parallelize, rational::Rational},
 };
@@ -205,39 +204,39 @@ pub fn k_from_circuit<F: Ord + Field + FromUniformBytes<64>, C: Circuit<F>>(circ
 /// Automatically determines the smallest `k` required for the given circuit
 /// and adjusts the received parameters to match the circuit's size.
 /// Use `keygen_vk_with_k` to specify a custom `k` value.
-pub fn keygen_vk<F, CS, ConcreteCircuit>(
-    params: &CS::Parameters,
+pub fn keygen_vk<F, PCS, ConcreteCircuit>(
+    params: &PCS::Parameters,
     circuit: &ConcreteCircuit,
-) -> Result<VerifyingKey<F, CS>, Error>
+) -> Result<VerifyingKey<F, PCS>, Error>
 where
     F: WithSmallOrderMulGroup<3> + FromUniformBytes<64> + Ord,
-    CS: PolynomialCommitmentScheme<F>,
+    PCS: PolynomialCommitmentScheme<F>,
     ConcreteCircuit: Circuit<F>,
 {
     let k = k_from_circuit(circuit);
 
-    if params.max_k() != k {
-        return Err(Error::SrsError(params.max_k() as usize, k as usize));
+    let max_k = PCS::max_k(params);
+    if max_k != k {
+        return Err(Error::SrsError(max_k as usize, k as usize));
     }
 
     keygen_vk_with_k(params, circuit, k)
 }
 
 /// Generate a `VerifyingKey` from an instance of `Circuit`.
-pub fn keygen_vk_with_k<F, CS, ConcreteCircuit>(
-    params: &CS::Parameters,
+pub fn keygen_vk_with_k<F, PCS, ConcreteCircuit>(
+    params: &PCS::Parameters,
     circuit: &ConcreteCircuit,
     k: u32,
-) -> Result<VerifyingKey<F, CS>, Error>
+) -> Result<VerifyingKey<F, PCS>, Error>
 where
     F: WithSmallOrderMulGroup<3> + FromUniformBytes<64> + Ord,
-    CS: PolynomialCommitmentScheme<F>,
+    PCS: PolynomialCommitmentScheme<F>,
     ConcreteCircuit: Circuit<F>,
 {
-    if params.max_k() < k {
-        return Err(Error::NotEnoughRowsAvailable {
-            current_k: params.max_k(),
-        });
+    let max_k = PCS::max_k(params);
+    if max_k < k {
+        return Err(Error::NotEnoughRowsAvailable { current_k: max_k });
     }
 
     let (domain, cs, config) = create_domain::<F, ConcreteCircuit>(
@@ -274,30 +273,22 @@ where
     let (cs, selector_polys) = cs.directly_convert_selectors_to_fixed(selectors);
     fixed.extend(selector_polys.into_iter().map(|poly| domain.lagrange_from_vec(poly)));
 
-    let permutation_vk = assembly.permutation.build_vk(params, &domain, &cs.permutation);
+    let permutations = assembly.permutation.into_permutations::<F>(&domain, &cs.permutation);
 
-    let fixed_commitments = fixed
-        .iter()
-        .enumerate()
-        .map(|(i, poly)| CS::commit(params, poly, PolynomialLabel::Fixed(i)))
-        .collect();
+    let fixed_polys: Vec<_> = fixed.iter().chain(permutations.iter()).collect();
+    let phase0_commitment = PCS::commit_many(params, &fixed_polys, &cs.fixed_polys_labels());
 
-    Ok(VerifyingKey::from_parts(
-        domain,
-        fixed_commitments,
-        permutation_vk,
-        cs,
-    ))
+    Ok(VerifyingKey::from_parts(domain, phase0_commitment, cs))
 }
 
 /// Generate a `ProvingKey` from a `VerifyingKey` and an instance of `Circuit`.
-pub fn keygen_pk<F, CS, ConcreteCircuit>(
-    vk: VerifyingKey<F, CS>,
+pub fn keygen_pk<F, PCS, ConcreteCircuit>(
+    vk: VerifyingKey<F, PCS>,
     circuit: &ConcreteCircuit,
-) -> Result<ProvingKey<F, CS>, Error>
+) -> Result<ProvingKey<F, PCS>, Error>
 where
-    F: WithSmallOrderMulGroup<3>,
-    CS: PolynomialCommitmentScheme<F>,
+    F: PrimeField,
+    PCS: PolynomialCommitmentScheme<F>,
     ConcreteCircuit: Circuit<F>,
 {
     let mut cs = ConstraintSystem::default();
@@ -331,15 +322,9 @@ where
     let (cs, selector_polys) = cs.directly_convert_selectors_to_fixed(assembly.selectors);
     fixed.extend(selector_polys.into_iter().map(|poly| vk.domain.lagrange_from_vec(poly)));
 
-    let fixed_polys: Vec<_> =
-        fixed.par_iter().map(|poly| vk.domain.lagrange_to_coeff(poly.clone())).collect();
-
-    let fixed_cosets = fixed_polys
-        .par_iter()
-        .map(|poly| vk.domain.coeff_to_extended(poly.clone()))
-        .collect();
-
-    let permutation_pk = assembly.permutation.build_pk::<F>(&vk.domain, &cs.permutation);
+    let permutations = assembly.permutation.into_permutations::<F>(&vk.domain, &cs.permutation);
+    let (phase0_polys, fixed_cosets, sigmas) =
+        super::build_phase0_polys(&vk.domain, &cs, vk.transcript_repr, &fixed, permutations);
 
     let [l0, l_last, l_active_row] = compute_lagrange_polys(&vk, &cs);
     // Compute the optimized evaluation data structure
@@ -350,21 +335,21 @@ where
         l_last,
         l_active_row,
         fixed_values: fixed,
-        fixed_polys,
         fixed_cosets,
-        permutation: permutation_pk,
+        phase0_polys,
+        sigmas,
         ev,
         region_starts,
     })
 }
 
-pub(crate) fn compute_lagrange_polys<F, CS>(
-    vk: &VerifyingKey<F, CS>,
+pub(crate) fn compute_lagrange_polys<F, PCS>(
+    vk: &VerifyingKey<F, PCS>,
     cs: &ConstraintSystem<F>,
 ) -> [Polynomial<F, ExtendedLagrangeCoeff>; 3]
 where
-    F: WithSmallOrderMulGroup<3>,
-    CS: PolynomialCommitmentScheme<F>,
+    F: PrimeField,
+    PCS: PolynomialCommitmentScheme<F>,
 {
     // Compute l_0(X)
     // TODO: this can be done more efficiently

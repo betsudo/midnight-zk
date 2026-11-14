@@ -5,18 +5,18 @@
 //! to the claimed state exists. Verification is constant-time regardless
 //! of how many steps the prover has performed.
 
-use midnight_circuits::{hash::poseidon::PoseidonState, verifier::Accumulator};
+use midnight_circuits::{
+    hash::poseidon::{PoseidonChip, PoseidonState},
+    verifier::Accumulator,
+};
 use midnight_proofs::{
     plonk::{self},
-    poly::{
-        PolynomialLabel,
-        kzg::{KZGCommitmentScheme, commitment::KZGMultiCommitment, params::ParamsVerifierKZG},
-    },
+    poly::kzg::params::ParamsVerifierKZG,
     transcript::{CircuitTranscript, Transcript},
 };
 use midnight_zk_stdlib::{MidnightVK, Relation};
 
-use super::{E, F, Ivc, IvcCircuit, IvcError, IvcInstance, S};
+use super::{E, F, Ivc, IvcCircuit, IvcError, IvcInstance, PCS, circuit::IvcExtendedInstance};
 
 /// Lightweight IVC verifier carrying:
 /// - the application context (for the decider check),
@@ -27,11 +27,21 @@ use super::{E, F, Ivc, IvcCircuit, IvcError, IvcInstance, S};
 #[derive(Clone, Debug)]
 pub struct IvcVerifier<T: Ivc> {
     pub(crate) ctx: T::Context,
-    pub(crate) vk: MidnightVK,
+    pub(crate) vk: MidnightVK<PCS>,
     pub(crate) params_verifier: ParamsVerifierKZG<E>,
 }
 
 impl<T: Ivc> IvcVerifier<T> {
+    /// The canonical verifying key of the IVC circuit.
+    pub fn vk(&self) -> &MidnightVK<PCS> {
+        &self.vk
+    }
+
+    /// The SRS verifier parameters, for discharging a deferred pairing.
+    pub fn params_verifier(&self) -> &ParamsVerifierKZG<E> {
+        &self.params_verifier
+    }
+
     /// Verifies an IVC proof against the given instance.
     ///
     /// Checks that the proof is valid with respect to the given instance by:
@@ -41,37 +51,30 @@ impl<T: Ivc> IvcVerifier<T> {
     /// 4. Running the application-level [`decider`](super::IvcState::decider)
     ///    on the instance state.
     ///
-    /// This method checks that `instance.vk_repr` matches the canonical
-    /// verifying key held by this verifier (derived from
-    /// [`setup`](super::setup())). Without this check, a proof generated
-    /// under a different (potentially malicious) circuit could pass
-    /// verification.
+    /// The public inputs of the verifying key are not part of `instance`: they
+    /// are derived from the canonical key held by this verifier (obtained via
+    /// [`setup`](super::setup())).
     pub fn verify(&self, instance: &IvcInstance<T>, proof: &[u8]) -> Result<(), IvcError> {
-        // Reject proofs whose instance claims a different verifying key.
-        if instance.vk_repr != self.vk.vk().transcript_repr() {
-            return Err(IvcError::VkMismatch);
-        }
-
         if !T::decider(&self.ctx, &instance.state) {
             return Err(IvcError::DeciderFailed);
         }
 
-        let fixed_bases = midnight_circuits::verifier::fixed_bases::<S>(self.vk.vk());
+        let fixed_bases = midnight_circuits::verifier::fixed_bases::<E, PCS>(self.vk.vk());
 
-        let pi =
-            IvcCircuit::<T>::format_instance(instance).map_err(|_| IvcError::InvalidInstance)?;
+        let pi = IvcCircuit::<T>::format_instance(&IvcExtendedInstance::new(
+            self.vk.vk(),
+            instance.clone(),
+        ))
+        .map_err(|_| IvcError::InvalidInstance)?;
 
         let mut transcript = CircuitTranscript::<PoseidonState<F>>::init_from_bytes(proof);
-        let dual_msm =
-            plonk::prepare::<F, KZGCommitmentScheme<E>, CircuitTranscript<PoseidonState<F>>>(
-                self.vk.vk(),
-                &[KZGMultiCommitment::commitment_to_zero(
-                    PolynomialLabel::CommittedInstance(0),
-                )],
-                &[&pi],
-                &mut transcript,
-            )
-            .map_err(|_| IvcError::InvalidProof)?;
+        let dual_msm = plonk::prepare::<F, PCS, CircuitTranscript<PoseidonState<F>>>(
+            self.vk.vk(),
+            &[],
+            &[&[], &pi],
+            &mut transcript,
+        )
+        .map_err(|_| IvcError::InvalidProof)?;
 
         transcript.assert_empty().map_err(|_| IvcError::TranscriptNotEmpty)?;
 
@@ -79,7 +82,8 @@ impl<T: Ivc> IvcVerifier<T> {
 
         // Verify that both `proof_acc` and `instance.acc` satisfy the pairing
         // invariant, with a single pairing, by accumulating them first.
-        let final_acc = Accumulator::<S>::accumulate(&[proof_acc, instance.acc.clone()]);
+        let final_acc =
+            Accumulator::accumulate::<PoseidonChip<F>>(&[proof_acc, instance.acc.clone()]);
         if !final_acc.check(&self.params_verifier, &fixed_bases) {
             return Err(IvcError::InvalidProof);
         };

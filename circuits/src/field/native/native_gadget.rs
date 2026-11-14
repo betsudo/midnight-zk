@@ -525,19 +525,6 @@ where
         let assigned_as_native: AssignedNative<F> = assigned.clone().into();
         self.constrain_as_public_input(layouter, &assigned_as_native)
     }
-
-    fn assign_as_public_input(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        value: Value<u8>,
-    ) -> Result<AssignedByte<F>, Error> {
-        // We can skip the in-circuit [0, 255]-range-check as this condition will
-        // be enforced through the public inputs bind anyway.
-        let assigned_native = self
-            .native_chip
-            .assign_as_public_input(layouter, value.map(|byte| F::from(byte as u64)))?;
-        self.convert_unsafe(layouter, &assigned_native)
-    }
 }
 
 impl<F, CD, NA, Assigned> CommittedInstanceInstructions<F, Assigned> for NativeGadget<F, CD, NA>
@@ -989,7 +976,7 @@ where
         // admits two representations: (w = 0, e = 0) and (w = (p-1)/2, e = 1).
         let x_val = x.value().copied().map(|v| v.to_biguint());
         let w_val = x_val.clone().map(|x| &x / BigUint::from(2u8));
-        let e_val = x_val.clone().map(|x| x.bit(0));
+        let e_val = x_val.map(|x| x.bit(0));
 
         let e: AssignedBit<F> = self.assign(layouter, e_val)?;
         let w = self.assign_lower_than_fixed(
@@ -999,7 +986,7 @@ where
         )?;
         let must_be_x = self.linear_combination(
             layouter,
-            &[(F::ONE, e.clone().into()), (F::from(2), w.clone())],
+            &[(F::ONE, e.clone().into()), (F::from(2), w)],
             F::ZERO,
         )?;
         self.assert_equal(layouter, x, &must_be_x)?;
@@ -1036,14 +1023,6 @@ where
         assigned: &AssignedNative<F>,
     ) -> Result<(), Error> {
         self.native_chip.constrain_as_public_input(layouter, assigned)
-    }
-
-    fn assign_as_public_input(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        value: Value<F>,
-    ) -> Result<AssignedNative<F>, Error> {
-        self.native_chip.assign_as_public_input(layouter, value)
     }
 }
 
@@ -1104,14 +1083,6 @@ where
     ) -> Result<(), Error> {
         self.native_chip.constrain_as_public_input(layouter, assigned)
     }
-
-    fn assign_as_public_input(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        value: Value<bool>,
-    ) -> Result<AssignedBit<F>, Error> {
-        self.native_chip.assign_as_public_input(layouter, value)
-    }
 }
 
 // Inherit Bit Assignment Instructions.
@@ -1171,12 +1142,12 @@ where
     ) -> Result<(), Error> {
         let x_bound_opt = self.constrained_cells.borrow().get(x).cloned();
         if let Some(x_bound) = x_bound_opt {
-            self.update_bound(y, x_bound.clone());
+            self.update_bound(y, x_bound);
         }
 
         let y_bound_opt = self.constrained_cells.borrow().get(y).cloned();
         if let Some(y_bound) = y_bound_opt {
-            self.update_bound(x, y_bound.clone());
+            self.update_bound(x, y_bound);
         }
 
         self.native_chip.assert_equal(layouter, x, y)

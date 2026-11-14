@@ -141,9 +141,10 @@ pub struct MultiEmulationParams {}
 
 /// Implement FieldEmulationParams for any curve that can emulate itself through
 /// MultiEmulationParams.
-impl<C: CircuitCurve + Default> FieldEmulationParams<C::ScalarField, C::Base> for C
+impl<C> FieldEmulationParams<C::ScalarField, C::Base> for C
 where
     MultiEmulationParams: FieldEmulationParams<C::ScalarField, C::Base>,
+    C: CircuitCurve + Default,
 {
     const LOG2_BASE: u32 = MultiEmulationParams::LOG2_BASE;
 
@@ -236,8 +237,8 @@ impl FieldEmulationParams<midnight_curves::Fq, p256::Fp> for MultiEmulationParam
     const NB_LIMBS: u32 = 4;
     fn moduli() -> Vec<BigInt> {
         vec![
-            BigInt::from(2).pow(122),
-            BigInt::from(2).pow(122) - BigInt::from(507376),
+            BigInt::from(2).pow(118),
+            BigInt::from(2).pow(118) - BigInt::from(270),
         ]
     }
     const RC_LIMB_SIZE: u32 = 17;

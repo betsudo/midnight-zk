@@ -1,55 +1,49 @@
 use std::{
-    hash::Hash,
+    collections::BTreeMap,
     iter::{self},
 };
 
-use ff::{FromUniformBytes, WithSmallOrderMulGroup};
+use ff::FromUniformBytes;
 
 use super::{Error, VerifyingKey};
 use crate::{
-    plonk::{
-        argument, linearization::verifier::compute_linearization_commitment,
-        partially_evaluate_identities, traces::VerifierTrace,
-    },
-    poly::{PolynomialLabel, VerifierQuery, commitment::PolynomialCommitmentScheme},
-    transcript::{Hashable, Sampleable, Transcript, read_n},
+    plonk::{ProofField, argument, evaluate_identities, traces::VerifierTrace},
+    poly::{PolynomialLabel, Rotation, VerifierQuery, commitment::PolynomialCommitmentScheme},
+    transcript::{Hashable, Transcript, TranscriptField},
     utils::arithmetic::compute_inner_product,
 };
 
 /// Given a plonk proof, this function parses it to extract the verifying trace.
 /// This function computes all Fiat-Shamir challenges, with the exception of
 /// `x`, which is computed in [verify_algebraic_constraints]
-pub fn parse_trace<F, CS, T>(
-    vk: &VerifyingKey<F, CS>,
+pub fn parse_trace<F, PCS, T>(
+    vk: &VerifyingKey<F, PCS>,
     // Unlike the prover, the verifier gets their instances in two arguments:
     // committed and normal (non-committed). Note that the total number of
     // instance columns is expected to be the sum of committed instances and
     // normal instances. (Committed instances go first, that is, the first
     // instance columns are devoted to committed instances.)
-    #[cfg(feature = "committed-instances")] committed_instances: &[CS::Commitment],
+    #[cfg(feature = "committed-instances")] committed_instances: &[PCS::Commitment],
     instances: &[&[F]],
     transcript: &mut T,
-) -> Result<VerifierTrace<F, CS>, Error>
+) -> Result<VerifierTrace<F, PCS>, Error>
 where
-    CS: PolynomialCommitmentScheme<F>,
+    F: TranscriptField<T::Hash> + FromUniformBytes<64> + Ord,
+    PCS: PolynomialCommitmentScheme<F>,
+    PCS::Commitment: Hashable<T::Hash>,
     T: Transcript,
-    F: WithSmallOrderMulGroup<3>
-        + Hashable<T::Hash>
-        + Sampleable<T::Hash>
-        + FromUniformBytes<64>
-        + Ord,
-    CS::Commitment: Hashable<T::Hash>,
 {
     #[cfg(not(feature = "committed-instances"))]
-    let committed_instances: Vec<CS::Commitment> = vec![];
+    let committed_instances: Vec<PCS::Commitment> = vec![];
 
     // Check that instances matches the expected number of instance columns
     if committed_instances.len() + instances.len() != vk.cs.num_instance_columns {
         return Err(Error::InvalidInstances);
     }
 
-    // Hash verification key into transcript
-    vk.hash_into(transcript)?;
+    // Hash verification key into transcript.
+    let vk_absorbed = vk.absorb_into(transcript)?;
+    let phase0_committed = argument::verifier::Committed::from_key(&vk_absorbed);
 
     for commitment in committed_instances.iter() {
         transcript.common(commitment)?
@@ -62,23 +56,10 @@ where
         }
     }
 
-    // Hash the prover's advice commitments into the transcript and squeeze
-    // challenges
-    let advice_commitments: Vec<_> = (0..vk.cs.num_advice_columns)
-        .map(|i| CS::read_commitment(transcript, &[PolynomialLabel::Advice(i)]))
-        .collect::<Result<_, _>>()?;
+    let phase1_committed = argument::verifier::Committed::read(&vk.phase1_labels(), transcript)?;
 
     // Sample theta challenge for keeping lookup columns linearly independent
     let theta: F = transcript.squeeze_challenge();
-
-    // Read multiplicities
-    let lookup_multiplicities: Vec<_> = vk
-        .cs
-        .lookups
-        .iter()
-        .enumerate()
-        .map(|(i, l)| l.chunk_by_degree(vk.cs_degree).read_multiplicities::<_, CS>(i, transcript))
-        .collect::<Result<Vec<_>, _>>()?;
 
     // Sample beta challenge
     let beta: F = transcript.squeeze_challenge();
@@ -89,31 +70,15 @@ where
     // Sample the trash challenge after the advices have been committed to
     let trash_challenge: F = transcript.squeeze_challenge();
 
-    let permutations_committed = vk.cs.permutation.read_product_commitments(vk, transcript)?;
-
-    let lookups_committed: Vec<_> = lookup_multiplicities
-        .into_iter()
-        .zip(vk.cs.lookups.iter().map(|l| l.chunk_by_degree(vk.cs_degree)))
-        .enumerate()
-        .map(|(i, (m, batch))| m.read_commitment(i, batch.num_chunks(), transcript))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let phase2_labels = vk
-        .cs
-        .trashcans
-        .iter()
-        .map(|argument| PolynomialLabel::Trash(argument.argument_index))
-        .collect::<Vec<_>>();
-    let phase2_committed = argument::verifier::Committed::read(&phase2_labels, transcript)?;
+    let phase2_committed = argument::verifier::Committed::read(&vk.phase2_labels(), transcript)?;
 
     // Sample y challenge, which keeps the gates linearly independent.
     let y: F = transcript.squeeze_challenge();
 
     Ok(VerifierTrace {
-        advice_commitments,
-        lookups: lookups_committed,
+        phase0_committed,
+        phase1_committed,
         phase2_committed,
-        permutations: permutations_committed,
         beta,
         gamma,
         theta,
@@ -127,37 +92,33 @@ where
 /// evaluations. This function does not verify the PCS proof.
 ///
 /// The verifier will error if there are trailing bits in the transcript.
-pub fn verify_algebraic_constraints<F, CS: PolynomialCommitmentScheme<F>, T: Transcript>(
-    vk: &VerifyingKey<F, CS>,
-    trace: VerifierTrace<F, CS>,
+pub fn verify_algebraic_constraints<F, PCS, T>(
+    vk: &VerifyingKey<F, PCS>,
+    trace: VerifierTrace<F, PCS>,
     // Unlike the prover, the verifier gets their instances in two arguments:
     // committed and normal (non-committed). Note that the total number of
     // instance columns is expected to be the sum of committed instances and
     // normal instances. (Committed instances go first, that is, the first
     // instance columns are devoted to committed instances.)
-    #[cfg(feature = "committed-instances")] committed_instances: &[CS::Commitment],
+    #[cfg(feature = "committed-instances")] committed_instances: &[PCS::Commitment],
     instances: &[&[F]],
     transcript: &mut T,
-) -> Result<CS::VerificationGuard, Error>
+) -> Result<PCS::VerificationGuard, Error>
 where
-    F: WithSmallOrderMulGroup<3>
-        + Hashable<T::Hash>
-        + Sampleable<T::Hash>
-        + FromUniformBytes<64>
-        + Hash
-        + Ord,
-    CS::Commitment: Hashable<T::Hash>,
+    F: ProofField<T::Hash>,
+    PCS: PolynomialCommitmentScheme<F>,
+    PCS::Commitment: Hashable<T::Hash>,
+    T: Transcript,
 {
     #[cfg(not(feature = "committed-instances"))]
-    let committed_instances: Vec<CS::Commitment> = vec![];
+    let committed_instances: Vec<PCS::Commitment> = vec![];
 
     let nb_committed_instances = committed_instances.len();
 
     let VerifierTrace {
-        advice_commitments,
-        lookups,
+        phase0_committed,
+        phase1_committed,
         phase2_committed,
-        permutations,
         beta,
         gamma,
         theta,
@@ -165,32 +126,20 @@ where
         y,
     } = trace;
 
-    // Read commitment(s) to the quotient polynomial h(X) = nu(X)/(X^n-1) from
-    // the transcript. When the `single-h-commitment` feature is enabled the prover
-    // commits to h(X) as a single polynomial (one commitment); otherwise it
-    // splits h(X) into `quotient_poly_degree` limbs (one commitment each).
-    #[cfg(not(feature = "single-h-commitment"))]
-    let nb_quotient_coms = vk.domain.get_quotient_poly_degree();
-    #[cfg(feature = "single-h-commitment")]
-    let nb_quotient_coms = 1;
-    let quotient_limb_coms = {
-        #[cfg(not(feature = "single-h-commitment"))]
-        let labeled = (0..nb_quotient_coms)
-            .map(|i| CS::read_commitment(transcript, &[PolynomialLabel::QuotientPiece(i)]))
-            .collect::<Result<Vec<_>, _>>()?;
-        #[cfg(feature = "single-h-commitment")]
-        let labeled = (0..nb_quotient_coms)
-            .map(|_| CS::read_commitment(transcript, &[PolynomialLabel::Quotient]))
-            .collect::<Result<Vec<_>, _>>()?;
-        labeled
-    };
+    // Read the commitment to the quotient polynomial h(X) = nu(X)/(X^n-1) from
+    // the transcript. The prover splits h(X) into `quotient_poly_degree + 1`
+    // limbs, committed to as one group.
+    let quotient_labels: Vec<_> = (0..vk.domain.get_quotient_poly_degree() + 1)
+        .map(PolynomialLabel::QuotientPiece)
+        .collect();
+    let quotient_committed = argument::verifier::Committed::read(&quotient_labels, transcript)?;
 
     // Sample x challenge, which is used to ensure the circuit is
     // satisfied with high probability.
-    let x: F = CS::squeeze_evaluation_point(transcript);
+    let x: F = PCS::squeeze_evaluation_point(transcript);
 
-    let splitting_factor = x.pow_vartime([vk.n() - 1]);
-    let xn = splitting_factor * x;
+    let splitting_factor = x.pow_vartime([vk.n() - 2]);
+    let xn = splitting_factor * x.square();
 
     let instance_evals: Vec<F> = {
         let (min_rotation, max_rotation) =
@@ -231,82 +180,66 @@ where
             .collect::<Result<Vec<_>, _>>()?
     };
 
-    let advice_evals: Vec<F> = read_n(transcript, vk.cs.advice_queries.len())?;
+    let domain = vk.get_domain();
+    let cs = vk.cs();
 
-    // Read one eval per non-simple-selector fixed query from the transcript,
-    // then fill the "missing" places with 1 (the transcript doesn't contain evals
-    // corresponding to multiplicative, simple selectors).
-    // We count queries (not unique columns) because the same column can appear
-    // multiple times in fixed_queries at different rotation points.
-    let mut fixed_evals = read_n(
-        transcript,
-        vk.cs.fixed_queries().len() - vk.cs.num_simple_selectors(),
-    )?;
-    for (idx, (col, _)) in vk.cs.fixed_queries().iter().enumerate() {
-        if vk.cs.has_simple_selector_col(col.index()) {
-            fixed_evals.insert(idx, F::ONE)
-        }
-    }
-
-    let permutations_common = vk.permutation.evaluate(transcript)?;
-
-    let permutations_evaluated = permutations.evaluate(transcript)?;
-
-    let lookups_evaluated: Vec<_> = lookups
+    let x_rotations: BTreeMap<Rotation, F> = argument::rotations(cs)
         .into_iter()
-        .map(|lookup| lookup.evaluate(transcript))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|rotation| (rotation, domain.rotate_omega(x, rotation)))
+        .collect();
 
-    let phase2_evaluated = phase2_committed.evaluate(x, transcript)?;
+    let phase0_evaluated = phase0_committed.evaluate(cs, &x_rotations, transcript)?;
 
-    // Partially evaluate batched identities
-    // (without fixed columns corresponding to simple, multiplicative selectors)
-    let expressions = partially_evaluate_identities(
+    let phase1_evaluated = phase1_committed.evaluate(cs, &x_rotations, transcript)?;
+    let phase2_evaluated = phase2_committed.evaluate(cs, &x_rotations, transcript)?;
+    let mut quotient_evaluated = quotient_committed.evaluate(cs, &x_rotations, transcript)?;
+
+    let phase0_evals = &phase0_evaluated.evals_map;
+    let phase1_evals = &phase1_evaluated.evals_map;
+    let phase2_evals = &phase2_evaluated.evals_map;
+
+    // Evaluate the batched identities, nu(x)
+    let nu_eval = evaluate_identities(
         vk,
-        &fixed_evals,
         &instance_evals,
-        &advice_evals,
-        &permutations_evaluated.sets,
-        lookups_evaluated.iter().map(|inner| &inner.evaluated),
-        &phase2_evaluated.evals_map,
-        &permutations_common,
+        phase0_evals,
+        phase1_evals,
+        phase2_evals,
         x,
         xn,
         beta,
         gamma,
         theta,
         trash_challenge,
+        y,
     );
 
-    let (lin_commitment, lin_eval) = compute_linearization_commitment(
-        expressions,
-        vk,
-        &y,
-        &xn,
-        &splitting_factor,
-        &quotient_limb_coms,
-    );
+    // h_0(x) is derived from nu(x) = (x^n - 1) h(x), for
+    // h(x) = h_0(x) + x^{n-2} h_1(x) + ..., so that opening h_0 at it checks
+    // the identities.
+    let higher_limbs = (quotient_evaluated.evals_map.values().skip(1).rev())
+        .fold(F::ZERO, |acc, evals| {
+            (acc + evals[0].eval()) * splitting_factor
+        });
+    let vanishing_inv =
+        Option::<F>::from((xn - F::ONE).invert()).ok_or(Error::ConstraintSystemFailure)?;
+    let h0_eval = nu_eval * vanishing_inv - higher_limbs;
+    quotient_evaluated.insert(PolynomialLabel::QuotientPiece(0), x, h0_eval);
 
     // Collect queries that are checked in the multi-open argument
     //
-    // NB: Queries corresponding to simple, multiplicative selectors need not be
-    // checked
+    // The multi-open scales the first commitment by 1, which is best spent on
+    // one read from the proof: the phase-0 commitments are known in advance and
+    // a committed instance may be a constant, so both go after phases 1 and 2.
     let queries = iter::empty()
-        .chain(
-            vk.cs.advice_queries.iter().enumerate().map(|(query_index, &(column, at))| {
-                VerifierQuery::new(
-                    vk.domain.rotate_omega(x, at),
-                    &advice_commitments[column.index()],
-                    PolynomialLabel::Advice(column.index()),
-                    advice_evals[query_index],
-                )
-            }),
-        )
+        .chain(phase1_evaluated.queries())
+        .chain(phase2_evaluated.queries())
+        .chain(phase0_evaluated.queries())
         .chain(vk.cs.instance_queries.iter().enumerate().filter_map(
             |(query_index, &(column, at))| {
                 if column.index() < nb_committed_instances {
                     Some(VerifierQuery::new(
-                        vk.domain.rotate_omega(x, at),
+                        x_rotations[&at],
                         &committed_instances[column.index()],
                         PolynomialLabel::CommittedInstance(column.index()),
                         instance_evals[query_index],
@@ -316,38 +249,13 @@ where
                 }
             },
         ))
-        .chain(permutations_evaluated.queries(vk, x))
-        .chain(lookups_evaluated.iter().flat_map(|p| p.queries(vk, x)))
-        .chain(phase2_evaluated.queries())
-        .chain(
-            vk.cs
-                .fixed_queries
-                .iter()
-                .enumerate()
-                // Filter out queries for simple, multiplicative selectors
-                .filter(|(_, (col, _))| !vk.cs.has_simple_selector_col(col.index()))
-                .map(|(query_index, &(column, at))| {
-                    VerifierQuery::new(
-                        vk.domain.rotate_omega(x, at),
-                        &vk.fixed_commitments[column.index()],
-                        PolynomialLabel::Fixed(column.index()),
-                        fixed_evals[query_index],
-                    )
-                }),
-        )
-        .chain(permutations_common.queries(&vk.permutation, x))
-        .chain(iter::once(VerifierQuery::new(
-            x,
-            &lin_commitment,
-            PolynomialLabel::Linearization,
-            lin_eval,
-        )))
+        .chain(quotient_evaluated.queries())
         .collect::<Vec<_>>();
 
     // We are now convinced the circuit is satisfied so long as the
     // polynomial commitments open to the correct values, which is true as long
     // as the following accumulator passes the invariant.
-    CS::multi_prepare(&queries, vk.domain.k(), transcript).map_err(|_| Error::Opening)
+    PCS::multi_prepare(&queries, transcript).map_err(|_| Error::Opening)
 }
 
 /// Prepares a plonk proof into a PCS instance that can be finalized or
@@ -355,25 +263,22 @@ where
 /// instance columns.
 ///
 /// The verifier will error if there are trailing bytes in the transcript.
-pub fn prepare<F, CS: PolynomialCommitmentScheme<F>, T: Transcript>(
-    vk: &VerifyingKey<F, CS>,
+pub fn prepare<F, PCS, T>(
+    vk: &VerifyingKey<F, PCS>,
     // Unlike the prover, the verifier gets their instances in two arguments:
     // committed and normal (non-committed). Note that the total number of
     // instance columns is expected to be the sum of committed instances and
     // normal instances. (Committed instances go first, that is, the first
     // instance columns are devoted to committed instances.)
-    #[cfg(feature = "committed-instances")] committed_instances: &[CS::Commitment],
+    #[cfg(feature = "committed-instances")] committed_instances: &[PCS::Commitment],
     instances: &[&[F]],
     transcript: &mut T,
-) -> Result<CS::VerificationGuard, Error>
+) -> Result<PCS::VerificationGuard, Error>
 where
-    F: WithSmallOrderMulGroup<3>
-        + Hashable<T::Hash>
-        + Sampleable<T::Hash>
-        + FromUniformBytes<64>
-        + Hash
-        + Ord,
-    CS::Commitment: Hashable<T::Hash>,
+    F: ProofField<T::Hash>,
+    PCS: PolynomialCommitmentScheme<F>,
+    PCS::Commitment: Hashable<T::Hash>,
+    T: Transcript,
 {
     let trace = parse_trace(
         vk,

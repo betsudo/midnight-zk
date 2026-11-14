@@ -1,6 +1,6 @@
 [package]
 name = "midnight-proofs"
-version = "0.8.0"
+version = "0.9.0-rc.1"
 edition.workspace = true
 rust-version.workspace = true
 description = """
@@ -28,10 +28,13 @@ name = "zswap_output"
 required-features = ["bench-internal"]
 harness = false
 
+[lints]
+workspace = true
+
 [dependencies]
 ff = { workspace = true }
 group = { workspace = true }
-midnight-curves = "0.3.0"
+midnight-curves = "0.4.0-rc.1"
 rand_core = { workspace = true, features = ["getrandom"] }
 tracing = { workspace = true }
 blake2b_simd = { workspace = true }
@@ -61,17 +64,12 @@ criterion = "0.8"
 getrandom = { version = "0.2", features = ["js"] }
 
 [target.'cfg(ci_build)'.dependencies]
-midnight-curves = { version = "0.3.0", features = [
-  "portable",
-] }
+midnight-curves = { version = "0.4.0-rc.1", features = ["portable"] }
 
 [features]
 default = ["committed-instances"]
 circuit-params = []
 dev-curves = ["midnight-curves/dev-curves"]
-
-# This feature truncates challenges to half the size of the scalar field.
-truncated-challenges = []
 
 # This feature adds a new argument to prover and verifier functions, which
 # represents instances in committed form (e.g. in the form of a polynomial
@@ -84,19 +82,6 @@ committed-instances = []
 
 # Feature to expose internal prover types and benchmarking utilities.
 bench-internal = ["criterion"]
-
-# Feature to commit to the quotient polynomial H as a single polynomial
-# commitment instead of splitting it into degree-(n-1) limbs. Requires the
-# KZG parameters to support polynomials of degree up to (d-1)*(n-1), where d
-# is the maximum constraint degree and n is the circuit domain size (i.e., the
-# params must be generated with k >= log2(n * (d-1))).
-single-h-commitment = []
-
-# Enables a heuristic to reduce the number of distinct multi-open point sets,
-# lowering the verifier MSM length. This can be particularly beneficial for
-# in-circuit verifiers. The heuristic works by adding dummy queries for some
-# polynomials, which may slightly increase proof size.
-fewer-point-sets = []
 
 [lib]
 bench = false

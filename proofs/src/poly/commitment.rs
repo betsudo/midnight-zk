@@ -1,59 +1,71 @@
 //! Trait for a commitment scheme
-use core::ops::{Add, Mul};
 use std::{
     fmt::Debug,
     hash::Hash,
     io::{self, Read},
 };
 
-use ff::{FromUniformBytes, PrimeField};
+use ff::PrimeField;
 
 use crate::{
-    plonk::{Circuit, k_from_circuit},
     poly::{
         Error, Polynomial, PolynomialRepresentation, ProverQuery, VerifierQuery,
         query::PolynomialLabel,
     },
-    transcript::{Hashable, Sampleable, Transcript},
+    transcript::{Hashable, Sampleable, Transcript, TranscriptField},
     utils::helpers::{ProcessedSerdeObject, SerdeFormat},
 };
 
-/// Public interface for a additively homomorphic Polynomial Commitment Scheme
-/// (PCS)
+/// Public interface for a Polynomial Commitment Scheme (PCS)
 pub trait PolynomialCommitmentScheme<F: PrimeField>: Clone + Debug {
     /// Parameters needed to generate a proof in the PCS
-    type Parameters: Params;
+    type Parameters: Send + Sync;
 
     /// Parameters needed to verify a proof in the PCS
     type VerifierParameters;
 
     /// Type of a committed polynomial
-    type Commitment: Clone
-        + Debug
-        + Default
-        + PartialEq
-        + ProcessedSerdeObject
-        + Send
-        + Sync
-        + Add<Output = Self::Commitment>
-        + Mul<F, Output = Self::Commitment>;
+    type Commitment: Clone + Debug + Default + PartialEq + ProcessedSerdeObject + Send + Sync;
 
     /// Verification guard. Allows for batch verification
-    type VerificationGuard: Guard<F, Self>;
+    type VerificationGuard: Guard<Self::VerifierParameters>;
 
-    /// Generates the parameters of the polynomial commitment scheme
+    /// Generates the parameters of the polynomial commitment scheme, for
+    /// committing to polynomials of degree strictly less than `2^k`.
     fn gen_params(k: u32) -> Self::Parameters;
+
+    /// Reads the parameters of the polynomial commitment scheme from `reader`,
+    /// for committing to polynomials of degree strictly less than `2^k`.
+    fn load_params<R: io::Read>(
+        reader: &mut R,
+        format: SerdeFormat,
+        k: u32,
+    ) -> io::Result<Self::Parameters>;
+
+    /// Returns the largest `k` such that `params` can commit to polynomials of
+    /// degree strictly less than `2^k`.
+    fn max_k(params: &Self::Parameters) -> u32;
 
     /// Extract the `VerifierParameters` from `Parameters`
     fn get_verifier_params(params: &Self::Parameters) -> Self::VerifierParameters;
 
-    /// Commit to one or more polynomials, tagging the result with the
+    /// Commit to several polynomials, tagging the result with the
     /// corresponding labels for identification during multi-open accumulation.
+    ///
+    /// The polynomials are committed to in the order given, which must be the
+    /// order in which [`read_commitment`](Self::read_commitment) and
+    /// [`deserialize_commitment`](Self::deserialize_commitment) receive their
+    /// labels.
+    ///
+    /// Committing to no polynomials does not fail: it returns an empty
+    /// commitment, which [`write_commitment`](Self::write_commitment) does not
+    /// write to the transcript. An empty commitment holds no polynomial, so it
+    /// cannot be queried: the multi-open rejects any query against it.
     ///
     /// # Panics
     ///
-    /// Panics if `polynomials` and `labels` have different lengths, or if
-    /// either slice is empty.
+    /// Panics if `polynomials` and `labels` have different lengths, or if a
+    /// label is repeated.
     fn commit_many<B: PolynomialRepresentation>(
         params: &Self::Parameters,
         polynomials: &[&Polynomial<F, B>],
@@ -75,14 +87,38 @@ pub trait PolynomialCommitmentScheme<F: PrimeField>: Clone + Debug {
     /// transcript, absorbing it into the transcript state and tagging each
     /// polynomial with its label.
     ///
+    /// The labels are matched to the points read in the order given, that of
+    /// [`commit_many`](Self::commit_many).
+    ///
     /// Use [`deserialize_commitment`](Self::deserialize_commitment) instead for
     /// commitments that are not part of the proof.
-    fn read_commitment<T: Transcript>(
+    ///
+    /// # Panics
+    ///
+    /// Panics if a label is repeated. Labels name the polynomials the
+    /// verifying key expects, so a repeat is a caller bug, not a malformed
+    /// proof.
+    fn read_commitment<T>(
         transcript: &mut T,
         labels: &[PolynomialLabel],
     ) -> io::Result<Self::Commitment>
     where
-        Self::Commitment: Hashable<T::Hash>;
+        Self::Commitment: Hashable<T::Hash>,
+        T: Transcript;
+
+    /// Write a commitment produced by [`commit_many`](Self::commit_many) to the
+    /// proof transcript, absorbing it in exactly the granularity in which
+    /// [`read_commitment`](Self::read_commitment) reads it back.
+    ///
+    /// A commitment to no polynomials writes and absorbs nothing, and
+    /// [`read_commitment`](Self::read_commitment) with no labels reads nothing.
+    fn write_commitment<T>(transcript: &mut T, commitment: &Self::Commitment) -> io::Result<()>
+    where
+        Self::Commitment: Hashable<T::Hash>,
+        T: Transcript,
+    {
+        transcript.write(commitment)
+    }
 
     /// Deserialize a commitment to `labels.len()` polynomials from `reader`,
     /// tagging each polynomial with its label.
@@ -90,6 +126,10 @@ pub trait PolynomialCommitmentScheme<F: PrimeField>: Clone + Debug {
     /// Unlike [`read_commitment`](Self::read_commitment), the bytes come from a
     /// plain reader, typically a serialized verifying key, and nothing is
     /// absorbed into a transcript.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a label is repeated.
     fn deserialize_commitment<R: Read>(
         reader: &mut R,
         format: SerdeFormat,
@@ -103,37 +143,32 @@ pub trait PolynomialCommitmentScheme<F: PrimeField>: Clone + Debug {
     /// `t`-th power in the field.
     ///
     /// The protocol must squeeze evaluation points through this method.
-    fn squeeze_evaluation_point<T: Transcript>(transcript: &mut T) -> F
+    fn squeeze_evaluation_point<T>(transcript: &mut T) -> F
     where
         F: Sampleable<T::Hash>,
+        T: Transcript,
     {
         transcript.squeeze_challenge()
     }
 
-    /// Multiplicative blow-up factor by which `params.g_monomial_size()` must
-    /// exceed `2^k` (the circuit's Lagrange-domain size) for this PCS to
-    /// commit every polynomial it produces at the requested circuit size.
-    /// Returns `1` when no extension is needed.
-    ///
-    /// `cs_degree` is the constraint system's `cs.degree()`. Schemes that
-    /// commit to a single combined polynomial (e.g. `single-h-commitment`,
-    /// fflonk's bundles) factor that into their requested blow-up.
-    fn srs_monomial_blowup(cs_degree: usize) -> usize {
-        let _ = cs_degree; // Just to avoid a clippy warning.
-        1
-    }
-
     /// Create a multi-opening proof at a set of [ProverQuery]'s.
-    fn multi_open<T: Transcript>(
+    ///
+    /// The evaluations of the queries are already in the transcript.
+    fn multi_open<T>(
         params: &Self::Parameters,
         prover_query: &[ProverQuery<F>],
         transcript: &mut T,
     ) -> Result<(), Error>
     where
-        F: Sampleable<T::Hash> + Hash + Ord + Hashable<T::Hash>,
-        Self::Commitment: Hashable<T::Hash>;
+        F: TranscriptField<T::Hash> + Hash + Ord,
+        Self::Commitment: Hashable<T::Hash>,
+        T: Transcript;
 
-    /// Total byte length when committing to `n` polynomials.
+    /// The labels `commitment` tags its polynomials with.
+    fn commitment_labels(commitment: &Self::Commitment) -> Vec<PolynomialLabel>;
+
+    /// Total byte length when committing to `n` polynomials, which is 0 when
+    /// `n` is 0.
     ///
     /// For schemes that commit each polynomial independently (e.g. KZG), this
     /// equals `n` times the per-commitment size. Override for schemes that fold
@@ -144,73 +179,51 @@ pub trait PolynomialCommitmentScheme<F: PrimeField>: Clone + Debug {
 
     /// Verify an multi-opening proof for a given set of [VerifierQuery]'s.
     /// The function fails if the transcript has trailing bytes.
-    ///
-    /// `k` is the log2 of the circuit's (Lagrange) domain size. Schemes whose
-    /// opening structure depends on the domain relative to the SRS capacity
-    /// (e.g. fflonk's SRS-aware bundling) need it to reconstruct and
-    /// sanity-check the prover's choices; schemes that don't (e.g. plain KZG)
-    /// ignore it.
-    fn multi_prepare<'com, T: Transcript>(
+    fn multi_prepare<'com, T>(
         verifier_query: &[VerifierQuery<'com, F, Self>],
-        k: u32,
         transcript: &mut T,
     ) -> Result<Self::VerificationGuard, Error>
     where
-        F: Sampleable<T::Hash> + Hash + Ord + Hashable<T::Hash>,
-        Self::Commitment: Hashable<T::Hash> + 'com;
+        F: TranscriptField<T::Hash> + Hash + Ord,
+        Self::Commitment: Hashable<T::Hash> + 'com,
+        T: Transcript;
 }
 
-/// Interface for verifier finalizer
-pub trait Guard<F: PrimeField, CS: PolynomialCommitmentScheme<F>>: Sized {
+/// A [`PolynomialCommitmentScheme`] that commits to polynomials interleaved
+/// in chunks.
+pub trait InterleavedCommit<F: PrimeField>: PolynomialCommitmentScheme<F> {
+    /// Commit to `g(X) = Σ_i X^i f_i(X^t)` for every chunk `f_0, ..., f_{k-1}`
+    /// of `chunks`, with `t` the next power of two of `k`, tagging the `g` of
+    /// each chunk with the corresponding label.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunks` and `labels` have different lengths, if a label is
+    /// repeated, or if the polynomials of a chunk have different lengths.
+    fn commit_interleaved<B: PolynomialRepresentation>(
+        params: &Self::Parameters,
+        chunks: &[&[&Polynomial<F, B>]],
+        labels: &[PolynomialLabel],
+    ) -> Self::Commitment;
+}
+
+/// Interface for verifier finalizer, given the verifier parameters `VP` of
+/// its PCS
+pub trait Guard<VP>: Sized {
     /// Finalize the verification guard
-    fn verify(self, params: &CS::VerifierParameters) -> Result<(), Error>;
+    fn verify(self, params: &VP) -> Result<(), Error>;
 
     /// Finalize a batch of verification guards
     fn batch_verify<'a, I, J>(guards: I, params: J) -> Result<(), Error>
     where
         I: ExactSizeIterator<Item = Self>,
-        J: ExactSizeIterator<Item = &'a CS::VerifierParameters>,
-        CS::VerifierParameters: 'a,
+        J: ExactSizeIterator<Item = &'a VP>,
+        VP: 'a,
     {
         assert_eq!(guards.len(), params.len());
         guards
             .into_iter()
             .zip(params)
             .try_for_each(|(guard, params)| guard.verify(params))
-    }
-}
-
-/// Interface for PCS params
-pub trait Params: Send + Sync {
-    /// Returns the size of the Lagrange basis, expressed as the exponent `k`
-    /// such that the Lagrange domain has `2^k` elements. This equals the
-    /// circuit domain size and is used by keygen to validate the SRS.
-    fn max_k(&self) -> u32;
-
-    /// Returns the number of monomial-basis elements `[s^i]G₁` available in
-    /// the SRS. For a standard SRS this equals `1 << max_k()`. When the
-    /// `single-h-commitment` feature is enabled the monomial basis may be
-    /// larger than the Lagrange basis (which covers only the circuit
-    /// domain), so this method returns the true capacity for
-    /// coefficient-form commitments.
-    fn g_monomial_size(&self) -> usize {
-        1 << self.max_k()
-    }
-
-    /// Downsize the params to work with a circuit of size `new_k`
-    fn downsize(&mut self, new_k: u32);
-
-    /// Downsize the params to work with a circuit of unknown length. The
-    /// function first computes the `k` of the provided circuit, and then
-    /// downsizes the SRS.
-    fn downsize_from_circuit<
-        F: PrimeField + Ord + FromUniformBytes<64>,
-        ConcreCircuit: Circuit<F>,
-    >(
-        &mut self,
-        circuit: &ConcreCircuit,
-    ) {
-        let k = k_from_circuit(circuit);
-        self.downsize(k);
     }
 }

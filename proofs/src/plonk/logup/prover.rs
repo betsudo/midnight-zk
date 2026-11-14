@@ -22,89 +22,63 @@
 
 use std::{hash::Hash, iter};
 
-use ff::{BatchInvert, FromUniformBytes, PrimeField, WithSmallOrderMulGroup};
+use ff::{BatchInvert, FromUniformBytes, PrimeField};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
-    plonk::{
-        Error, Expression, ProvingKey,
-        evaluation::evaluate,
-        logup::{self, ChunkedArgument},
-    },
-    poly::{
-        Coeff, LagrangeCoeff, Polynomial, PolynomialLabel, ProverQuery, Rotation,
-        commitment::PolynomialCommitmentScheme,
-    },
-    transcript::{Hashable, Transcript},
-    utils::arithmetic::{eval_polynomial, parallelize},
+    plonk::{Error, Expression, ProvingKey, evaluation::evaluate, logup::ChunkedArgument},
+    poly::{LagrangeCoeff, Polynomial, commitment::PolynomialCommitmentScheme},
+    utils::arithmetic::parallelize,
 };
-
-/// Committed LogUp polynomials in coefficient form.
-#[cfg_attr(feature = "bench-internal", derive(Clone))]
-#[derive(Debug)]
-pub(crate) struct Committed<F: PrimeField> {
-    pub(crate) argument_index: usize,
-    pub(crate) multiplicities: Polynomial<F, Coeff>,
-    pub(crate) helper_polys: Vec<Polynomial<F, Coeff>>,
-    pub(crate) aggregator_poly: Polynomial<F, Coeff>,
-}
 
 /// Computed multiplicities.
 ///
-/// This structure holds the multiplicity counts computed from compressing
-/// input and table expressions.
+/// This structure holds the multiplicity counts, together with the evaluations
+/// of the input and table expressions they were counted from, which are
+/// compressed with `theta` once it is known.
 #[cfg_attr(feature = "bench-internal", derive(Clone))]
 #[derive(Debug)]
 pub(crate) struct ComputedMultiplicities<F: PrimeField> {
     pub(crate) argument_index: usize,
     pub(crate) selector: Polynomial<F, LagrangeCoeff>,
     pub(crate) multiplicities: Polynomial<F, LagrangeCoeff>,
-    pub(crate) chunked_compressed_inputs: Vec<Vec<Polynomial<F, LagrangeCoeff>>>,
-    pub(crate) compressed_table_expression: Polynomial<F, LagrangeCoeff>,
+    /// Per chunk, per input, the evaluation of each of its expressions.
+    chunked_input_evals: Vec<Vec<Vec<Polynomial<F, LagrangeCoeff>>>>,
+    /// The evaluation of each table expression.
+    table_evals: Vec<Polynomial<F, LagrangeCoeff>>,
 }
 
 /// Intermediate result from logderivative computation, before transcript
 /// write and FFT conversion to coefficient form.
-pub(crate) struct ComputedLogderivative<F: PrimeField, C> {
+pub(crate) struct ComputedLogderivative<F: PrimeField> {
     pub(crate) argument_index: usize,
-    pub(crate) multiplicities: Polynomial<F, LagrangeCoeff>,
     pub(crate) helper_polys_lagrange: Vec<Vec<F>>,
     pub(crate) aggregator_poly: Polynomial<F, LagrangeCoeff>,
-    pub(crate) aggregator_commitment: C,
 }
 
-/// Committed polynomials after evaluation at challenge point.
-pub(crate) struct Evaluated<F: PrimeField> {
-    pub(crate) constructed: Committed<F>,
-    pub(crate) evaluated: logup::Evaluated<F>,
-}
-
-impl<F: WithSmallOrderMulGroup<3> + Hash> ChunkedArgument<F> {
-    /// Compresses input and table expressions, computes multiplicities, and
-    /// commits — but does NOT write to the transcript. The caller is
-    /// responsible for writing `commitment` in the correct order.
-    ///
-    /// Compresses input and table expressions, computes multiplicities, and
-    /// commits — but does NOT write to the transcript. The caller is
-    /// responsible for writing `commitment` in the correct order.
+impl<F: PrimeField + Hash> ChunkedArgument<F> {
+    /// Evaluates the input and table expressions and computes the
+    /// multiplicities, comparing the input and table tuples directly. The
+    /// multiplicities are neither committed nor written to the transcript: the
+    /// caller commits them as part of the phase1 argument group, before
+    /// `theta` is squeezed.
     ///
     /// `blinding_values` are pre-generated random field elements for the
     /// blinding rows, so this method does not need `&mut rng` and can be
     /// called in parallel across lookups.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn compute_multiplicities_parallel<'a, CS: PolynomialCommitmentScheme<F>>(
+    pub(crate) fn compute_multiplicities_parallel<'a, PCS>(
         &self,
         argument_index: usize,
-        pk: &ProvingKey<F, CS>,
-        params: &CS::Parameters,
-        theta: F,
+        pk: &ProvingKey<F, PCS>,
         advice_values: &'a [Polynomial<F, LagrangeCoeff>],
         fixed_values: &'a [Polynomial<F, LagrangeCoeff>],
         instance_values: &'a [Polynomial<F, LagrangeCoeff>],
         blinding_values: &[F],
-    ) -> Result<(ComputedMultiplicities<F>, CS::Commitment), Error>
+    ) -> Result<ComputedMultiplicities<F>, Error>
     where
-        F: WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
+        F: FromUniformBytes<64>,
+        PCS: PolynomialCommitmentScheme<F>,
     {
         assert_eq!(blinding_values.len(), pk.vk.cs.blinding_factors() + 1);
         let domain = pk.vk.get_domain();
@@ -126,85 +100,72 @@ impl<F: WithSmallOrderMulGroup<3> + Hash> ChunkedArgument<F> {
                     .collect()
             };
 
-        // Closure to get values of expressions and compress them
-        let compress_expressions = |expressions: &[Expression<F>]| {
-            eval_expressions(expressions)
-                .iter()
-                .fold(domain.empty_lagrange(), |acc, expression| {
-                    acc * theta + expression
-                })
-        };
-
-        let chunked_compressed_inputs: Vec<Vec<Polynomial<F, LagrangeCoeff>>> = self
+        let chunked_input_evals: Vec<Vec<Vec<Polynomial<F, LagrangeCoeff>>>> = self
             .input_expression_chunks
             .iter()
-            .map(|chunk| chunk.iter().map(|exprs| compress_expressions(exprs)).collect())
+            .map(|chunk| chunk.iter().map(|exprs| eval_expressions(exprs)).collect())
             .collect();
 
-        let all_compressed_inputs: Vec<&Polynomial<F, LagrangeCoeff>> =
-            chunked_compressed_inputs.iter().flat_map(|v| v.iter()).collect();
-
-        let compressed_table_expression = compress_expressions(&self.table_expressions);
+        let table_evals = eval_expressions(&self.table_expressions);
 
         let selector = eval_expressions(std::slice::from_ref(&self.selector)).swap_remove(0);
 
         let usable_rows = n - pk.vk.cs.blinding_factors() - 1;
         let multiplicities = compute_multiplicities(
             &selector,
-            &all_compressed_inputs,
-            &compressed_table_expression,
+            &chunked_input_evals.iter().flatten().map(Vec::as_slice).collect::<Vec<_>>(),
+            &table_evals,
             usable_rows,
             blinding_values,
         );
 
         let multiplicities = pk.vk.domain.lagrange_from_vec(multiplicities);
 
-        // Multiplicities are produced by sorting/deduplicating into contiguous
-        // equal-value runs, which collapse to zeros in the LagrangeDelta basis.
-        // The Lagrange form is needed downstream for `eval_polynomial` and the
-        // openings, so we borrow into a transient delta buffer rather than
-        // transforming in place and prefix-summing back.
-        let commitment = CS::commit(
-            params,
-            &multiplicities.to_delta(),
-            PolynomialLabel::LogupMultiplicities(argument_index),
-        );
-
-        Ok((
-            ComputedMultiplicities {
-                argument_index,
-                selector,
-                multiplicities,
-                chunked_compressed_inputs,
-                compressed_table_expression,
-            },
-            commitment,
-        ))
+        Ok(ComputedMultiplicities {
+            argument_index,
+            selector,
+            multiplicities,
+            chunked_input_evals,
+            table_evals,
+        })
     }
 }
 
-impl<F: WithSmallOrderMulGroup<3> + Hash> ComputedMultiplicities<F> {
+impl<F: PrimeField + Hash> ComputedMultiplicities<F> {
     /// Constructs and commits to the LogUp prover polynomials, but does NOT
     /// write to the transcript or convert to coefficient form. The caller
     /// handles transcript ordering and can batch the FFTs.
     ///
+    /// The input and table expressions are compressed with `theta` here.
+    ///
     /// `blinding_values` must contain exactly `blinding_factors` random field
     /// elements. They are provided externally so the caller can pre-generate
     /// them from `&mut rng` and then invoke multiple lookups in parallel.
-    pub(crate) fn compute_logderivative<CS: PolynomialCommitmentScheme<F>>(
+    pub(crate) fn compute_logderivative<PCS>(
         self,
-        pk: &ProvingKey<F, CS>,
-        params: &CS::Parameters,
+        pk: &ProvingKey<F, PCS>,
+        theta: F,
         beta: F,
         blinding_values: Vec<F>,
-    ) -> Result<ComputedLogderivative<F, CS::Commitment>, Error>
+    ) -> Result<ComputedLogderivative<F>, Error>
     where
-        F: WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
+        F: FromUniformBytes<64>,
+        PCS: PolynomialCommitmentScheme<F>,
     {
         let blinding_factors = pk.vk.cs.blinding_factors();
         assert_eq!(blinding_values.len(), blinding_factors);
         let domain = pk.vk.get_domain();
         let n = domain.n as usize;
+
+        let compress = |evals: &[Polynomial<F, LagrangeCoeff>]| {
+            evals.iter().fold(domain.empty_lagrange(), |acc, eval| acc * theta + eval)
+        };
+        let compressed_table_expression = compress(&self.table_evals);
+        let chunked_compressed_inputs: Vec<Vec<Polynomial<F, LagrangeCoeff>>> = self
+            .chunked_input_evals
+            .par_iter()
+            .map(|chunk| chunk.iter().map(|evals| compress(evals)).collect())
+            .collect();
 
         // We need to compute the helper polynomial, for which we need to do batch
         // inversion for the table.
@@ -213,7 +174,7 @@ impl<F: WithSmallOrderMulGroup<3> + Hash> ComputedMultiplicities<F> {
         parallelize(&mut table_denoms, |input, start| {
             for (i, input) in input.iter_mut().enumerate() {
                 let i = i + start;
-                *input = beta + self.compressed_table_expression.values[i];
+                *input = beta + compressed_table_expression.values[i];
             }
         });
         table_denoms.iter_mut().batch_invert();
@@ -221,8 +182,7 @@ impl<F: WithSmallOrderMulGroup<3> + Hash> ComputedMultiplicities<F> {
         // F(X) = 1 / (f(X) + beta)
         // Invert each column independently in parallel, then sum across columns
         // to form the helper polynomial Σⱼ 1/(fⱼ(X) + β).
-        let helper_polys_lagrange: Vec<Vec<F>> = self
-            .chunked_compressed_inputs
+        let helper_polys_lagrange: Vec<Vec<F>> = chunked_compressed_inputs
             .par_iter()
             .map(|compressed_inputs| {
                 let inverted_columns: Vec<Vec<F>> = compressed_inputs
@@ -290,167 +250,86 @@ impl<F: WithSmallOrderMulGroup<3> + Hash> ComputedMultiplicities<F> {
             assert_eq!(aggregator_poly[u], F::ZERO);
         }
 
-        // The aggregator is a running sum. When the per-row contribution
-        // (selector·h − m·(t+β)⁻¹) is locally constant (common, because
-        // multiplicities m are highly contiguous and tables are zero-padded)
-        // the aggregator is locally *linear*. Δ² converts them in zero runs,
-        // which will be filtered out.
-        let aggregator_commitment = CS::commit(
-            params,
-            &aggregator_poly.to_double_delta(),
-            PolynomialLabel::LogupAggregator(self.argument_index),
-        );
-
         Ok(ComputedLogderivative {
             argument_index: self.argument_index,
-            multiplicities: self.multiplicities,
             helper_polys_lagrange,
             aggregator_poly,
-            aggregator_commitment,
         })
     }
 }
 
-impl<F: WithSmallOrderMulGroup<3>> Committed<F> {
-    /// Evaluates `m(x)`, `h(x)`, `Z(x)`, and `Z(ωx)`, writing them to the
-    /// transcript.
-    pub(crate) fn evaluate<T: Transcript, CS: PolynomialCommitmentScheme<F>>(
-        self,
-        pk: &ProvingKey<F, CS>,
-        x: F,
-        transcript: &mut T,
-    ) -> Result<Evaluated<F>, Error>
-    where
-        F: Hashable<T::Hash>,
-    {
-        let domain = &pk.vk.domain;
-        let x_next = domain.rotate_omega(x, Rotation::next());
-
-        // Compute all evaluations up front, then write to transcript.
-        let multiplicities_eval = eval_polynomial(&self.multiplicities, x);
-        let helper_evals: Vec<F> =
-            self.helper_polys.par_iter().map(|h| eval_polynomial(h, x)).collect();
-        let accumulator_eval = eval_polynomial(&self.aggregator_poly, x);
-        let accumulator_next_eval = eval_polynomial(&self.aggregator_poly, x_next);
-        transcript.write(&multiplicities_eval)?;
-        for eval in &helper_evals {
-            transcript.write(eval)?;
-        }
-        transcript.write(&accumulator_eval)?;
-        transcript.write(&accumulator_next_eval)?;
-
-        Ok(Evaluated {
-            constructed: self,
-            evaluated: logup::Evaluated {
-                multiplicities_eval,
-                helper_evals,
-                accumulator_eval,
-                accumulator_next_eval,
-            },
-        })
-    }
-}
-
-impl<F: WithSmallOrderMulGroup<3>> Evaluated<F> {
-    /// Returns opening queries.
-    pub(crate) fn open<'a, CS: PolynomialCommitmentScheme<F>>(
-        &'a self,
-        pk: &'a ProvingKey<F, CS>,
-        x: F,
-    ) -> impl Iterator<Item = ProverQuery<'a, F>> + Clone {
-        let x_next = pk.vk.domain.rotate_omega(x, Rotation::next());
-        let arg = self.constructed.argument_index;
-
-        let m_query = iter::once(ProverQuery::new(
-            x,
-            &self.constructed.multiplicities,
-            PolynomialLabel::LogupMultiplicities(arg),
-        ));
-
-        let helper_queries = self
-            .constructed
-            .helper_polys
-            .iter()
-            .enumerate()
-            .map(move |(j, h)| ProverQuery::new(x, h, PolynomialLabel::LogupHelper(arg, j)));
-
-        let z_queries = [
-            ProverQuery::new(
-                x,
-                &self.constructed.aggregator_poly,
-                PolynomialLabel::LogupAggregator(arg),
-            ),
-            ProverQuery::new(
-                x_next,
-                &self.constructed.aggregator_poly,
-                PolynomialLabel::LogupAggregator(arg),
-            ),
-        ];
-
-        m_query.chain(helper_queries).chain(z_queries)
-    }
-}
-
-/// Computes the multiplicity of each value in the polynomial.
+/// Computes the multiplicity of each table tuple among the input tuples.
 ///
-/// Returns a vector where `result[i]` is the number of times `table[i]` appears
-/// in `values`.
+/// A tuple is a row of a set of polynomials, one per expression: row `i` of
+/// `table` is the `i`-th table tuple, and row `r` of `values[j]` the `r`-th
+/// tuple of the `j`-th input. Returns a vector where `result[i]` is the number
+/// of times the `i`-th table tuple appears among the selected input tuples.
 ///
-/// When a value appears multiple times in the table, the multiplicity is
-/// normalized: if a value is looked up `k` times and appears `t` times in the
+/// When a tuple appears multiple times in the table, the multiplicity is
+/// normalized: if a tuple is looked up `k` times and appears `t` times in the
 /// table, each table position gets multiplicity `k/t`.
 ///
-/// Only values in the first `usable_rows` are counted for both inputs and
+/// Only tuples in the first `usable_rows` are counted for both inputs and
 /// table. Blinding rows are excluded from the counting but still get a
-/// multiplicity value (zero for values not in the active region).
+/// multiplicity value (zero for tuples not in the active region).
 ///
 /// # Panics
 ///
-/// Panics if any selected input value (where the selector is non-zero) is not
-/// present in `table`.
+/// Panics if any selected input tuple (where the selector is non-zero) is not
+/// present in `table`, or if an input does not have as many polynomials as the
+/// table.
 pub(crate) fn compute_multiplicities<F>(
     selector: &Polynomial<F, LagrangeCoeff>,
-    values: &[&Polynomial<F, LagrangeCoeff>],
-    table: &Polynomial<F, LagrangeCoeff>,
+    values: &[&[Polynomial<F, LagrangeCoeff>]],
+    table: &[Polynomial<F, LagrangeCoeff>],
     usable_rows: usize,
     blinding_values: &[F],
 ) -> Vec<F>
 where
     F: PrimeField + std::hash::Hash + Eq,
 {
-    assert_eq!(blinding_values.len(), table.len() - usable_rows);
     use rustc_hash::FxHashMap;
 
-    // Count how many times each value appears in the table (active rows only)
-    let mut table_counts: FxHashMap<F, u32> = FxHashMap::default();
-    for v in table.iter().take(usable_rows) {
-        *table_counts.entry(*v).or_default() += 1;
+    let n = selector.len();
+    let width = table.len();
+    assert_eq!(blinding_values.len(), n - usable_rows);
+
+    let tuple_at = |columns: &[Polynomial<F, LagrangeCoeff>], row: usize| -> Vec<F> {
+        columns.iter().map(|column| column[row]).collect()
+    };
+
+    // Count how many times each tuple appears in the table (active rows only)
+    let table_tuples: Vec<Vec<F>> = (0..usable_rows).map(|row| tuple_at(table, row)).collect();
+    let mut table_counts: FxHashMap<&[F], u32> = FxHashMap::default();
+    for tuple in table_tuples.iter() {
+        *table_counts.entry(tuple).or_default() += 1;
     }
 
-    // Count how many times each value appears in inputs (only where the selector is
-    // non-zero).
-    let mut input_counts: FxHashMap<F, u32> = table_counts.keys().map(|v| (*v, 0)).collect();
-    for value in values.iter() {
-        value
-            .iter()
-            .zip(selector.iter())
-            .take(usable_rows)
-            .filter(|(_, sel)| !sel.is_zero_vartime())
-            .for_each(|(v, _)| {
-                *input_counts
-                    .get_mut(v)
-                    .unwrap_or_else(|| panic!("input value {v:?} not found in lookup table")) += 1;
-            });
+    // Count how many times each tuple appears in inputs (only where the selector
+    // is non-zero).
+    let mut input_counts: FxHashMap<&[F], u32> =
+        table_counts.keys().map(|tuple| (*tuple, 0)).collect();
+    for input in values.iter() {
+        assert_eq!(
+            input.len(),
+            width,
+            "an input and the table have different widths"
+        );
+        for row in (0..usable_rows).filter(|&row| !selector[row].is_zero_vartime()) {
+            let tuple = tuple_at(input, row);
+            *input_counts
+                .get_mut(tuple.as_slice())
+                .unwrap_or_else(|| panic!("input tuple {tuple:?} not found in lookup table")) += 1;
+        }
     }
 
     // Build vector of table counts for batch inversion (only for active table
-    // values)
-    let mut table_count_inverses: Vec<F> = table
-        .iter()
-        .enumerate()
-        .map(|(i, value)| {
+    // tuples)
+    let mut table_count_inverses: Vec<F> = (0..n)
+        .map(|i| {
             if i < usable_rows {
-                F::from(*table_counts.get(value).unwrap_or(&1) as u64)
+                let tuple = table_tuples[i].as_slice();
+                F::from(*table_counts.get(tuple).unwrap_or(&1) as u64)
             } else {
                 F::ONE // Random blinding factors will be applied later
             }
@@ -460,13 +339,13 @@ where
 
     // Compute normalized multiplicities: input_count / table_count
     // Blinding rows get random values to ensure ZK.
-    table
-        .iter()
+    table_count_inverses
+        .into_iter()
         .enumerate()
-        .zip(table_count_inverses)
-        .map(|((i, value), table_count_inv)| {
+        .map(|(i, table_count_inv)| {
             if i < usable_rows {
-                let input_count = *input_counts.get(value).unwrap_or(&0);
+                let tuple = table_tuples[i].as_slice();
+                let input_count = *input_counts.get(tuple).unwrap_or(&0);
                 F::from(input_count as u64) * table_count_inv
             } else {
                 blinding_values[i - usable_rows]
@@ -525,8 +404,8 @@ mod tests {
 
         let result = compute_multiplicities(
             &poly_from_vec(vec![Fq::ONE; 4]),
-            &[&input1, &input2],
-            &table,
+            &[std::slice::from_ref(&input1), std::slice::from_ref(&input2)],
+            std::slice::from_ref(&table),
             4,
             &[],
         );
@@ -558,7 +437,13 @@ mod tests {
         ]);
 
         // Should panic because input value 5 is not found in the table
-        compute_multiplicities(&poly_from_vec(vec![Fq::ONE; 4]), &[&input], &table, 4, &[]);
+        compute_multiplicities(
+            &poly_from_vec(vec![Fq::ONE; 4]),
+            &[std::slice::from_ref(&input)],
+            std::slice::from_ref(&table),
+            4,
+            &[],
+        );
     }
 
     #[test]
@@ -579,8 +464,13 @@ mod tests {
             Fq::from(3u64),
         ]);
 
-        let result =
-            compute_multiplicities(&poly_from_vec(vec![Fq::ONE; 4]), &[&input], &table, 4, &[]);
+        let result = compute_multiplicities(
+            &poly_from_vec(vec![Fq::ONE; 4]),
+            &[std::slice::from_ref(&input)],
+            std::slice::from_ref(&table),
+            4,
+            &[],
+        );
 
         assert_eq!(result.len(), 4);
         assert_eq!(result[0], Fq::from(1u64)); // table[0]=1 -> 1/1 = 1
@@ -612,8 +502,8 @@ mod tests {
         let blinding = [Fq::from(42u64), Fq::from(43u64)];
         let result = compute_multiplicities(
             &poly_from_vec(vec![Fq::ONE; 4]),
-            &[&input],
-            &table,
+            &[std::slice::from_ref(&input)],
+            std::slice::from_ref(&table),
             2,
             &blinding,
         );
@@ -623,5 +513,22 @@ mod tests {
         assert_eq!(result[1], Fq::from(1u64)); // table[1]=2 -> 1/1 = 1
         assert_eq!(result[2], blinding[0]); // blinding row
         assert_eq!(result[3], blinding[1]); // blinding row
+    }
+
+    #[test]
+    fn test_compute_multiplicities_compares_tuples() {
+        let col = |values: [u64; 4]| poly_from_vec(values.map(Fq::from).to_vec());
+
+        // Table tuples: (1, 2), (2, 1), (3, 3), (4, 4)
+        let table = [col([1, 2, 3, 4]), col([2, 1, 3, 4])];
+
+        // Input tuples: (1, 2), (1, 2), (2, 1), (3, 3). A comparison of the
+        // columns separately would not tell (1, 2) and (2, 1) apart.
+        let input = [col([1, 1, 2, 3]), col([2, 2, 1, 3])];
+
+        let result =
+            compute_multiplicities(&poly_from_vec(vec![Fq::ONE; 4]), &[&input], &table, 4, &[]);
+
+        assert_eq!(result, [2, 1, 1, 0].map(Fq::from).to_vec());
     }
 }

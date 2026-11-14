@@ -13,8 +13,10 @@ const BLAKE2B_PREFIX_COMMON: u8 = 1;
 
 /// Hash function that can be used for transcript
 pub trait TranscriptHash: Clone {
-    /// Input type of the hash function
-    type Input;
+    /// Input type of the hash function. It is a collection, so that the input
+    /// of a composite value can be built by concatenating the inputs of its
+    /// parts.
+    type Input: IntoIterator + FromIterator<<Self::Input as IntoIterator>::Item>;
     /// Output type of the hash function
     type Output;
 
@@ -43,6 +45,12 @@ pub trait Sampleable<H: TranscriptHash> {
     /// Converts `H`'s output to Self
     fn sample(hash_output: H::Output) -> Self;
 }
+
+/// A field whose elements can be absorbed into a transcript with hash `H` and
+/// sampled from it.
+pub trait TranscriptField<H: TranscriptHash>: Hashable<H> + Sampleable<H> {}
+
+impl<H: TranscriptHash, F: Hashable<H> + Sampleable<H>> TranscriptField<H> for F {}
 
 /// Generic transcript view
 pub trait Transcript: Clone {
@@ -147,12 +155,4 @@ impl<H: TranscriptHash> Transcript for CircuitTranscript<H> {
             "Transcript has unexpected trailing bytes.",
         ))
     }
-}
-
-pub(crate) fn read_n<C, T>(transcript: &mut T, n: usize) -> io::Result<Vec<C>>
-where
-    T: Transcript,
-    C: Hashable<T::Hash>,
-{
-    (0..n).map(|_| transcript.read()).collect()
 }

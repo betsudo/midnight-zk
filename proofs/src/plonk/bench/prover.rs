@@ -1,9 +1,8 @@
 //! Benchmarking utilities for the PLONK prover.
 
-use std::{collections::BTreeMap, hash::Hash};
+use std::collections::BTreeMap;
 
 use criterion::BenchmarkGroup;
-use ff::{FromUniformBytes, WithSmallOrderMulGroup};
 use rand_core::{CryptoRng, RngCore};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
@@ -11,20 +10,25 @@ use rayon::iter::{
 
 use crate::{
     plonk::{
-        Error, ProvingKey, argument,
+        Error, ProofField, ProvingKey, argument,
         circuit::Circuit,
-        linearization::prover::compute_linearization_poly,
-        logup, partially_evaluate_identities,
+        logup,
         prover::{
-            Evals, compute_h_poly, compute_instances, compute_nu_poly, compute_queries,
-            parse_advices, write_evals_to_transcript,
+            compute_h_poly, compute_instances, compute_nu_poly, compute_queries, parse_advices,
+            write_instance_evals_to_transcript,
         },
         traces::ProverTrace,
     },
-    poly::{PolynomialLabel, commitment::PolynomialCommitmentScheme},
-    transcript::{Hashable, Sampleable, Transcript},
+    poly::{
+        LagrangeCoeff, Polynomial, PolynomialLabel, Rotation,
+        commitment::PolynomialCommitmentScheme,
+    },
+    transcript::{Hashable, Transcript},
     utils::arithmetic::eval_polynomial,
 };
+
+/// The polynomials of one argument phase group, keyed by their label.
+type PhaseGroupPolys<F> = BTreeMap<PolynomialLabel, Polynomial<F, LagrangeCoeff>>;
 
 /// This computes a proof trace for the provided `circuit` when given the
 /// public parameters `params` and the proving key [`ProvingKey`] that was
@@ -35,14 +39,9 @@ use crate::{
 ///
 /// Benchmarks individual internal steps using the provided `group`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn compute_trace<
-    F,
-    CS: PolynomialCommitmentScheme<F>,
-    T: Transcript,
-    ConcreteCircuit: Circuit<F>,
->(
-    params: &CS::Parameters,
-    pk: &ProvingKey<F, CS>,
+pub(crate) fn compute_trace<'a, F, PCS, T, ConcreteCircuit>(
+    params: &PCS::Parameters,
+    pk: &'a ProvingKey<F, PCS>,
     circuit: &ConcreteCircuit,
     // The prover needs to get all instances in non-committed form. However,
     // the first `nb_committed_instances` instance columns are dedicated for
@@ -52,15 +51,13 @@ pub(crate) fn compute_trace<
     transcript: &mut T,
     mut rng: impl RngCore + CryptoRng,
     group: &mut BenchmarkGroup<'_, criterion::measurement::WallTime>,
-) -> Result<ProverTrace<F>, Error>
+) -> Result<ProverTrace<'a, F>, Error>
 where
-    CS::Commitment: Hashable<T::Hash>,
-    F: WithSmallOrderMulGroup<3>
-        + Sampleable<T::Hash>
-        + Hashable<T::Hash>
-        + Hash
-        + Ord
-        + FromUniformBytes<64>,
+    F: ProofField<T::Hash>,
+    PCS: PolynomialCommitmentScheme<F>,
+    PCS::Commitment: Hashable<T::Hash>,
+    T: Transcript,
+    ConcreteCircuit: Circuit<F>,
 {
     #[cfg(not(feature = "committed-instances"))]
     let nb_committed_instances: usize = 0;
@@ -80,7 +77,8 @@ where
             criterion::BatchSize::SmallInput,
         )
     });
-    pk.vk.hash_into(transcript)?;
+    let vk_absorbed = pk.vk.absorb_into(transcript)?;
+    let phase0_committed = pk.phase0_polys.committed(&vk_absorbed);
 
     let domain = &pk.vk.domain;
 
@@ -90,7 +88,7 @@ where
             b.iter_batched(
                 || (transcript.clone(), instances_clone.clone()),
                 |(mut t, inst)| {
-                    let _ = compute_instances::<F, CS, T>(
+                    let _ = compute_instances::<F, PCS, T>(
                         params,
                         pk,
                         &inst,
@@ -104,23 +102,14 @@ where
         compute_instances(params, pk, instances, nb_committed_instances, transcript)?
     };
 
-    let advice = {
+    let advice_polys = {
         group.bench_function("Parse advices", |b| {
-            b.iter_batched(
-                || transcript.clone(),
-                |mut t| {
-                    let _ = parse_advices::<F, CS, ConcreteCircuit, T>(
-                        params, pk, circuit, instances, &mut t, &mut rng,
-                    );
-                },
-                criterion::BatchSize::LargeInput,
-            )
+            b.iter(|| {
+                let _ = parse_advices::<F, PCS, ConcreteCircuit>(pk, circuit, instances, &mut rng);
+            })
         });
-        parse_advices(params, pk, circuit, instances, transcript, &mut rng)?
+        parse_advices(pk, circuit, instances, &mut rng)?
     };
-
-    // Sample theta challenge for keeping lookup columns linearly independent
-    let theta: F = transcript.squeeze_challenge();
 
     // Pre-generate multiplicities blindings so the measured closures don't need
     // `&mut rng`. One extra value beyond `blinding_factors` is required by
@@ -131,73 +120,99 @@ where
         .map(|_| (0..mult_blinding_count).map(|_| F::random(&mut rng)).collect())
         .collect();
 
-    // Commit to the multiplicities columns. Compute and transcript write are
-    // now separate API calls — measure them together to match the prior
+    // Compute the multiplicities columns and commit to them as the phase1
+    // argument group: one commitment over every multiplicities polynomial,
+    // rather than one per lookup argument. Compute and transcript write are
+    // separate API calls — measure them together to match the prior
     // `commit_multiplicities` shape.
-    let lookups: Vec<logup::prover::ComputedMultiplicities<F>> = {
-        group.bench_function("Commit lookup multiplicities", |b| {
+    let compute_multiplicities =
+        |advice_polys: &[Polynomial<F, LagrangeCoeff>],
+         instance_values: &[Polynomial<F, LagrangeCoeff>],
+         blindings: &[Vec<F>]|
+         -> Result<Vec<logup::prover::ComputedMultiplicities<F>>, Error> {
+            let logup_args: Vec<_> =
+                pk.vk.cs.lookups.iter().map(|l| l.chunk_by_degree(pk.vk.cs.degree())).collect();
+            logup_args
+                .par_iter()
+                .enumerate()
+                .zip(blindings.par_iter())
+                .map(|((argument_index, logup), blinds)| {
+                    logup.compute_multiplicities_parallel(
+                        argument_index,
+                        pk,
+                        advice_polys,
+                        &pk.fixed_values,
+                        instance_values,
+                        blinds,
+                    )
+                })
+                .collect::<Result<Vec<_>, Error>>()
+        };
+
+    // The advice columns and the multiplicities form the phase1 group.
+    let advice_labels = pk.vk.cs.advice_labels();
+    let phase1_polys_map =
+        |advice_polys: Vec<Polynomial<F, LagrangeCoeff>>,
+         multiplicities: &[logup::prover::ComputedMultiplicities<F>]|
+         -> Result<BTreeMap<PolynomialLabel, Polynomial<F, LagrangeCoeff>>, Error> {
+            let mut phase1_polys_map = BTreeMap::new();
+
+            for (label, poly) in advice_labels.iter().cloned().zip(advice_polys) {
+                if phase1_polys_map.insert(label, poly).is_some() {
+                    return Err(Error::DuplicatedLabel);
+                }
+            }
+
+            for c in multiplicities.iter() {
+                let label = PolynomialLabel::LogupMultiplicities(c.argument_index);
+                if phase1_polys_map.insert(label, c.multiplicities.clone()).is_some() {
+                    return Err(Error::DuplicatedLabel);
+                }
+            }
+
+            Ok(phase1_polys_map)
+        };
+
+    let (logup_multiplicities, phase1_committed) = {
+        group.bench_function("Commit advices and lookup multiplicities", |b| {
             b.iter_batched(
-                || (transcript.clone(), mult_blindings.clone()),
-                |(mut t, mult_blinds)| -> Result<(), Error> {
-                    let logup_args: Vec<_> = pk
-                        .vk
-                        .cs
-                        .lookups
-                        .iter()
-                        .map(|l| l.chunk_by_degree(pk.vk.cs.degree()))
-                        .collect();
-                    let results: Vec<_> = logup_args
-                        .par_iter()
-                        .enumerate()
-                        .zip(mult_blinds.par_iter())
-                        .map(|((argument_index, logup), blinds)| {
-                            logup.compute_multiplicities_parallel(
-                                argument_index,
-                                pk,
-                                params,
-                                theta,
-                                &advice.advice_polys,
-                                &pk.fixed_values,
-                                &instance.instance_values,
-                                blinds,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, Error>>()?;
-                    for (_, commitment) in &results {
-                        t.write(commitment)?;
-                    }
+                || {
+                    (
+                        transcript.clone(),
+                        mult_blindings.clone(),
+                        advice_polys.clone(),
+                    )
+                },
+                |(mut t, mult_blinds, advice_polys)| -> Result<(), Error> {
+                    let multiplicities = compute_multiplicities(
+                        &advice_polys,
+                        &instance.instance_values,
+                        &mult_blinds,
+                    )?;
+                    argument::prover::Committed::commit::<PCS, _, _>(
+                        params,
+                        phase1_polys_map(advice_polys, &multiplicities)?,
+                        Polynomial::to_delta,
+                        &mut t,
+                    )?;
                     Ok(())
                 },
                 criterion::BatchSize::LargeInput,
             )
         });
-        let logup_args: Vec<_> =
-            pk.vk.cs.lookups.iter().map(|l| l.chunk_by_degree(pk.vk.cs.degree())).collect();
-        let results: Vec<_> = logup_args
-            .par_iter()
-            .enumerate()
-            .zip(mult_blindings.par_iter())
-            .map(|((argument_index, logup), blinds)| {
-                logup.compute_multiplicities_parallel(
-                    argument_index,
-                    pk,
-                    params,
-                    theta,
-                    &advice.advice_polys,
-                    &pk.fixed_values,
-                    &instance.instance_values,
-                    blinds,
-                )
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        results
-            .into_iter()
-            .map(|(c, commitment)| {
-                transcript.write(&commitment)?;
-                Ok::<_, Error>(c)
-            })
-            .collect::<Result<Vec<_>, _>>()?
+        let multiplicities =
+            compute_multiplicities(&advice_polys, &instance.instance_values, &mult_blindings)?;
+        let committed = argument::prover::Committed::commit::<PCS, T, _>(
+            params,
+            phase1_polys_map(advice_polys, &multiplicities)?,
+            Polynomial::to_delta,
+            transcript,
+        )?;
+        (multiplicities, committed)
     };
+
+    // Sample theta challenge for keeping lookup columns linearly independent
+    let theta: F = transcript.squeeze_challenge();
 
     // Sample beta challenge
     let beta: F = transcript.squeeze_challenge();
@@ -216,188 +231,170 @@ where
         .map(|_| (0..blinding_factors).map(|_| F::random(&mut rng)).collect())
         .collect();
 
-    // Commit to permutations. `Argument::compute` returns z polys + commitments
-    // without touching the transcript; `write_and_convert` then writes
-    // commitments and converts to coefficient form. Measure both together.
-    //
-    // CAVEAT: in `create_proof` this stage runs inside a `rayon::join` with the
-    // logup logderivative compute, so permutation and logup overlap in wall
-    // time. This benchmark measures each stage in isolation, so the sum of
-    // "Commit permutations" + "Commit lookup products" overstates the combined
-    // cost versus what `create_proof` actually pays.
-    let permutations = {
-        group.bench_function("Commit permutations", |b| {
-            b.iter_batched(
-                || (transcript.clone(), perm_blindings.clone()),
-                |(mut t, perm_blinds)| -> Result<(), Error> {
-                    let computed = pk.vk.cs.permutation.compute::<F, CS>(
-                        params,
-                        pk,
-                        &pk.permutation,
-                        &advice.advice_polys,
-                        &pk.fixed_values,
-                        &instance.instance_values,
-                        beta,
-                        gamma,
-                        perm_blinds,
-                    );
-                    let _ = computed.write_and_convert(domain, &mut t)?;
-                    Ok(())
-                },
-                criterion::BatchSize::LargeInput,
-            )
-        });
-        let computed = pk.vk.cs.permutation.compute::<F, CS>(
-            params,
+    // Compute the permutation accumulators.
+    let compute_perm_z_polys = |perm_blindings: Vec<Vec<F>>| {
+        pk.vk.cs.permutation.compute_z_polys::<F, PCS>(
             pk,
-            &pk.permutation,
-            &advice.advice_polys,
+            phase1_committed.polys_of(&advice_labels),
             &pk.fixed_values,
             &instance.instance_values,
             beta,
             gamma,
             perm_blindings,
-        );
-        computed.write_and_convert(domain, transcript)?
+        )
+    };
+
+    let perm_z_polys = {
+        group.bench_function("Compute permutation accumulators", |b| {
+            b.iter_batched(
+                || perm_blindings.clone(),
+                compute_perm_z_polys,
+                criterion::BatchSize::LargeInput,
+            )
+        });
+        compute_perm_z_polys(perm_blindings)
     };
 
     // Pre-generate logderivative blindings, one vector per lookup.
-    let logup_blindings: Vec<Vec<F>> = (0..lookups.len())
+    let logup_blindings: Vec<Vec<F>> = (0..logup_multiplicities.len())
         .map(|_| (0..blinding_factors).map(|_| F::random(&mut rng)).collect())
         .collect();
 
-    // Construct and commit to lookup product polynomials.
-    // `compute_logderivative` returns helper_polys_lagrange + aggregator
-    // commitment without transcript writes. Helper commitments must be taken
-    // and written here, and Lagrange polys converted to coefficient form.
-    let lookups: Vec<logup::prover::Committed<F>> = {
-        group.bench_function("Commit lookup products", |b| {
-            b.iter_batched(
-                || (transcript.clone(), lookups.clone(), logup_blindings.clone()),
-                |(mut t, lookups, logup_blinds)| -> Result<(), Error> {
-                    let computed: Vec<_> = lookups
-                        .into_par_iter()
-                        .zip(logup_blinds.into_par_iter())
-                        .map(|(lookup, blinds)| {
-                            lookup.compute_logderivative(pk, params, beta, blinds)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let all_helper_commitments: Vec<Vec<CS::Commitment>> = computed
-                        .par_iter()
-                        .map(|c| {
-                            c.helper_polys_lagrange
-                                .par_iter()
-                                .enumerate()
-                                .map(|(j, h)| {
-                                    let h_poly = domain.lagrange_from_vec(h.clone());
-                                    CS::commit(
-                                        params,
-                                        &h_poly,
-                                        PolynomialLabel::LogupHelper(c.argument_index, j),
-                                    )
-                                })
-                                .collect()
-                        })
-                        .collect();
-                    for (c, helper_commitments) in
-                        computed.iter().zip(all_helper_commitments.iter())
-                    {
-                        for h_commitment in helper_commitments {
-                            t.write(h_commitment)?;
-                        }
-                        t.write(&c.aggregator_commitment)?;
-                    }
-                    Ok(())
-                },
-                criterion::BatchSize::LargeInput,
-            )
-        });
-        let computed: Vec<_> = lookups
+    // Construct the lookup product polynomials. `compute_logderivative` returns
+    // the helper polynomials and the aggregator without touching the transcript;
+    // they are committed further below, as part of the phase2 argument group.
+    let logup_phase2_polys = |multiplicities: Vec<logup::prover::ComputedMultiplicities<F>>,
+                              blindings: Vec<Vec<F>>|
+     -> Result<Vec<PhaseGroupPolys<F>>, Error> {
+        Ok(multiplicities
             .into_par_iter()
-            .zip(logup_blindings.into_par_iter())
-            .map(|(lookup, blinds)| lookup.compute_logderivative(pk, params, beta, blinds))
-            .collect::<Result<Vec<_>, _>>()?;
-        let all_helper_commitments: Vec<Vec<CS::Commitment>> = computed
-            .par_iter()
-            .map(|c| {
-                c.helper_polys_lagrange
-                    .par_iter()
-                    .enumerate()
-                    .map(|(j, h)| {
-                        let h_poly = domain.lagrange_from_vec(h.clone());
-                        CS::commit(
-                            params,
-                            &h_poly,
-                            PolynomialLabel::LogupHelper(c.argument_index, j),
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
-        for (c, helper_commitments) in computed.iter().zip(all_helper_commitments.iter()) {
-            for h_commitment in helper_commitments {
-                transcript.write(h_commitment)?;
-            }
-            transcript.write(&c.aggregator_commitment)?;
-        }
-        computed
+            .zip(blindings.into_par_iter())
+            .map(|(lookup, blinds)| lookup.compute_logderivative(pk, theta, beta, blinds))
+            .collect::<Result<Vec<_>, Error>>()?
             .into_par_iter()
             .map(|c| {
-                let helper_polys = c
-                    .helper_polys_lagrange
-                    .into_iter()
-                    .map(|h| domain.lagrange_to_coeff(domain.lagrange_from_vec(h)))
-                    .collect();
-                logup::prover::Committed {
-                    argument_index: c.argument_index,
-                    multiplicities: domain.lagrange_to_coeff(c.multiplicities),
-                    helper_polys,
-                    aggregator_poly: domain.lagrange_to_coeff(c.aggregator_poly),
-                }
+                BTreeMap::from_iter(
+                    [
+                        c.helper_polys_lagrange
+                            .into_iter()
+                            .enumerate()
+                            .map(|(j, p)| {
+                                (
+                                    PolynomialLabel::LogupHelper(c.argument_index, j),
+                                    domain.lagrange_from_vec(p),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                        vec![(
+                            PolynomialLabel::LogupAggregator(c.argument_index),
+                            c.aggregator_poly,
+                        )],
+                    ]
+                    .concat(),
+                )
             })
-            .collect()
+            .collect::<Vec<_>>())
     };
 
-    // Phase2 argument group (only the trash arguments, for now)
-    let phase2_committed = {
-        group.bench_function("Commit phase2 arguments", |b| {
+    let logup_polys_maps = {
+        group.bench_function("Compute lookup products", |b| {
             b.iter_batched(
-                || (transcript.clone(), instance.clone(), advice.clone()),
-                |(mut t, inst, adv)| -> Result<(), Error> {
-                    let mut polys_map = BTreeMap::new();
-                    for (i, trash) in pk.vk.cs.trashcans.iter().enumerate() {
-                        let p = trash.compute_trash_poly(
-                            domain,
-                            trash_challenge,
-                            &adv.advice_polys,
-                            &pk.fixed_values,
-                            &inst.instance_values,
-                        );
-                        if polys_map.insert(PolynomialLabel::Trash(i), p).is_some() {
-                            return Err(Error::DuplicatedLabel);
-                        }
-                    }
-                    argument::prover::Committed::commit::<CS, _>(params, polys_map, &mut t)?;
-                    Ok(())
-                },
+                || (logup_multiplicities.clone(), logup_blindings.clone()),
+                |(multiplicities, blinds)| logup_phase2_polys(multiplicities, blinds),
                 criterion::BatchSize::LargeInput,
             )
         });
+        logup_phase2_polys(logup_multiplicities, logup_blindings)?
+    };
 
-        let mut polys_map = BTreeMap::new();
+    // Phase2 argument group: the logup helper and aggregator polynomials
+    // together with the trash polynomials, under a single commitment.
+    //
+    // CAVEAT: this stage used to commit the trash polynomials alone. It now
+    // covers the logup polynomials too, so its cost is not comparable with the
+    // same line from earlier revisions.
+    let build_phase2_polys_map = |logup_polys_maps: Vec<PhaseGroupPolys<F>>,
+                                  perm_z_polys: Vec<Polynomial<F, LagrangeCoeff>>,
+                                  advice_polys: &[Polynomial<F, LagrangeCoeff>],
+                                  instance_values: &[Polynomial<F, LagrangeCoeff>]|
+     -> Result<PhaseGroupPolys<F>, Error> {
+        let mut phase2_polys_map = BTreeMap::new();
+
+        for (i, poly) in perm_z_polys.into_iter().enumerate() {
+            if phase2_polys_map
+                .insert(PolynomialLabel::PermutationAccumulator(i), poly)
+                .is_some()
+            {
+                return Err(Error::DuplicatedLabel);
+            }
+        }
+
+        for polys_map in logup_polys_maps {
+            for (label, p) in polys_map {
+                if phase2_polys_map.insert(label, p).is_some() {
+                    return Err(Error::DuplicatedLabel);
+                }
+            }
+        }
+
         for (i, trash) in pk.vk.cs.trashcans.iter().enumerate() {
             let p = trash.compute_trash_poly(
                 domain,
                 trash_challenge,
-                &advice.advice_polys,
+                advice_polys,
                 &pk.fixed_values,
-                &instance.instance_values,
+                instance_values,
             );
-            if polys_map.insert(PolynomialLabel::Trash(i), p).is_some() {
+
+            if phase2_polys_map.insert(PolynomialLabel::Trash(i), p).is_some() {
                 return Err(Error::DuplicatedLabel);
             }
         }
-        argument::prover::Committed::commit::<CS, T>(params, polys_map, transcript)?
+
+        Ok(phase2_polys_map)
+    };
+
+    let phase2_committed = {
+        group.bench_function("Commit phase2 arguments", |b| {
+            b.iter_batched(
+                || {
+                    (
+                        transcript.clone(),
+                        logup_polys_maps.clone(),
+                        perm_z_polys.clone(),
+                    )
+                },
+                |(mut t, logup_maps, perm_z_polys)| -> Result<(), Error> {
+                    let polys_map = build_phase2_polys_map(
+                        logup_maps,
+                        perm_z_polys,
+                        phase1_committed.polys_of(&advice_labels),
+                        &instance.instance_values,
+                    )?;
+                    argument::prover::Committed::commit::<PCS, _, _>(
+                        params,
+                        polys_map,
+                        Polynomial::to_double_delta,
+                        &mut t,
+                    )?;
+                    Ok(())
+                },
+                criterion::BatchSize::LargeInput,
+            )
+        });
+
+        let polys_map = build_phase2_polys_map(
+            logup_polys_maps,
+            perm_z_polys,
+            phase1_committed.polys_of(&advice_labels),
+            &instance.instance_values,
+        )?;
+        argument::prover::Committed::commit::<PCS, T, _>(
+            params,
+            polys_map,
+            Polynomial::to_double_delta,
+            transcript,
+        )?
     };
 
     // Obtain challenge for keeping all separate gates linearly independent
@@ -406,16 +403,15 @@ where
     let instance_polys = instance.instance_polys;
     let instance_values = instance.instance_values;
 
-    let advice_polys: Vec<_> =
-        advice.advice_polys.into_iter().map(|p| domain.lagrange_to_coeff(p)).collect();
+    let phase1_committed = phase1_committed.into_coeff(domain);
+    let phase2_committed = phase2_committed.into_coeff(domain);
 
     Ok(ProverTrace {
-        advice_polys,
         instance_polys,
         instance_values,
-        lookups,
+        phase0_committed,
+        phase1_committed,
         phase2_committed,
-        permutations,
         beta,
         gamma,
         theta,
@@ -431,25 +427,22 @@ where
 /// are zero-padded internally.
 ///
 /// Benchmarks individual internal steps using the provided `group`.
-pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transcript>(
-    params: &'a CS::Parameters,
-    pk: &'a ProvingKey<F, CS>,
+pub(crate) fn finalise_proof<'a, F, PCS, T>(
+    params: &'a PCS::Parameters,
+    pk: &'a ProvingKey<F, PCS>,
     // The prover needs to get all instances in non-committed form. However,
     // the first `nb_committed_instances` instance columns are dedicated for
     // instances that the verifier receives in committed form.
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
-    trace: ProverTrace<F>,
+    trace: ProverTrace<'a, F>,
     transcript: &mut T,
     group: &mut BenchmarkGroup<'_, criterion::measurement::WallTime>,
 ) -> Result<(), Error>
 where
-    CS::Commitment: Hashable<T::Hash>,
-    F: WithSmallOrderMulGroup<3>
-        + Sampleable<T::Hash>
-        + Hashable<T::Hash>
-        + Hash
-        + Ord
-        + FromUniformBytes<64>,
+    F: ProofField<T::Hash>,
+    PCS: PolynomialCommitmentScheme<F>,
+    PCS::Commitment: Hashable<T::Hash>,
+    T: Transcript,
 {
     #[cfg(not(feature = "committed-instances"))]
     let nb_committed_instances: usize = 0;
@@ -463,15 +456,14 @@ where
         compute_nu_poly(pk, &trace)
     };
 
-    // Construct the quotient polynomial h(X) = nu(X)/(X^n-1) and commit.
-    // When `single-h-commitment` is enabled this produces a single commitment;
-    // otherwise h(X) is split into limbs and each is committed separately.
-    let quotient_limbs = {
+    // Construct the quotient polynomial h(X) = nu(X)/(X^n-1), split it into
+    // limbs and commit to the limbs as one group.
+    let quotient_committed = {
         group.bench_function("Compute quotient poly", |b| {
             b.iter_batched(
                 || transcript.clone(),
                 |mut t| {
-                    let _ = compute_h_poly::<F, CS, T>(
+                    let _ = compute_h_poly::<F, PCS, T>(
                         params,
                         pk.get_vk().get_domain(),
                         nu_poly.clone(),
@@ -481,172 +473,103 @@ where
                 criterion::BatchSize::SmallInput,
             )
         });
-        compute_h_poly::<F, CS, T>(params, pk.get_vk().get_domain(), nu_poly, transcript)?
+        compute_h_poly::<F, PCS, T>(params, pk.get_vk().get_domain(), nu_poly, transcript)?
     };
 
     let ProverTrace {
-        advice_polys,
         instance_polys,
-        lookups,
+        phase0_committed,
+        phase1_committed,
         phase2_committed,
-        permutations,
-        beta,
-        gamma,
-        theta,
-        trash_challenge,
-        y,
         ..
     } = trace;
 
     // PCS-aware squeeze (see plonk/prover.rs).
-    let x: F = CS::squeeze_evaluation_point(transcript);
+    let x: F = PCS::squeeze_evaluation_point(transcript);
+
+    let domain = pk.vk.get_domain();
+    let cs = pk.vk.cs();
+    let x_rotations: BTreeMap<Rotation, F> = argument::rotations(cs)
+        .into_iter()
+        .map(|rotation| (rotation, domain.rotate_omega(x, rotation)))
+        .collect();
 
     group.bench_function("Write evals to transcript", |b| {
         b.iter_batched(
             || transcript.clone(),
             |mut t| {
-                let _ = write_evals_to_transcript(
+                let _ = write_instance_evals_to_transcript(
                     pk,
                     nb_committed_instances,
                     &instance_polys,
-                    &advice_polys,
-                    x,
+                    &x_rotations,
                     &mut t,
                 );
             },
             criterion::BatchSize::SmallInput,
         )
     });
-    let Evals {
-        fixed_evals,
-        instance_evals,
-        advice_evals,
-        ..
-    } = write_evals_to_transcript(
+    write_instance_evals_to_transcript(
         pk,
         nb_committed_instances,
         &instance_polys,
-        &advice_polys,
-        x,
+        &x_rotations,
         transcript,
     )?;
 
-    // Evaluate common permutation data
+    // Evaluate the fixed permutation polynomials, committed to in the verifying
+    // key.
     group.bench_function("Evaluate permutation data", |b| {
         b.iter_batched(
             || transcript.clone(),
             |mut t| {
-                let _ = pk.permutation.evaluate(x, &mut t);
+                let _ = phase0_committed.evaluate(cs, &x_rotations, &mut t);
             },
             criterion::BatchSize::SmallInput,
         )
     });
-    let permutations_common = pk.permutation.evaluate(x, transcript)?;
+    let phase0_evaluated = phase0_committed.evaluate(cs, &x_rotations, transcript)?;
 
-    // Evaluate the permutations, if any, at omega^i x.
-    let permutations = permutations.evaluate(pk, x, transcript)?;
+    // Evaluate the phase1 and phase2 arguments, if any, at their opening points.
+    let phase1_evaluated = phase1_committed.evaluate(cs, &x_rotations, transcript)?;
+    let phase2_evaluated = phase2_committed.evaluate(cs, &x_rotations, transcript)?;
+    let mut quotient_evaluated = quotient_committed.evaluate(cs, &x_rotations, transcript)?;
 
-    // Evaluate the lookups, if any, at omega^i x.
-    let lookups: Vec<logup::prover::Evaluated<F>> = lookups
-        .into_iter()
-        .map(|p| p.evaluate(pk, x, transcript))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Evaluate the phase2 arguments, if any, at their opening points.
-    let phase2_evaluated = phase2_committed.evaluate(x, transcript)?;
-
-    // Partially evaluate batched identities (without fixed columns
-    // corresponding to simple, multiplicative selectors)
-    let splitting_factor = x.pow_vartime([pk.vk.n() - 1]);
-    let xn = splitting_factor * x;
-    let expressions = {
-        group.bench_function("Partially evaluate identities", |b| {
-            b.iter(|| {
-                let _ = partially_evaluate_identities(
-                    &pk.vk,
-                    &fixed_evals,
-                    &instance_evals,
-                    &advice_evals,
-                    &permutations.evaluated,
-                    lookups.iter().map(|inner| &inner.evaluated),
-                    &phase2_evaluated.evals_map,
-                    &permutations_common,
-                    x,
-                    xn,
-                    beta,
-                    gamma,
-                    theta,
-                    trash_challenge,
-                );
-            })
-        });
-        partially_evaluate_identities(
-            &pk.vk,
-            &fixed_evals,
-            &instance_evals,
-            &advice_evals,
-            &permutations.evaluated,
-            lookups.iter().map(|inner| &inner.evaluated),
-            &phase2_evaluated.evals_map,
-            &permutations_common,
-            x,
-            xn,
-            beta,
-            gamma,
-            theta,
-            trash_challenge,
-        )
-    };
-
-    // Compute linearization polynomial
-    let (lin_poly_non_constant_part, lin_poly_constant_term) = {
-        group.bench_function("Compute linearization poly", |b| {
-            b.iter(|| {
-                let _ = compute_linearization_poly(
-                    expressions.clone(),
-                    pk,
-                    y,
-                    xn,
-                    splitting_factor,
-                    quotient_limbs.clone(),
-                );
-            })
-        });
-        compute_linearization_poly(expressions, pk, y, xn, splitting_factor, quotient_limbs)
-    };
-
-    debug_assert_eq!(
-        eval_polynomial(&lin_poly_non_constant_part, x),
-        -lin_poly_constant_term,
-        "L'(x) should equal -C, where C is the constant part of the linearization polynomial"
+    // h_0(x) is not written to the proof, the verifier derives it.
+    let h0 = PolynomialLabel::QuotientPiece(0);
+    let h0_eval = eval_polynomial(
+        quotient_committed.poly(&h0).expect("a quotient limb h_0"),
+        x,
     );
+    quotient_evaluated.insert(h0, x, h0_eval);
 
+    let instance_labels: Vec<_> = (0..nb_committed_instances)
+        .map(|i| [PolynomialLabel::CommittedInstance(i)])
+        .collect();
     let queries = {
         group.bench_function("Compute queries", |b| {
             b.iter(|| {
                 let _ = compute_queries(
                     pk,
-                    nb_committed_instances,
+                    &instance_labels,
                     &instance_polys,
-                    &advice_polys,
-                    &permutations,
-                    &lookups,
+                    &phase0_evaluated,
+                    &phase1_evaluated,
                     &phase2_evaluated,
-                    x,
-                    &lin_poly_non_constant_part,
+                    &quotient_evaluated,
+                    &x_rotations,
                 );
             })
         });
         compute_queries(
             pk,
-            nb_committed_instances,
+            &instance_labels,
             &instance_polys,
-            &advice_polys,
-            &permutations,
-            &lookups,
+            &phase0_evaluated,
+            &phase1_evaluated,
             &phase2_evaluated,
-            x,
-            &lin_poly_non_constant_part,
+            &quotient_evaluated,
+            &x_rotations,
         )
     };
 
@@ -654,12 +577,12 @@ where
         b.iter_batched(
             || (transcript.clone(), queries.clone()),
             |(mut t, q)| {
-                let _ = CS::multi_open(params, &q, &mut t);
+                let _ = PCS::multi_open(params, &q, &mut t);
             },
             criterion::BatchSize::SmallInput,
         )
     });
-    CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure)
+    PCS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure)
 }
 
 /// Benchmarked version of proof creation that measures each internal step.
@@ -668,14 +591,9 @@ where
 /// provided benchmark group, which causes those functions to benchmark their
 /// internal steps.
 #[allow(clippy::too_many_arguments)]
-pub fn benchmark_create_proof<
-    F,
-    CS: PolynomialCommitmentScheme<F>,
-    T: Transcript,
-    ConcreteCircuit: Circuit<F>,
->(
-    params: &CS::Parameters,
-    pk: &ProvingKey<F, CS>,
+pub fn benchmark_create_proof<F, PCS, T, ConcreteCircuit>(
+    params: &PCS::Parameters,
+    pk: &ProvingKey<F, PCS>,
     circuit: &ConcreteCircuit,
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     instances: &[&[F]],
@@ -684,13 +602,11 @@ pub fn benchmark_create_proof<
     group: &mut BenchmarkGroup<'_, criterion::measurement::WallTime>,
 ) -> Result<(), Error>
 where
-    CS::Commitment: Hashable<T::Hash>,
-    F: WithSmallOrderMulGroup<3>
-        + Sampleable<T::Hash>
-        + Hashable<T::Hash>
-        + Hash
-        + Ord
-        + FromUniformBytes<64>,
+    F: ProofField<T::Hash>,
+    PCS: PolynomialCommitmentScheme<F>,
+    PCS::Commitment: Hashable<T::Hash>,
+    T: Transcript,
+    ConcreteCircuit: Circuit<F>,
 {
     #[cfg(not(feature = "committed-instances"))]
     let nb_committed_instances: usize = 0;

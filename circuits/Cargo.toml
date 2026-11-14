@@ -1,19 +1,22 @@
 [package]
 name = "midnight-circuits"
-version = "7.1.0"
+version = "8.0.0-rc.1"
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 description = "Circuit and gadget implementations for Midnight zero-knowledge proofs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lints]
+workspace = true
 
 [dependencies]
 group = { workspace = true }
 ff = { workspace = true }
 rustc-hash = "2"
-midnight-curves = "0.3.0"
-midnight-proofs = { version = "0.8.0", default-features = false, features = [
+midnight-curves = "0.4.0-rc.1"
+midnight-proofs = { version = "0.9.0-rc.1", default-features = false, features = [
     "circuit-params",
     "committed-instances",
 ] }
@@ -43,20 +46,13 @@ itertools = "0.15"
 dhat = "0.3"
 
 [target.'cfg(ci_build)'.dependencies]
-midnight-curves = { version = "0.3.0", features = ["portable"] }
+midnight-curves = { version = "0.4.0-rc.1", features = ["portable"] }
 
 [features]
 default = []
 # Feature that exposes some testing functionality, such as load from scratch or instantiable
 testing = ["num-bigint/rand", "goldenfile", "serde_json", "rand_chacha"]
 heap_profiling = []
-# Enable truncated challenges. This makes recursive proofs more efficient
-truncated-challenges = ["midnight-proofs/truncated-challenges"]
-# Commit to the quotient polynomial H as a single commitment (see midnight-proofs)
-single-h-commitment = ["midnight-proofs/single-h-commitment"]
-# Enables a heuristic to reduce the number of distinct multi-open point sets,
-# lowering the verifier MSM length (see midnight-proofs for details).
-fewer-point-sets = ["midnight-proofs/fewer-point-sets"]
 # Enable development curves (BN256, Pasta)
 dev-curves = ["midnight-curves/dev-curves", "midnight-proofs/dev-curves"]
 

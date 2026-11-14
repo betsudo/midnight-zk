@@ -2,6 +2,10 @@ name: CI checks
 
 on:
   pull_request:
+    # Draft runs skip the test jobs, and a skipped required check counts as
+    # passing, so re-run when a draft is marked ready.
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
   push:
     branches:
       - main
@@ -14,9 +18,11 @@ jobs:
   download-srs:
     runs-on: ubuntu-latest
     outputs:
-      srs-cache-hit: ${{ steps.cache-srs.outputs.cache-hit }}
+      srs-cache-hit: ${{ steps.restore-srs.outputs.cache-hit }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - name: Restore SRS from cache
         id: restore-srs
@@ -29,7 +35,7 @@ jobs:
         if: steps.restore-srs.outputs.cache-hit != 'true'
         run: |
           mkdir -p zk_stdlib/examples/assets
-          curl -L -o zk_stdlib/examples/assets/bls_filecoin_2p19 \
+          curl --fail --location --show-error -o zk_stdlib/examples/assets/bls_filecoin_2p19 \
             https://midnight-s3-fileshare-dev-eu-west-1.s3.eu-west-1.amazonaws.com/bls_filecoin_2p19
 
   test-blstrs:
@@ -39,6 +45,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/cargo-test
         with:
           package: midnight-curves
@@ -47,7 +55,7 @@ jobs:
   test-circuits:
     if: github.event.pull_request.draft == false
     name: Test circuits
-    runs-on: ubuntu-latest-16-core-x64
+    runs-on: ${{ vars.LARGE_RUNNER || 'ubuntu-latest' }}
 
     env:
       RUST_BACKTRACE: full
@@ -55,6 +63,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - run: cargo tree -e features -p midnight-curves
       - uses: ./.github/actions/cargo-test
         with:
@@ -65,7 +75,7 @@ jobs:
     needs: download-srs
     if: github.event.pull_request.draft == false
     name: Test zk-stdlib
-    runs-on: ubuntu-latest-16-core-x64
+    runs-on: ${{ vars.LARGE_RUNNER || 'ubuntu-latest' }}
 
     env:
       RUST_BACKTRACE: full
@@ -73,6 +83,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - name: Restore SRS from cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -87,31 +99,11 @@ jobs:
         with:
           package: midnight-zk-stdlib
           args: --release --test serialization -- --test-threads=1
-
-  test-vk-consistency:
-    needs: download-srs
-    if: github.event.pull_request.draft == false
-    name: Test VK consistency
-    runs-on: ubuntu-latest-16-core-x64
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - name: Restore SRS from cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: zk_stdlib/examples/assets/bls_filecoin_2p19
-          key: fixed-srs-cache
-
-      - uses: ./.github/actions/cargo-test
-        with:
-          package: midnight-zk-stdlib
-          args: --release -- --ignored
-
       - name: Check for changes in goldenfiles/examples.
         run: |
           if ! git diff --quiet -- zk_stdlib/goldenfiles/examples; then
             echo "Files in zk_stdlib/goldenfiles/examples have changed"
-            echo "Run "cargo test --release -- --ignored" locally and commit the changes"
+            echo 'Run "cargo test -p midnight-zk-stdlib --release --test check_vks" locally and commit the changes'
             git diff -- zk_stdlib/goldenfiles/examples
             exit 1
           else
@@ -121,12 +113,22 @@ jobs:
   test-proofs:
     if: github.event.pull_request.draft == false
     name: Test proofs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Install libfontconfig1-dev
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
+        timeout-minutes: 5
+        run: |
+          apt_options=(
+            -o Acquire::Retries=3
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+          )
+          sudo apt-get "${apt_options[@]}" update
+          sudo apt-get "${apt_options[@]}" install -y libfontconfig1-dev
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/cargo-test
         with:
           package: midnight-proofs
@@ -138,6 +140,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/cargo-test
         with:
           package: midnight-aggregation
@@ -150,6 +154,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - name: 'Install rust-toolchain.toml'
         run: rustup toolchain install
       - name: cargo fetch
@@ -167,27 +173,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      # Unstable rustfmt options change behaviour across nightlies, so bump this pin deliberately.
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
         with:
-          toolchain: nightly
-      - run: rustup component add rustfmt --toolchain nightly
-      - run: cargo +nightly fmt --all -- --check
+          toolchain: nightly-2026-05-29
+          components: rustfmt
+      - run: cargo +nightly-2026-05-29 fmt --all -- --check
 
   clippy:
     if: github.event.pull_request.draft == false
     name: Clippy
     timeout-minutes: 30
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - name: 'Install rust-toolchain.toml'
         run: rustup toolchain install
 
       # font required for benchmarking charts generation
       - name: Install libfontconfig1-dev
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
+        timeout-minutes: 5
+        run: |
+          apt_options=(
+            -o Acquire::Retries=3
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+          )
+          sudo apt-get "${apt_options[@]}" update
+          sudo apt-get "${apt_options[@]}" install -y libfontconfig1-dev
 
       - name: Run Clippy
         if: always()

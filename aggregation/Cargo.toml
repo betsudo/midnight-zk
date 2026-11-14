@@ -1,6 +1,6 @@
 [package]
 name = "midnight-aggregation"
-version = "0.1.2"
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Toolkit for proof aggregation of midnight-proofs"
@@ -12,18 +12,21 @@ keywords = ["halo", "proofs", "zkp", "zkSNARKs", "aggregation"]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs", "--html-in-header", "katex-header.html"]
 
+[lints]
+workspace = true
+
 [dependencies]
 group = { workspace = true }
 ff = { workspace = true }
-midnight-curves = "0.3.0"
-midnight-proofs = { version = "0.8.0", default-features = false, features = [
+midnight-curves = "0.4.0-rc.1"
+midnight-proofs = { version = "0.9.0-rc.1", default-features = false, features = [
     "circuit-params",
     "committed-instances",
 ] }
-midnight-circuits = { version = "7.0.0", default-features = false, features = [
+midnight-circuits = { version = "8.0.0-rc.1", default-features = false, features = [
     "testing",
 ] }
-midnight-zk-stdlib = { path = "../zk_stdlib", version = "2.1.0" }
+midnight-zk-stdlib = { path = "../zk_stdlib", version = "3.0.0-rc.1" }
 
 rand = { workspace = true }
 blake2b_simd = { workspace = true }
@@ -31,30 +34,3 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 rand_chacha = { workspace = true }
-
-[[example]]
-name = "ivc"
-required-features = ["truncated-challenges"]
-
-[[example]]
-name = "single_circuit_aggregation"
-required-features = ["truncated-challenges"]
-
-[[example]]
-name = "multi_circuit_aggregation"
-required-features = ["truncated-challenges"]
-
-[features]
-truncated-challenges = [
-    "midnight-proofs/truncated-challenges",
-    "midnight-circuits/truncated-challenges",
-]
-single-h-commitment = [
-    "midnight-proofs/single-h-commitment",
-    "midnight-circuits/single-h-commitment",
-    "midnight-zk-stdlib/single-h-commitment",
-]
-fewer-point-sets = [
-    "midnight-proofs/fewer-point-sets",
-    "midnight-circuits/fewer-point-sets",
-]

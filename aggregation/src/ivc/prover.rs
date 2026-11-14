@@ -8,22 +8,21 @@
 //! stores everything internally so the next step can build on it.
 
 use midnight_circuits::{
-    hash::poseidon::PoseidonState,
+    hash::poseidon::{PoseidonChip, PoseidonState},
     types::Instantiable,
-    verifier::{Accumulator, AssignedAccumulator, AssignedVk, InCircuitKZG},
+    verifier::{Accumulator, AssignedAccumulator, AssignedVk},
 };
 use midnight_proofs::{
     plonk::{self},
-    poly::{
-        PolynomialLabel,
-        kzg::{KZGCommitmentScheme, commitment::KZGMultiCommitment, params::ParamsKZG},
-    },
+    poly::kzg::params::ParamsKZG,
     transcript::{CircuitTranscript, Transcript},
 };
 use midnight_zk_stdlib::MidnightPK;
 use rand::rngs::OsRng;
 
-use super::{E, F, Ivc, IvcCircuit, IvcError, IvcInstance, IvcWitness, S};
+use super::{
+    E, F, Ivc, IvcCircuit, IvcError, IvcInstance, IvcWitness, PCS, circuit::IvcExtendedInstance,
+};
 
 /// Stateful IVC prover holding:
 /// - the SRS (params),
@@ -33,20 +32,20 @@ use super::{E, F, Ivc, IvcCircuit, IvcError, IvcInstance, IvcWitness, S};
 ///
 /// Created via [`super::setup()`]. Use [`IvcProver::prove_step`] to advance
 /// the state and [`IvcProver::instance`] to obtain the latest instance.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct IvcProver<T: Ivc> {
     pub(crate) params: ParamsKZG<E>,
     pub(crate) relation: IvcCircuit<T>,
-    pub(crate) pk: MidnightPK<IvcCircuit<T>>,
+    pub(crate) pk: MidnightPK<IvcCircuit<T>, PCS>,
     pub(crate) state: T::State,
     pub(crate) proof: Vec<u8>,
-    pub(crate) acc: Accumulator<S>,
+    pub(crate) acc: Accumulator<E>,
 }
 
 impl<T: Ivc> IvcProver<T> {
     /// Resets the prover to a previously saved state, allowing it to resume
     /// proving from an intermediate point in the chain.
-    pub fn resume_from(&mut self, state: T::State, proof: Vec<u8>, acc: Accumulator<S>) {
+    pub fn resume_from(&mut self, state: T::State, proof: Vec<u8>, acc: Accumulator<E>) {
         self.state = state;
         self.proof = proof;
         self.acc = acc;
@@ -64,9 +63,8 @@ impl<T: Ivc> IvcProver<T> {
             T::transition(self.relation.ctx(), &self.state, transition_witness.clone());
 
         let vk = self.pk.pk().get_vk();
-        let vk_repr = vk.transcript_repr();
 
-        let fixed_bases = midnight_circuits::verifier::fixed_bases::<S>(vk);
+        let fixed_bases = midnight_circuits::verifier::fixed_bases::<E, PCS>(vk);
 
         // Off-circuit verification of the previous proof.
         let proof_acc = if T::is_genesis(self.relation.ctx(), &self.state) {
@@ -84,27 +82,24 @@ impl<T: Ivc> IvcProver<T> {
             // essentially because `0 + r * 0` equals `0` for any `r` so the resulting
             // accumulator (so-called `next_acc`) will be the same in both (in-circuit and
             // off-circuit) executions after `collapse`.
-            Accumulator::<S>::trivial(&fixed_bases.keys().cloned().collect::<Vec<_>>())
+            Accumulator::<E>::trivial(&fixed_bases.keys().cloned().collect::<Vec<_>>())
         } else {
             // Construct the public inputs of the previous proof.
             let prev_pi = [
-                AssignedVk::<S, InCircuitKZG<S>>::as_public_input(vk),
+                AssignedVk::<F, PCS>::as_public_input(vk),
                 T::format_public_input(&self.state),
-                AssignedAccumulator::<S>::as_public_input(&self.acc),
+                AssignedAccumulator::<E>::as_public_input(&self.acc),
             ]
             .concat();
 
             let mut transcript =
                 CircuitTranscript::<PoseidonState<F>>::init_from_bytes(&self.proof);
-            let dual_msm =
-                plonk::prepare::<F, KZGCommitmentScheme<E>, CircuitTranscript<PoseidonState<F>>>(
-                    vk,
-                    &[KZGMultiCommitment::commitment_to_zero(
-                        PolynomialLabel::CommittedInstance(0),
-                    )],
-                    &[&prev_pi],
-                    &mut transcript,
-                )?;
+            let dual_msm = plonk::prepare::<F, PCS, CircuitTranscript<PoseidonState<F>>>(
+                vk,
+                &[],
+                &[&[], &prev_pi],
+                &mut transcript,
+            )?;
 
             if !dual_msm.clone().check(&self.params.verifier_params()) {
                 return Err(IvcError::InvalidProof);
@@ -114,14 +109,15 @@ impl<T: Ivc> IvcProver<T> {
         };
 
         // Accumulate the proof accumulator with the previous accumulator.
-        let mut next_acc = Accumulator::accumulate(&[proof_acc, self.acc.clone()]);
+        let mut next_acc =
+            Accumulator::accumulate::<PoseidonChip<F>>(&[proof_acc, self.acc.clone()]);
         next_acc.collapse();
 
-        let instance = IvcInstance {
-            vk_repr,
+        let next_instance = IvcInstance {
             state: next_state.clone(),
             acc: next_acc.clone(),
         };
+        let instance = IvcExtendedInstance::new(vk, next_instance);
 
         let witness = IvcWitness {
             prev_state: self.state.clone(),
@@ -130,7 +126,7 @@ impl<T: Ivc> IvcProver<T> {
             transition_witness,
         };
 
-        let proof = midnight_zk_stdlib::prove::<IvcCircuit<T>, PoseidonState<F>>(
+        let proof = midnight_zk_stdlib::prove::<IvcCircuit<T>, PoseidonState<F>, _>(
             &self.params,
             &self.pk,
             &self.relation,
@@ -154,7 +150,6 @@ impl<T: Ivc> IvcProver<T> {
     /// current state.
     pub fn instance(&self) -> IvcInstance<T> {
         IvcInstance {
-            vk_repr: self.pk.pk().get_vk().transcript_repr(),
             state: self.state.clone(),
             acc: self.acc.clone(),
         }

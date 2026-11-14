@@ -20,7 +20,7 @@ use super::{
     circuit::{InnerCircuitsContext, ProofAggregation},
     claims::{Claim, TypedStatement},
 };
-use crate::ivc::{self, E, IvcError, IvcInstance};
+use crate::ivc::{self, E, IvcError, IvcInstance, PCS};
 
 impl ProofAggregation {
     /// Sets up the proof aggregator, returning an [`Aggregator`] (at genesis)
@@ -49,12 +49,9 @@ impl AggregationWitness {
     /// Creates an [`AggregationWitness`] from a VK, a typed instance, and
     /// the inner proof bytes. The instance is wrapped into a type-erased
     /// [`Statement`](super::Statement) via [`TypedStatement`].
-    pub fn new<R: AggregableRelation + Default + std::fmt::Debug + 'static>(
-        vk: MidnightVK,
-        instance: R::Instance,
-        inner_proof: Vec<u8>,
-    ) -> Self
+    pub fn new<R>(vk: MidnightVK<PCS>, instance: R::Instance, inner_proof: Vec<u8>) -> Self
     where
+        R: AggregableRelation + Default + std::fmt::Debug + 'static,
         R::Instance: std::fmt::Debug + Clone,
     {
         let statement = Box::new(TypedStatement::<R>::new(instance));

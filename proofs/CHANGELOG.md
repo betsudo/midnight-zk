@@ -7,10 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+* `kzg::KZGEngine`, the pairing engines over which KZG commitments can be made, bounding `KZGCommitmentScheme<E>` [#644](https://github.com/midnightntwrk/midnight-zk/pull/644)
+* `transcript::TranscriptField<H>` (`Hashable<H> + Sampleable<H>`) and `plonk::ProofField<H>` (`TranscriptField<H> + WithSmallOrderMulGroup<3> + FromUniformBytes<64> + Hash + Ord`), which the prover, verifier and commitment schemes are bounded by [#644](https://github.com/midnightntwrk/midnight-zk/pull/644)
+### Changed
+* Only the code that needs `ZETA` (building an `EvaluationDomain`, and reading or creating keys) requires `WithSmallOrderMulGroup<3>`; the getters of `EvaluationDomain`, `VerifyingKey` and `ProvingKey`, and the prover and verifier internals, require `PrimeField` [#644](https://github.com/midnightntwrk/midnight-zk/pull/644)
+### Removed
+
+## [0.9.0-rc.1]
+### Added
+* `Fflonk::T_MAX` is public, and `Fflonk::chunk_labels` gives the labels of the chunks of a group [#634](https://github.com/midnightntwrk/midnight-zk/pull/634)
+* `kzg::point_set_order`, the order in which the KZG multi-open takes its point sets [#583](https://github.com/midnightntwrk/midnight-zk/pull/583)
+* `fflonk::balanced_chunks`, the split of a group into the fewest chunks of at most `T_MAX`, of balanced sizes [#579](https://github.com/midnightntwrk/midnight-zk/pull/579)
+* `kzg::COLLAPSE_THRESHOLD`, the number of variable-base terms from which the KZG multi-open collapses a point set's combined commitment [#579](https://github.com/midnightntwrk/midnight-zk/pull/579)
+* `VerifyingKey` implements `Default`: a placeholder key of an empty constraint system [#461](https://github.com/midnightntwrk/midnight-zk/pull/461)
+* `ConstraintSystem::fixed_polys_labels` [#547](https://github.com/midnightntwrk/midnight-zk/pull/547)
+* `Rotation` derives `PartialOrd` and `Ord` [#543](https://github.com/midnightntwrk/midnight-zk/pull/543)
+* `permutation::Argument::polynomial_labels`, `num_sets` and `accumulator_labels` are public [#537](https://github.com/midnightntwrk/midnight-zk/pull/537)
 * changed `sha256` name in benches to account for the change of naming convention in `circuits` [#135](https://github.com/midnightntwrk/midnight-zk/pull/135)
 * optional names on VerifierQuery commitments [#205](https://github.com/midnightntwrk/midnight-zk/pull/205)
 * `padded_add` and `padded_sub` polynomial operations [#276](https://github.com/midnightntwrk/midnight-zk/pull/276)
-* `single-h-commitment` feature to commit the quotient polynomial in one piece [#276](https://github.com/midnightntwrk/midnight-zk/pull/276)
 * `fewer-point-sets` feature to reduce the number of distinct multi-open point sets [#281](https://github.com/midnightntwrk/midnight-zk/pull/281)
 * `LagrangeDelta` / `LagrangeDoubleDelta` commit bases [#379](https://github.com/midnightntwrk/midnight-zk/pull/379)
 * `FloorPlanner` region-layout caching API (`synthesize_capturing_regions`, `synthesize_with_cached_regions`) and implementation in `SimpleFloorPlanner` to skip the shape pass during proving [#380](https://github.com/midnightntwrk/midnight-zk/pull/380)
@@ -21,8 +36,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * `commitment_byte_length` method on the `PolynomialCommitmentScheme` trait, defaulting to the per-commitment size times `n` and overridable for schemes that fold polynomials into a single proof element [#440](https://github.com/midnightntwrk/midnight-zk/pull/440)
 * `circuit_model_with` taking an explicit commitment-size closure [#440](https://github.com/midnightntwrk/midnight-zk/pull/440)
 * `Error::DuplicatedLabel`, returned when two polynomials of an argument group claim the same `PolynomialLabel` [#513](https://github.com/midnightntwrk/midnight-zk/pull/513)
+* `ConstraintSystem::into_finalized`, converting the selectors of a constraint system to fixed columns without their polynomials, as in the constraint system of a verifying key [#546](https://github.com/midnightntwrk/midnight-zk/pull/546)
+* `Fflonk<PCS, LOG2_T_MAX>`, a polynomial commitment scheme combining the polynomials of a group, in chunks of up to `2^LOG2_T_MAX`, into single polynomials committed to by the inner scheme `PCS` [#555](https://github.com/midnightntwrk/midnight-zk/pull/555)
+* `PolynomialLabel::Collection`, a label made of other labels, and the `commitment_labels` method on the `PolynomialCommitmentScheme` trait, the labels a commitment tags its polynomials with [#555](https://github.com/midnightntwrk/midnight-zk/pull/555)
+* `PolynomialCommitmentScheme::max_k`, the largest `k` such that some parameters can commit to polynomials of degree strictly less than `2^k` [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `PolynomialCommitmentScheme::load_params`, reading the parameters of the scheme for committing to polynomials of degree strictly less than `2^k` [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `InterleavedCommit`, a `PolynomialCommitmentScheme` that commits to `Σ_i X^i f_i(X^t)` for chunks of polynomials `f_0, ..., f_{k-1}`, implemented by KZG from per-residue bases cached in `ParamsKZG` [#565](https://github.com/midnightntwrk/midnight-zk/pull/565)
 
 ### Fixed
+* `ParamsKZG::read_custom` rejects a serialized `k` above `E::Fr::S` with `InvalidData` before allocating, instead of sizing the point vectors from an unchecked header [#615](https://github.com/midnightntwrk/midnight-zk/pull/615)
+* LogUp verifier no longer panics when the prover makes some `fⱼ(x) + β` zero: the helper constraint folds products instead of inverting each term, which also saves the inversions [#562](https://github.com/midnightntwrk/midnight-zk/pull/562)
+* `KZGCommitmentScheme::multi_prepare` returns `Error::OpeningError` instead of panicking when a query names a polynomial its commitment group lacks [#562](https://github.com/midnightntwrk/midnight-zk/pull/562)
+* Under `truncated-challenges`, the collapse in the KZG verifier now keeps the terms of fixed and permutation columns apart, as the in-circuit verifier does, instead of folding them. The off-circuit accumulator no longer drops a fixed column queried at several rotations [#569](https://github.com/midnightntwrk/midnight-zk/pull/569)
+* Cost model: a circuit with no permutation columns no longer underflows when counting the permutation queries, and is no longer charged for an accumulator commitment and its evaluations, which the prover does not produce [#537](https://github.com/midnightntwrk/midnight-zk/pull/537)
+* The KZG multi-open verifier reads the batch commitment `f` and the opening proof `π` through `read_commitment`, instead of reading them straight from the transcript and unwrapping them with `KZGMultiCommitment::into_single`. `into_single` panics on a group holding any other number of polynomials, and that number is declared by the prover, so a malformed proof could abort the verifier rather than fail verification [#515](https://github.com/midnightntwrk/midnight-zk/pull/515)
+* `KZGCommitmentScheme::read_commitment` rejects a commitment group holding a different number of polynomials than the number of labels expected. A group's length is declared in the proof and is not hashed into the transcript, so without this check the points read were silently zipped against the labels: a group truncated to one point made every query of that group resolve to that single commitment [#515](https://github.com/midnightntwrk/midnight-zk/pull/515)
+* Resolve a query's commitment by matching its `PolynomialLabel` even when the group holds a single polynomial, instead of taking the sole inner commitment by position. The `Linear` linearization commitment, which aggregates many polynomials under no label of its own, is still taken as it is [#515](https://github.com/midnightntwrk/midnight-zk/pull/515)
+* Bound the allocation in `Hashable::read` for `KZGMultiCommitment` by the bytes actually available, so a proof declaring a large group length no longer makes the verifier allocate up to 4 GiB before reading it [#515](https://github.com/midnightntwrk/midnight-zk/pull/515)
+* Cost model: account for the length prefix framing each commitment group, and for the logup polynomials being committed in the two argument phase groups rather than one group per lookup argument. `commit(n)` is now the byte length of the single message that commits to `n` polynomials, so a site writing `n` commitments separately costs `n * commit(1)` [#515](https://github.com/midnightntwrk/midnight-zk/pull/515)
 * Fix verifier evals bug [#356](https://github.com/midnightntwrk/midnight-zk/pull/356)
 * Fix broken intra-doc links to private `Polynomial::padded_add` and `padded_sub` [#287](https://github.com/midnightntwrk/midnight-zk/pull/287)
 * Fix cost model to account for committed instance column evaluations [#280](https://github.com/midnightntwrk/midnight-zk/pull/280)
@@ -31,10 +62,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Fix cost-model [#435](https://github.com/midnightntwrk/midnight-zk/pull/435)
 
 ### Changed
+* BREAKING: `PolynomialCommitmentScheme::Commitment` no longer requires `Add` and `Mul<F>`: no generic code combines commitments, so a scheme need not be homomorphic [#582](https://github.com/midnightntwrk/midnight-zk/pull/582)
+* The KZG multi-open takes first the point set with the most variable-base polynomials, then the others by cardinality, so that fewer scalars are products of two truncated challenges. This changes the proof [#583](https://github.com/midnightntwrk/midnight-zk/pull/583)
+* fflonk splits the polynomials of a `commit_many` call into the same number of chunks as before, of balanced sizes (e.g. 6, 6, 5 rather than 8, 8, 1), instead of chunks of `T_MAX` and a remainder. This changes fflonk verifying keys and proofs [#579](https://github.com/midnightntwrk/midnight-zk/pull/579)
+* With truncated challenges, the KZG multi-open collapses the combined commitment of a point set only if it has at least `COLLAPSE_THRESHOLD` variable-base terms; a set with fewer keeps its terms, scaled by `x4` one by one [#579](https://github.com/midnightntwrk/midnight-zk/pull/579)
+* The quotient is split into `quotient_poly_degree + 1` limbs of `n - 2` coefficients, with two blinders per boundary between limbs, committed to as one group and opened one by one at `x`, rather than through the combination of their commitments. The proof carries the evaluations of all limbs but the first, which the verifier derives from the identities. This changes the proof [#582](https://github.com/midnightntwrk/midnight-zk/pull/582)
+* Remove the linearization: the simple selectors are committed, evaluated and opened in the phase-0 group like any other fixed column, and the verifier checks that the quotient commitment, scaled by `1 - x^n`, opens to `-nu(x)` at `x`. Proofs grow by one scalar per simple selector, and every verifying key and its `transcript_repr` change. `create_gate` no longer requires the polynomials of a gate to be multiples of one simple selector [#566](https://github.com/midnightntwrk/midnight-zk/pull/566)
+* `ConstraintSystem::create_gate` panics on a gate whose polynomials are not all multiples of the same simple selector, or that queries a simple selector none of its polynomials is a multiple of. The verifier takes the evaluation of a simple selector as 1, which relies on that shape [#547](https://github.com/midnightntwrk/midnight-zk/pull/547)
+* The verifying key commits to every fixed column but the simple selectors as one group, together with the fixed permutation polynomials, in the phase-0 group exposed as `VerifyingKey::phase0_commitment`, and to each simple selector on its own, as `VerifyingKey::simple_selector_commitments`. The serialized key changes to that layout, so every verifying key and its `transcript_repr` change [#547](https://github.com/midnightntwrk/midnight-zk/pull/547)
+* The fixed columns are evaluated and opened through the phase-0 group: their evaluations are written to the proof with the group's, in label order, rather than once per fixed query. A simple selector is never opened, as before. Proof sizes do not change [#547](https://github.com/midnightntwrk/midnight-zk/pull/547)
+* `msm_specific` always uses blst's `multi_exp_affine` for BLS12-381 G1,`msm_best`is a fallback for all other curves [#544](https://github.com/midnightntwrk/midnight-zk/pull/544)
+* `commit_many`, `read_commitment` and `deserialize_commitment` take the labels of a group in the order it is committed to, rather than ordering them [#554](https://github.com/midnightntwrk/midnight-zk/pull/554)
+* `ProverQuery` carries the labels and polynomials of the group the queried polynomial is committed with, so `multi_open` sees every polynomial committed together with the queried one [#554](https://github.com/midnightntwrk/midnight-zk/pull/554)
+* fflonk writes and reads the implicit evaluations of a chunk in the order its points are first queried, rather than by their value. This changes the proof for `T_MAX > 1` [#569](https://github.com/midnightntwrk/midnight-zk/pull/569)
+* The prover commits to the phase-1 group in `LagrangeDelta` and to the phase-2 group in `LagrangeDoubleDelta` [#565](https://github.com/midnightntwrk/midnight-zk/pull/565)
+* fflonk requires its inner scheme to implement `InterleavedCommit` and commits through it, without building `g`, so polynomials in Lagrange form are not converted to coefficient form and the rows where they vanish stay free in the commitment [#565](https://github.com/midnightntwrk/midnight-zk/pull/565)
+* fflonk computes the roots of each opening point once per chunk size, and evaluates the chunks at them sequentially [#565](https://github.com/midnightntwrk/midnight-zk/pull/565)
+* The KZG verifier evaluates the interpolant of each point set at `x3` with the barycentric formula instead of interpolating it first, and divides by the vanishing polynomial at `x3` with the same batch inversion [#565](https://github.com/midnightntwrk/midnight-zk/pull/565)
+* The KZG multi-open divides each point set's polynomial by the product of `X - point` at once, skipping its zero coefficients, instead of by each point in turn [#565](https://github.com/midnightntwrk/midnight-zk/pull/565)
+* Keygen bounds the circuit size by `PolynomialCommitmentScheme::max_k` rather than by `Params::max_k` [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* The `PolynomialCommitmentScheme` implementation of `KZGCommitmentScheme<E>` requires `E::G1Affine: SerdeObject` and `E::G2: ProcessedSerdeObject` [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `ProcessedSerdeObject` no longer requires the curve to implement `Default` [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* The quotient polynomial is always committed in `quotient_poly_degree` limbs [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* Keygen no longer checks the monomial basis of the SRS against `srs_monomial_blowup`; `PolynomialCommitmentScheme::max_k` bounds the circuit size instead [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `ParamsKZG::max_k` is an inherent method again and panics if the monomial and Lagrange bases differ in size [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `Fflonk::gen_params` and `Fflonk::load_params` keep the Lagrange basis of the inner parameters at the size of the monomial one, `2^(k + LOG2_T_MAX)`, rather than downsizing it to `2^k` [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `Guard` is generic over the verifier parameters of its PCS rather than over the PCS itself [#555](https://github.com/midnightntwrk/midnight-zk/pull/555)
+* Commit the advice columns as part of the phase-1 argument group, together with the logup multiplicities, instead of one commitment per column, and open them through it at the rotations the circuit queries them at. This changes the transcript of every proof, which shrinks by 4 bytes per advice column (one fewer if the circuit has no lookup) [#543](https://github.com/midnightntwrk/midnight-zk/pull/543)
+* Commit the logup multiplicities before squeezing `theta`, instead of after. The prover counts them by comparing the input and table tuples directly, and compresses the tuples with `theta` only when computing the helpers and aggregators. This changes the transcript of every proof over a circuit with a lookup [#543](https://github.com/midnightntwrk/midnight-zk/pull/543)
+* Open the phase-1 and phase-2 groups first in the multi-open, followed by the phase-0 group and then the committed instances. This changes the opening proof but not its size [#543](https://github.com/midnightntwrk/midnight-zk/pull/543)
+* Commit the permutation accumulators as part of the phase-2 argument group, and open the permutation polynomials as a phase-0 group, whose commitment lives in the verifying key rather than in the proof. `permutation::expressions` looks both sets of evaluations up by label, as the other arguments do, and the cost model counts the accumulators in the phase-2 group. This changes the transcript of every proof over a circuit with copy constraints: proofs produced by earlier versions no longer verify [#537](https://github.com/midnightntwrk/midnight-zk/pull/537)
+* The permutation polynomials are committed to as one group, in place of one commitment per polynomial. The verifying key holds that commitment directly, as `VerifyingKey::phase0_commitment() -> &CS::Commitment`; `permutation::VerifyingKey`, which held one commitment per polynomial, and the `VerifyingKey::permutation` accessor that returned it, are removed. A group is serialized as its polynomials' commitments back to back, so the verifying key's bytes and its `transcript_repr` are unchanged [#537](https://github.com/midnightntwrk/midnight-zk/pull/537)
+* `permutation::ProvingKey` is removed. The permutation polynomials belong to the proving key's phase-0 group, which holds them in coefficient form; the Lagrange form and the cosets that the prover reads once per proof are derived from it and cached beside it as `permutation::Sigmas`. `build_phase0_polys` derives the group and the `Sigmas` together, both at keygen and in `ProvingKey::read`, and is the only way to obtain either. The serialized key is unchanged: the Lagrange form is still the only one written [#537](https://github.com/midnightntwrk/midnight-zk/pull/537)
+* `compute_z_polys` and `Evaluator::evaluate_numerator` read the permutation polynomials from the proving key instead of taking the permutation proving key and its cosets as arguments [#537](https://github.com/midnightntwrk/midnight-zk/pull/537)
+* `commit_many` and `read_commitment` order a group's polynomials by their labels' `Ord` themselves, rather than requiring the caller to pass the labels in that order. Callers list the labels of a group in whatever order suits them and both sides agree on the on-wire order. A repeated label in a group now panics, in both, rather than being silently collapsed [#515](https://github.com/midnightntwrk/midnight-zk/pull/515)
+* Commit the logup polynomials as generic argument groups: every multiplicities polynomial in the phase-1 group, and every aggregator, helper and trash polynomial in the phase-2 group, instead of one commitment per polynomial. `ChunkedArgument::expressions` takes the two evaluation maps and looks its own evaluations up by label. This changes the transcript of every proof over a circuit with a lookup: proofs produced by earlier versions no longer verify [#515](https://github.com/midnightntwrk/midnight-zk/pull/515)
+* Frame each commitment group written to the proof with a little-endian `u32` byte-length prefix, so that `Hashable::read` for `KZGMultiCommitment` is self-delimiting. The prefix is not part of the hashed transcript; how many polynomials a group holds is pinned by the verifying key and checked on read. Proofs grow by 4 bytes per commitment group, and `KZGCommitmentScheme::commitment_byte_length` accounts for it [#515](https://github.com/midnightntwrk/midnight-zk/pull/515)
+* `commit_many` accepts a group with no polynomials. A commitment to no polynomials is neither written to nor absorbed into the transcript, and `read_commitment` with no labels reads nothing, in and out of circuit, so the phase groups of `VerifierTrace` are plain `Committed` values and `read_group` is removed. `commitment_byte_length(0)` is 0. The proof format is unchanged: an empty group was not written before either [#537](https://github.com/midnightntwrk/midnight-zk/pull/537)
 * Squeeze the trash challenge right after `gamma`, before the permutation and lookup commitments, so the trash polynomials are committed together with the other phase-2 polynomials. This changes the transcript of every proof, including for circuits with no trashcan: proofs produced by earlier versions no longer verify [#513](https://github.com/midnightntwrk/midnight-zk/pull/513)
 * Commit the trash polynomials as a single generic argument group keyed by `PolynomialLabel`, rather than one commitment per trashcan. A new internal `plonk::argument` module owns the group's `Committed`/`Evaluated` types and the per-label opening points; `trash::Argument` is identified by an index instead of a name and looks its own evaluation up by label [#513](https://github.com/midnightntwrk/midnight-zk/pull/513)
 * Migrate to Rust edition 2024; MSRV raised from 1.76 to 1.90. Both are now inherited from the workspace [#508](https://github.com/midnightntwrk/midnight-zk/pull/508)
-* Extend `PolynomialCommitmentScheme` with `squeeze_evaluation_point` and `srs_monomial_blowup` and add a `k` argument to `multi_prepare`, as PCS-agnostic extension points for fflonk [#487](https://github.com/midnightntwrk/midnight-zk/pull/487)
+* Extend `PolynomialCommitmentScheme` with `squeeze_evaluation_point`, as a PCS-agnostic extension point for fflonk [#487](https://github.com/midnightntwrk/midnight-zk/pull/487)
 * `circuit_model` is now parameterized by a `PolynomialCommitmentScheme` (`circuit_model::<_, CS>`) instead of const `COMM`/`SCALAR` byte-size generics [#440](https://github.com/midnightntwrk/midnight-zk/pull/440)
 * Rename `PolynomialPointer` to `PolynomialReference` in `ProverQuery`; rename `poly` field to `poly_ref`; change `poly_inner_product` to accept `&[&Polynomial<F, Coeff>]` to avoid cloning [#411](https://github.com/midnightntwrk/midnight-zk/pull/411)
 * Rename `CommitmentLabel` to `PolynomialLabel`; add `NoLabel` variant for freshly deserialized commitments; introduce `Labelable` trait so every call site attaches the correct label after deserialization [#392](https://github.com/midnightntwrk/midnight-zk/pull/392)
@@ -56,6 +124,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Simplify KZG multiopen verifier to use `KZGCommitment` directly [#430](https://github.com/midnightntwrk/midnight-zk/pull/430)
 
 ### Removed
+* BREAKING: `truncated-challenges` feature. The KZG multi-open always truncates its challenges, which changes the proofs of builds without the feature [#580](https://github.com/midnightntwrk/midnight-zk/pull/580)
+* `KZGMultiCommitment::commitment_to_zero`. An empty committed instance can be passed as an empty instance column instead, which is neither committed to nor opened [#569](https://github.com/midnightntwrk/midnight-zk/pull/569)
+* `single-h-commitment` feature, and the `PolynomialLabel::Quotient` label it committed the quotient polynomial with [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `PolynomialCommitmentScheme::srs_monomial_blowup`, superseded by `load_params` [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `ParamsKZG::downsize_lagrange` [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `ParamsKZG::with_extended_monomial` [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* The `Params` trait. `max_k` and `downsize` remain inherent methods of `ParamsKZG`, and `downsize_from_circuit` is removed [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* The linearization: `PolynomialLabel::Linearization`, `SelectorFlag`, `ConstraintSystem::{has_simple_selector_col, num_simple_selectors, simple_selector_columns}` and `VerifyingKey::simple_selector_commitments` [#566](https://github.com/midnightntwrk/midnight-zk/pull/566)
+* `fewer-point-sets` feature [#554](https://github.com/midnightntwrk/midnight-zk/pull/554)
+* `VerifyingKey::fixed_commitments`, replaced by `phase0_commitment` and `simple_selector_commitments` [#547](https://github.com/midnightntwrk/midnight-zk/pull/547)
+* `Clone` on `ProvingKey`, so that the polynomials it holds are never copied [#537](https://github.com/midnightntwrk/midnight-zk/pull/537)
+* Remove the internal `permutation::verifier` module and `permutation::Evaluated`; the permutation argument no longer carries any transcript plumbing of its own [#537](https://github.com/midnightntwrk/midnight-zk/pull/537)
+* Remove `KZGCommitment::into_point`; use `as_point`, which borrows the point instead of consuming (and often cloning) the commitment [#515](https://github.com/midnightntwrk/midnight-zk/pull/515)
+* Remove the internal `logup::verifier` module and `logup::Evaluated`; the lookup argument no longer carries any transcript plumbing of its own [#515](https://github.com/midnightntwrk/midnight-zk/pull/515)
 * Remove the internal `trash::verifier` module and `trash::Evaluated`; the trash argument no longer carries any transcript plumbing of its own [#513](https://github.com/midnightntwrk/midnight-zk/pull/513)
 * Remove the `Labelable` trait; commitments are now labeled while being read through `read_commitment` / `deserialize_commitment` instead of being re-labeled after deserialization [#491](https://github.com/midnightntwrk/midnight-zk/pull/491)
 * Remove `Query<F>` trait; `construct_intermediate_sets` now accepts `&[(T, F, F)]` (commitment reference, point, eval) tuples with `T: PartialEq + Copy` [#411](https://github.com/midnightntwrk/midnight-zk/pull/411)
@@ -63,6 +145,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Remove multi-proof support; `create_proof` and `prepare` now operate on a single circuit and take `instances: &[&[F]]` instead of `&[&[&[F]]]` [#375](https://github.com/midnightntwrk/midnight-zk/pull/375)
 * Remove `msm_inner_product` from `utils::arithmetic`; superseded by the generic `inner_product` [#430](https://github.com/midnightntwrk/midnight-zk/pull/430)
 * Remove redundant `PolynomialLabel::Instance` variant; use `CommittedInstance` [#450](https://github.com/midnightntwrk/midnight-zk/pull/450)
+
+## [0.8.3]
+### Changed
+* `msm_specific` always uses blst's multi-exponentiation for BLS12-381 G1, removing the cut-over to `msm_best` above 2^19 terms. `msm_best` runs the `from_xy` subgroup check of midnight-curves 0.3.1 on every base and bucket, which made commitments above 2^19 terms (k >= 20 circuits) about 7x slower [#536](https://github.com/midnightntwrk/midnight-zk/pull/536)
+
+## [0.8.2]
+### Fixed
+* Check per-proof vector lengths in `verify_algebraic_constraints`. [#482](https://github.com/midnightntwrk/midnight-zk/pull/482)
+
+## [0.8.1]
+### Fixed
+* Bug fix in midnight-curves [#434](https://github.com/midnightntwrk/midnight-zk/pull/434)
 
 ## [0.8.0]
 ### Added

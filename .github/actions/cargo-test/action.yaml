@@ -34,4 +34,4 @@ runs:
       # ARGS is deliberately unquoted: it carries multiple cargo flags.
       run: |
         # shellcheck disable=SC2086
-        cargo test -p "$PACKAGE" $ARGS
+        cargo test --locked -p "$PACKAGE" $ARGS

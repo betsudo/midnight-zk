@@ -1,10 +1,10 @@
-use ff::{PrimeField, WithSmallOrderMulGroup};
+use ff::PrimeField;
 use group::ff::Field;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use super::{ConstraintSystem, Expression};
 use crate::{
-    plonk::{Any, argument, logup, permutation},
+    plonk::{Any, argument},
     poly::{
         Coeff, EvaluationDomain, Polynomial, PolynomialLabel, PolynomialRepresentation, Rotation,
     },
@@ -653,7 +653,7 @@ impl<F: PrimeField> FlatGraphEvaluator<F> {
     }
 }
 
-impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
+impl<F: PrimeField> Evaluator<F> {
     /// Creates a new evaluation structure
     pub fn new(cs: &ConstraintSystem<F>) -> Self {
         let dummy_flat = FlatGraphEvaluator {
@@ -671,7 +671,7 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
         };
         let mut ev = Evaluator {
             custom_gates: GraphEvaluator::default(),
-            custom_gates_flat: dummy_flat.clone(),
+            custom_gates_flat: dummy_flat,
             lookups: Vec::new(),
             lookups_flat: Vec::new(),
             trashcans: Vec::new(),
@@ -829,13 +829,12 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
         gamma: F,
         theta: F,
         trash_challenge: F,
-        lookups: &[logup::prover::Committed<F>],
+        phase1_committed: &argument::prover::Committed<F, Coeff>,
         phase2_committed: &argument::prover::Committed<F, Coeff>,
-        permutation: &permutation::prover::Committed<F>,
         l0: &Polynomial<F, B>,
         l_last: &Polynomial<F, B>,
         l_active_row: &Polynomial<F, B>,
-        permutation_pk_cosets: &[Polynomial<F, B>],
+        permutation_cosets: &[Polynomial<F, B>],
     ) -> Polynomial<F, B> {
         let log_scale = B::k(domain) - domain.k();
         let omega = B::omega(domain);
@@ -860,16 +859,23 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
         });
 
         // Permutations
-        let sets = &permutation.sets;
-        if !sets.is_empty() {
+        if !cs.permutation().columns.is_empty() {
             let blinding_factors = cs.blinding_factors();
             let last_rotation = Rotation(-((blinding_factors + 1) as i32));
             let chunk_len = cs.degree() - 2;
             let delta_start = beta * &B::g_coset(domain);
 
-            let permutation_product_cosets: Vec<Polynomial<F, B>> = sets
-                .par_iter()
-                .map(|set| B::coeff_to_self(domain, set.permutation_product_poly.clone()))
+            let num_sets = cs.permutation().num_sets(cs.degree());
+
+            let permutation_product_cosets: Vec<Polynomial<F, B>> = (0..num_sets)
+                .into_par_iter()
+                .map(|i| {
+                    let poly =
+                        phase2_committed.poly(&PolynomialLabel::PermutationAccumulator(i)).expect(
+                            "the phase-2 group has no polynomial for a permutation accumulator",
+                        );
+                    B::coeff_to_self(domain, poly.clone())
+                })
                 .collect();
 
             let first_set_permutation_product_coset = permutation_product_cosets.first().unwrap();
@@ -896,7 +902,7 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
                             * l_last[idx];
                     // Except for the first set, enforce.
                     // l_0(X) * (z_i(X) - z_{i-1}(\omega^(last) X)) = 0
-                    for set_idx in 0..sets.len() {
+                    for set_idx in 0..num_sets {
                         if set_idx != 0 {
                             *value = *value * y
                                 + (permutation_product_cosets[set_idx][idx]
@@ -913,7 +919,7 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
                     for ((permutation_product_coset, columns), cosets) in permutation_product_cosets
                         .iter()
                         .zip(p.columns.chunks(chunk_len))
-                        .zip(permutation_pk_cosets.chunks(chunk_len))
+                        .zip(permutation_cosets.chunks(chunk_len))
                     {
                         let mut left = permutation_product_coset[r_next];
                         for (values, permutation) in columns
@@ -947,25 +953,47 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
 
         // Pre-compute all lookup cosets in parallel. This trades peak memory
         // for parallelism: the FFTs for different lookups can now overlap.
-        let all_lookup_cosets: Vec<_> = lookups
+        let all_lookup_cosets: Vec<_> = cs
+            .lookups
+            .iter()
+            .map(|l| l.chunk_by_degree(cs.degree()))
+            .enumerate()
+            .collect::<Vec<_>>()
             .par_iter()
-            .map(|lookup| {
-                let helper_cosets: Vec<_> = lookup
-                    .helper_polys
-                    .iter()
-                    .map(|h| B::coeff_to_self(domain, h.clone()))
+            .map(|(argument_index, lookup)| {
+                let multiplicities_poly = phase1_committed
+                    .poly(&PolynomialLabel::LogupMultiplicities(*argument_index))
+                    .unwrap();
+
+                let helper_polys: Vec<_> = (0..lookup.input_expression_chunks.len())
+                    .map(|j| {
+                        phase2_committed
+                            .poly(&PolynomialLabel::LogupHelper(*argument_index, j))
+                            .unwrap()
+                    })
                     .collect();
-                let aggregator_coset = B::coeff_to_self(domain, lookup.aggregator_poly.clone());
-                let multiplicities_coset = B::coeff_to_self(domain, lookup.multiplicities.clone());
-                (helper_cosets, aggregator_coset, multiplicities_coset)
+
+                let aggregator_poly = phase2_committed
+                    .poly(&PolynomialLabel::LogupAggregator(*argument_index))
+                    .unwrap();
+
+                // Compute cosets
+
+                let multiplicities_coset = B::coeff_to_self(domain, multiplicities_poly.clone());
+
+                let helper_cosets: Vec<_> =
+                    helper_polys.into_iter().map(|h| B::coeff_to_self(domain, h.clone())).collect();
+
+                let aggregator_poly = B::coeff_to_self(domain, aggregator_poly.clone());
+
+                (helper_cosets, aggregator_poly, multiplicities_coset)
             })
             .collect();
 
         // Pre-compute all trash cosets in parallel (lookup cosets
         // are already pre-computed above).
         let trash_cosets: Vec<_> = phase2_committed
-            .polys_map
-            .par_iter()
+            .par_polys()
             .filter_map(|(label, trash_poly)| match label {
                 PolynomialLabel::Trash(_) => Some(B::coeff_to_self(domain, trash_poly.clone())),
                 _ => None,

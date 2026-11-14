@@ -29,20 +29,19 @@ use midnight_proofs::{
         Circuit, Error, ProvingKey, VerifyingKey, create_proof, keygen_pk, keygen_vk, prepare,
     },
     poly::{
-        commitment::{Guard, PolynomialCommitmentScheme},
+        commitment::Guard,
         kzg::{
-            KZGCommitmentScheme,
             commitment::KZGMultiCommitment,
             params::{ParamsKZG, ParamsVerifierKZG},
         },
     },
-    transcript::{CircuitTranscript, Hashable, Sampleable, Transcript, TranscriptHash},
+    transcript::{CircuitTranscript, Hashable, Transcript, TranscriptField, TranscriptHash},
     utils::SerdeFormat,
 };
 use rand::{CryptoRng, RngCore};
 use sha2::Digest;
 
-use crate::{MidnightVK, Relation, cost_model, optimal_k};
+use crate::{KZG, MidnightPCS, MidnightVK, Relation, cost_model, optimal_k};
 
 macro_rules! plonk_api {
     ($name:ident, $engine:ty, $native:ty, $curve:ty, $projective:ty) => {
@@ -61,7 +60,7 @@ macro_rules! plonk_api {
             pub fn setup_vk(
                 params: &ParamsKZG<$engine>,
                 circuit: &Relation,
-            ) -> VerifyingKey<$native, KZGCommitmentScheme<$engine>> {
+            ) -> VerifyingKey<$native, KZG> {
                 #[cfg(test)]
                 let start = Instant::now();
                 let vk = keygen_vk(params, circuit).expect("keygen_vk should not fail");
@@ -74,8 +73,8 @@ macro_rules! plonk_api {
             /// PLONK PK setup for the given circuit.
             pub fn setup_pk(
                 circuit: &Relation,
-                vk: &VerifyingKey<$native, KZGCommitmentScheme<$engine>>,
-            ) -> ProvingKey<$native, KZGCommitmentScheme<$engine>> {
+                vk: &VerifyingKey<$native, KZG>,
+            ) -> ProvingKey<$native, KZG> {
                 #[cfg(test)]
                 let start = Instant::now();
                 let pk = keygen_pk(vk.clone(), circuit).expect("keygen_pk should not fail");
@@ -88,27 +87,22 @@ macro_rules! plonk_api {
             /// PLONK proving algorithm.
             pub fn prove<H>(
                 params: &ParamsKZG<$engine>,
-                pk: &ProvingKey<$native, KZGCommitmentScheme<$engine>>,
+                pk: &ProvingKey<$native, KZG>,
                 circuit: &Relation,
                 nb_instance_commitments: usize,
                 pi: &[&[$native]],
                 rng: impl RngCore + CryptoRng,
             ) -> Result<Vec<u8>, Error>
             where
-                H: TranscriptHash,
                 $projective: Hashable<H>,
-                $native: Hashable<H> + Sampleable<H>,
+                $native: TranscriptField<H>,
+                H: TranscriptHash,
             {
                 #[cfg(test)]
                 let start = Instant::now();
                 let proof = {
                     let mut transcript = CircuitTranscript::init();
-                    create_proof::<
-                        $native,
-                        KZGCommitmentScheme<$engine>,
-                        CircuitTranscript<H>,
-                        Relation,
-                    >(
+                    create_proof::<$native, KZG, CircuitTranscript<H>, Relation>(
                         params,
                         pk,
                         circuit,
@@ -132,21 +126,21 @@ macro_rules! plonk_api {
             /// PLONK verification algorithm.
             pub fn verify<H>(
                 params_verifier: &ParamsVerifierKZG<$engine>,
-                vk: &VerifyingKey<$native, KZGCommitmentScheme<$engine>>,
+                vk: &VerifyingKey<$native, KZG>,
                 instance_commitments: &[KZGMultiCommitment<$engine>],
                 pi: &[&[$native]],
                 proof: &[u8],
             ) -> Result<(), Error>
             where
-                H: TranscriptHash,
                 $projective: Hashable<H>,
-                $native: Hashable<H> + Sampleable<H>,
+                $native: TranscriptField<H>,
+                H: TranscriptHash,
             {
                 let mut transcript = CircuitTranscript::init_from_bytes(proof);
 
                 #[cfg(test)]
                 let start = Instant::now();
-                let res = prepare::<$native, KZGCommitmentScheme<$engine>, CircuitTranscript<H>>(
+                let res = prepare::<$native, KZG, CircuitTranscript<H>>(
                     vk,
                     instance_commitments,
                     pi,
@@ -181,7 +175,7 @@ plonk_api!(
 ///    breaking change to midnight_lib, and should change the ChangeLog
 ///    accordingly. To update the VK, re-run the example with
 ///    CHANGE_VK=BREAKING.
-pub fn check_vk<Relation: Circuit<midnight_curves::Fq>>(vk: &MidnightVK) {
+pub fn check_vk<Relation: Circuit<midnight_curves::Fq>>(vk: &MidnightVK<KZG>) {
     let circuit_name = std::any::type_name::<Relation>()
         .split("::")
         .last()
@@ -234,8 +228,9 @@ pub fn check_vk<Relation: Circuit<midnight_curves::Fq>>(vk: &MidnightVK) {
     }
 }
 
-/// Updates the circuit goldenfiles.
-pub fn update_circuit_goldenfiles<R: Relation>(relation: &R) {
+/// Updates the circuit goldenfiles, with a committed instance if
+/// `has_committed_instance`.
+pub fn update_circuit_goldenfiles<R: Relation>(relation: &R, has_committed_instance: bool) {
     let circuit_name = std::any::type_name::<R>()
         .split("::")
         .last()
@@ -248,8 +243,12 @@ pub fn update_circuit_goldenfiles<R: Relation>(relation: &R) {
     let path = Path::new(&file_name);
     let mut f =
         File::create(path).unwrap_or_else(|_| panic!("Could not create file {}", file_name));
-    writeln!(f, "{:#?}", cost_model(relation, None))
-        .unwrap_or_else(|_| panic!("Could not write to file {}", file_name));
+    writeln!(
+        f,
+        "{:#?}",
+        cost_model::<_, KZG>(relation, None, has_committed_instance)
+    )
+    .unwrap_or_else(|_| panic!("Could not write to file {}", file_name));
 }
 
 /// Available SRS sources.
@@ -258,28 +257,12 @@ pub enum SrsSource {
     Midnight,
 }
 
-/// Loads an SRS (over BLS12-381) for the given circuit size `k` and
-/// constraint-system degree `cs_degree`.
-///
-/// The monomial basis is sized via the active PCS's
-/// [`PolynomialCommitmentScheme::srs_monomial_blowup`]: a blow-up factor of
-/// `1` keeps the monomial basis at the Lagrange size `2^k`; a blow-up of `B`
-/// extends it to `2^k · B`. The Lagrange basis stays at size `2^k`.
-pub fn load_srs(source: SrsSource, k: u32, cs_degree: usize) -> ParamsKZG<Bls12> {
-    let fetch = |k| match source {
-        SrsSource::Filecoin => filecoin_srs(k),
-        SrsSource::Midnight => midnight_srs(k),
-    };
-
-    let blowup = <KZGCommitmentScheme<Bls12>>::srs_monomial_blowup(cs_degree);
-    assert_ne!(blowup, 0, "srs blowup should be >= 1");
-    let base = fetch(k);
-    if blowup == 1 {
-        base
-    } else {
-        let extended_k = k + (blowup as f64).log2().ceil() as u32;
-        let extended = fetch(extended_k);
-        base.with_extended_monomial(extended)
+/// Loads an SRS (over BLS12-381) for circuits of size `2^k` under the
+/// commitment scheme `PCS`.
+pub fn load_srs<PCS: MidnightPCS>(source: SrsSource, k: u32) -> ParamsKZG<Bls12> {
+    match source {
+        SrsSource::Filecoin => filecoin_srs::<PCS>(k),
+        SrsSource::Midnight => midnight_srs::<PCS>(k),
     }
 }
 
@@ -287,45 +270,52 @@ pub fn load_srs(source: SrsSource, k: u32, cs_degree: usize) -> ParamsKZG<Bls12>
 /// If `k` is `None`, the optimal circuit size is derived automatically.
 pub fn srs_for_test<R: Relation>(relation: &R, k: Option<u32>) -> ParamsKZG<Bls12> {
     let k = k.unwrap_or_else(|| optimal_k(relation));
-    let cs_degree = cost_model(relation, Some(k)).max_deg;
-    load_srs(SrsSource::Filecoin, k, cs_degree)
+    load_srs::<KZG>(SrsSource::Filecoin, k)
 }
 
-/// Loads Midnight's production SRS (over BLS12-381) for the given circuit
-/// size `k` (log2 of the number of rows).
+/// Loads Midnight's production SRS (over BLS12-381) for circuits of size `2^k`
+/// under the commitment scheme `PCS`.
 ///
-/// The SRS files are expected at `$SRS_DIR/midnight-srs-2p<k>`.
+/// The SRS files are expected at `$SRS_DIR/midnight-srs-2p<j>`, for
+/// `j = PCS::srs_k(k)`.
 ///
 /// For checksums and extra validation steps, see `MIDNIGHT_SRS_CATALOG.md` in
 /// the official repository of the Midnight trusted ceremony:
 /// <https://github.com/midnightntwrk/midnight-trusted-setup>
-fn midnight_srs(k: u32) -> ParamsKZG<Bls12> {
+fn midnight_srs<PCS: MidnightPCS>(k: u32) -> ParamsKZG<Bls12> {
+    let j = PCS::srs_k(k);
     let srs_dir = env::var("SRS_DIR").unwrap_or("./examples/assets".into());
-    let srs_path = format!("{srs_dir}/midnight-srs-2p{k}");
+    let srs_path = format!("{srs_dir}/midnight-srs-2p{j}");
 
     let params_fs = File::open(Path::new(&srs_path)).unwrap_or_else(|_| {
         panic!(
             "\nSRS file not found at {srs_path}. Download it with:\
              \n\n    curl -L -o {srs_path} \
-             https://srs.midnight.network/midnight-srs-2p{k}\n"
+             https://srs.midnight.network/midnight-srs-2p{j}\n"
         )
     });
 
-    ParamsKZG::read_custom::<_>(
+    PCS::load_params(
         &mut BufReader::new(params_fs),
         SerdeFormat::RawBytesUnchecked,
+        k,
     )
     .expect("Failed to read SRS params")
 }
 
-/// Loads Filecoin's production SRS (over BLS12-381) for the given circuit
-/// size `k` (log2 of the number of rows).
-fn filecoin_srs(k: u32) -> ParamsKZG<Bls12> {
-    assert!(k <= 19, "We don't have an SRS for circuits of bit size {k}");
+/// Loads Filecoin's production SRS (over BLS12-381) for circuits of size `2^k`
+/// under the commitment scheme `PCS`.
+///
+/// The SRS is read from `$SRS_DIR/bls_filecoin_2p<j>`, for `j = PCS::srs_k(k)`.
+/// If that file is missing, it is downsized from `bls_filecoin_2p19` and
+/// written there.
+fn filecoin_srs<PCS: MidnightPCS>(k: u32) -> ParamsKZG<Bls12> {
+    let j = PCS::srs_k(k);
+    assert!(j <= 19, "We don't have an SRS of size 2^{j}");
 
     let srs_dir = env::var("SRS_DIR").unwrap_or("./examples/assets".into());
 
-    let srs_path = format!("{srs_dir}/bls_filecoin_2p{k:?}");
+    let srs_path = format!("{srs_dir}/bls_filecoin_2p{j:?}");
     let mut fetching_path = srs_path.clone();
 
     let downsize = !Path::new(fetching_path.as_str()).exists();
@@ -345,15 +335,14 @@ or, if you don't trust the source, download it from IPFS and parse it (this migh
             * Run the binary to parse it `cargo run --example parse_filecoin_srs --release`
         \n"));
 
-    let mut params = ParamsKZG::read_custom::<_>(
+    let params = PCS::load_params(
         &mut BufReader::new(params_fs),
         SerdeFormat::RawBytesUnchecked,
+        k,
     )
     .expect("Failed to read params");
 
     if downsize {
-        params.downsize(k);
-
         let mut buf = Vec::new();
 
         params

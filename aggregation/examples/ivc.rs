@@ -8,12 +8,11 @@
 use std::time::Instant;
 
 use ff::Field;
-use midnight_aggregation::ivc::{self, IvcCircuit, IvcContext, IvcIO, IvcState, IvcTransition};
+use midnight_aggregation::ivc::{self, IvcContext, IvcIO, IvcState, IvcTransition, PCS};
 use midnight_circuits::{
     hash::poseidon::PoseidonChip,
     instructions::{hash::HashCPU, *},
     types::AssignedNative,
-    verifier::{BlstrsEmulation, SelfEmulation},
 };
 use midnight_proofs::{
     circuit::{Layouter, Value},
@@ -24,8 +23,7 @@ use midnight_zk_stdlib::{
     utils::plonk_api::{SrsSource, load_srs},
 };
 
-type S = BlstrsEmulation;
-type F = <S as SelfEmulation>::F;
+type F = midnight_curves::Fq;
 
 /// IVC state: a counter and a hash-chain value.
 ///
@@ -167,16 +165,12 @@ fn main() {
     // message will hint at a valid (but not necessarily optimal) value, e.g.
     // `keygen_vk should not fail: SrsError(14, 19)` means K = 19 works, but a
     // smaller K might too. Binary-search to find it.
-    const K: u32 = 17;
+    const K: u32 = 16;
 
-    const N: usize = 1_000; // Number of Poseidon iteration per IVC step.
+    const N: usize = 50; // Number of Poseidon iteration per IVC step.
     const STEPS: usize = 3; // Number of IVC steps to run.
 
-    let srs = load_srs(
-        SrsSource::Midnight,
-        K,
-        IvcCircuit::<PoseidonChain<N>>::cs_degree(),
-    );
+    let srs = load_srs::<PCS>(SrsSource::Midnight, K);
 
     let start = Instant::now();
     let (mut prover, verifier) = ivc::setup::<PoseidonChain<N>>(srs, K, ());

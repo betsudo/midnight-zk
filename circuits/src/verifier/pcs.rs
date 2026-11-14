@@ -20,12 +20,18 @@ use std::fmt::Debug;
 use midnight_proofs::{
     circuit::{Layouter, Value},
     plonk::Error,
-    poly::PolynomialLabel,
+    poly::{PolynomialLabel, commitment::PolynomialCommitmentScheme},
+    transcript::Hashable,
 };
 
 use crate::{
+    CircuitField,
     field::AssignedNative,
-    verifier::{AssignedAccumulator, SelfEmulation, transcript_gadget::TranscriptGadget},
+    types::{InnerValue, Instantiable},
+    verifier::{
+        ScalarChip,
+        transcript_gadget::{InCircuitHashable, InCircuitTranscript},
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -33,27 +39,43 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// An in-circuit verifier query: a commitment evaluated at a point.
+///
+/// `PCS` is the scheme checking the query, so that a PCS can query an inner
+/// one, as fflonk does with KZG.
 #[derive(Clone, Debug)]
-pub struct VerifierQuery<'a, S: SelfEmulation, PCS: InCircuitPCS<S>> {
-    pub(crate) point: AssignedNative<S::F>,
+pub struct VerifierQuery<'a, F: CircuitField, PCS: InCircuitPCS<F>> {
+    pub(crate) point: AssignedNative<F>,
     pub(crate) commitment: &'a PCS::AssignedCommitment,
     pub(crate) label: PolynomialLabel,
-    pub(crate) eval: AssignedNative<S::F>,
+    pub(crate) eval: AssignedNative<F>,
+    /// `Some((x, t))` if `point` is one of the `t`-th roots of `x`, and the
+    /// commitment is queried at all of them.
+    pub(crate) root_of: Option<(AssignedNative<F>, usize)>,
 }
 
-impl<'a, S: SelfEmulation, PCS: InCircuitPCS<S>> VerifierQuery<'a, S, PCS> {
+impl<'a, F: CircuitField, PCS: InCircuitPCS<F>> VerifierQuery<'a, F, PCS> {
     pub fn new(
-        point: &AssignedNative<S::F>,
+        point: &AssignedNative<F>,
         commitment: &'a PCS::AssignedCommitment,
         label: PolynomialLabel,
-        eval: &AssignedNative<S::F>,
+        eval: &AssignedNative<F>,
     ) -> Self {
         Self {
             point: point.clone(),
             commitment,
             label,
             eval: eval.clone(),
+            root_of: None,
         }
+    }
+
+    /// Marks `self.point` as one of the `t`-th roots of `x`.
+    ///
+    /// The caller guarantees that the commitment is queried at all `t` roots of
+    /// `x`, and that `point^t = x` is constrained.
+    pub(crate) fn with_root_of(mut self, x: &AssignedNative<F>, t: usize) -> Self {
+        self.root_of = Some((x.clone(), t));
+        self
     }
 }
 
@@ -61,65 +83,123 @@ impl<'a, S: SelfEmulation, PCS: InCircuitPCS<S>> VerifierQuery<'a, S, PCS> {
 // Traits
 // ---------------------------------------------------------------------------
 
-/// In-circuit operations on an additively homomorphic commitment.
-pub trait InCircuitHomomorphicCommitment<S: SelfEmulation>: Clone + Debug + Sized {
-    /// Scales this commitment by an assigned scalar.
-    fn mul(
-        self,
-        layouter: &mut impl Layouter<S::F>,
-        scalar_chip: &S::ScalarChip,
-        scalar: &AssignedNative<S::F>,
-    ) -> Result<Self, Error>;
-
-    /// Adds another commitment to this one.
-    fn add(
-        self,
-        layouter: &mut impl Layouter<S::F>,
-        scalar_chip: &S::ScalarChip,
-        other: Self,
-    ) -> Result<Self, Error>;
+/// An off-circuit commitment whose curve points can be read with the labels
+/// they carry.
+///
+/// Commitments in the in-circuit verifier are assumed to have this structure:
+/// a commitment is a list of curve points, each carrying a label. The labels
+/// are attached by the commitment scheme and need not be those of the
+/// committed polynomials: a scheme may commit to several polynomials together
+/// under a single label, such as a [`PolynomialLabel::Collection`] of theirs.
+/// The points of a verifying-key commitment are its fixed bases, collected by
+/// [`fixed_bases`](super::fixed_bases) under these labels.
+pub trait CommitmentBases<C> {
+    /// The (label, point) pairs of this commitment, in order.
+    ///
+    /// # Panics
+    ///
+    /// If the commitment is not made of labelled points only.
+    fn bases(&self) -> Vec<(PolynomialLabel, C)>;
 }
 
-/// In-circuit abstraction over a Polynomial Commitment Scheme.
+/// In-circuit verification of the proofs of an off-circuit Polynomial
+/// Commitment Scheme, implemented by the off-circuit scheme itself.
 ///
 /// Analog of [`midnight_proofs::poly::commitment::PolynomialCommitmentScheme`]
 /// for the in-circuit verifier.
-pub trait InCircuitPCS<S: SelfEmulation>: Sized + Clone + Debug {
-    /// The in-circuit type representing a committed polynomial.
-    type AssignedCommitment: InCircuitHomomorphicCommitment<S>;
+pub trait InCircuitPCS<F: CircuitField>:
+    PolynomialCommitmentScheme<F> + Sized + Clone + Debug
+{
+    /// The chip this scheme operates on its commitments with.
+    type CommitmentChip: Clone;
 
-    /// Creates a fixed (VK-embedded) commitment identified by `label`.
-    fn fixed_commitment(label: PolynomialLabel) -> Self::AssignedCommitment;
+    /// The in-circuit type representing a committed polynomial, whose
+    /// off-circuit value is a commitment of this scheme.
+    type AssignedCommitment: Clone
+        + Debug
+        + Instantiable<F>
+        + InnerValue<Element = <Self as PolynomialCommitmentScheme<F>>::Commitment>
+        + InCircuitHashable<F, Chip = Self::CommitmentChip, Shape = [PolynomialLabel]>;
 
-    /// Assigns a commitment from an off-circuit curve point.
+    /// The in-circuit counterpart of the scheme's verification guard,
+    /// produced by [`Self::multi_prepare`].
+    type AssignedVerificationGuard: Clone + Debug;
+
+    /// Creates the fixed (VK-embedded) commitment to the group of `labels`.
+    ///
+    /// The labels are matched to the group's polynomials in the order given,
+    /// as in [`Self::read_commitment`]. Its points carry the labels given by
+    /// [`Self::fixed_base_labels`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a label is repeated.
+    fn fixed_commitment(labels: &[PolynomialLabel]) -> Self::AssignedCommitment;
+
+    /// The labels of the curve points making up [`Self::fixed_commitment`] for
+    /// the group of `labels`, in order.
+    ///
+    /// Commitments are assumed to be made of labelled curve points, whose
+    /// labels may differ from those of the committed polynomials (see
+    /// [`CommitmentBases`]). These are the keys of
+    /// [`fixed_bases`](super::fixed_bases) for this group.
+    fn fixed_base_labels(labels: &[PolynomialLabel]) -> Vec<PolynomialLabel>;
+
+    /// Assigns the commitment to the group of `labels` from its off-circuit
+    /// value. As in [`Self::read_commitment`], its points are not checked to be
+    /// in the prime-order subgroup.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a label is repeated or if `value` does not commit to
+    /// `|labels|` polynomials.
     fn assign_commitment(
-        layouter: &mut impl Layouter<S::F>,
-        curve_chip: &S::CurveChip,
-        value: Value<S::C>,
-        label: PolynomialLabel,
+        layouter: &mut impl Layouter<F>,
+        commitment_chip: &Self::CommitmentChip,
+        value: Value<<Self::AssignedCommitment as InnerValue>::Element>,
+        labels: &[PolynomialLabel],
     ) -> Result<Self::AssignedCommitment, Error>;
 
     /// Reads one commitment to `labels.len()` polynomials from the proof
     /// transcript, tagging each polynomial with its label.
-    fn read_commitment(
-        transcript: &mut TranscriptGadget<S>,
-        layouter: &mut impl Layouter<S::F>,
+    fn read_commitment<T>(
+        layouter: &mut impl Layouter<F>,
+        commitment_chip: &Self::CommitmentChip,
+        transcript: &mut T,
         labels: &[PolynomialLabel],
-    ) -> Result<Self::AssignedCommitment, Error>;
+    ) -> Result<Self::AssignedCommitment, Error>
+    where
+        Self::Commitment: Hashable<T::Hash>,
+        T: InCircuitTranscript<F>;
 
-    /// Absorbs a commitment into the proof transcript.
-    fn common_commitment(
-        transcript: &mut TranscriptGadget<S>,
-        layouter: &mut impl Layouter<S::F>,
-        commitment: &Self::AssignedCommitment,
-    ) -> Result<(), Error>;
+    /// Squeezes the point at which the protocol opens its committed
+    /// polynomials; the default squeezes a plain challenge. Mirrors
+    /// [`midnight_proofs::poly::commitment::PolynomialCommitmentScheme::squeeze_evaluation_point`].
+    fn squeeze_evaluation_point<T: InCircuitTranscript<F>>(
+        layouter: &mut impl Layouter<F>,
+        _scalar_chip: &ScalarChip<F>,
+        transcript: &mut T,
+    ) -> Result<AssignedNative<F>, Error> {
+        transcript.squeeze_challenge(layouter)
+    }
 
-    /// In-circuit multi-open verification; produces an accumulator.
-    fn multi_prepare(
-        layouter: &mut impl Layouter<S::F>,
-        curve_chip: &S::CurveChip,
-        scalar_chip: &S::ScalarChip,
-        transcript: &mut TranscriptGadget<S>,
-        queries: &[VerifierQuery<'_, S, Self>],
-    ) -> Result<AssignedAccumulator<S>, Error>;
+    /// The labels `commitment` tags its polynomials with. Mirrors
+    /// [`midnight_proofs::poly::commitment::PolynomialCommitmentScheme::commitment_labels`].
+    fn commitment_labels(commitment: &Self::AssignedCommitment) -> Vec<PolynomialLabel>;
+
+    /// In-circuit multi-open verification; produces a verification guard.
+    fn multi_prepare<T>(
+        layouter: &mut impl Layouter<F>,
+        commitment_chip: &Self::CommitmentChip,
+        scalar_chip: &ScalarChip<F>,
+        queries: &[VerifierQuery<'_, F, Self>],
+        transcript: &mut T,
+    ) -> Result<Self::AssignedVerificationGuard, Error>
+    where
+        F: Hashable<T::Hash>,
+        Self::Commitment: Hashable<T::Hash>,
+        T: InCircuitTranscript<F>;
 }
+
+/// The in-circuit commitment type of `PCS`.
+pub type AssignedCommitment<F, PCS> = <PCS as InCircuitPCS<F>>::AssignedCommitment;

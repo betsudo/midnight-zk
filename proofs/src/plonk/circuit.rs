@@ -17,7 +17,7 @@ use crate::{
     circuit::{Layouter, Region, RegionStart, Value, layouter::SyncDeps},
     dev::metadata,
     plonk::trash::Argument,
-    poly::Rotation,
+    poly::{PolynomialLabel, Rotation},
     utils::rational::Rational,
 };
 
@@ -1510,26 +1510,6 @@ impl<F: Field> Gate<F> {
     }
 }
 
-/// Type for tracking information about selectors.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SelectorFlag(bool, Option<usize>);
-
-impl SelectorFlag {
-    /// Returns `true` if this selector flag tracks a simple selector, `false`
-    /// otherwise.
-    pub fn is_simple(&self) -> bool {
-        self.0
-    }
-
-    /// Returns an [Option] containing
-    ///  * the column index of this selector after it has been converted to a
-    ///    fixed column,
-    ///  * `None` otherwise.
-    pub fn col_idx(&self) -> Option<usize> {
-        self.1
-    }
-}
-
 /// This is a description of the circuit environment, such as the gate, column
 /// and permutation arrangements.
 #[derive(Debug, Clone)]
@@ -1538,7 +1518,6 @@ pub struct ConstraintSystem<F: Field> {
     pub(crate) num_advice_columns: usize,
     pub(crate) num_instance_columns: usize,
     pub(crate) num_selectors: usize,
-    pub(crate) selector_flags: Vec<SelectorFlag>,
 
     /// Contains the index of each advice column that is left unblinded.
     pub(crate) unblinded_advice_columns: Vec<usize>,
@@ -1649,7 +1628,6 @@ impl<F: Field> Default for ConstraintSystem<F> {
             num_advice_columns: 0,
             num_instance_columns: 0,
             num_selectors: 0,
-            selector_flags: vec![],
             unblinded_advice_columns: Vec::new(),
             gates: vec![],
             fixed_queries: Vec::new(),
@@ -1667,19 +1645,6 @@ impl<F: Field> Default for ConstraintSystem<F> {
 }
 
 impl<F: Field> ConstraintSystem<F> {
-    /// Returns `true` if this constraint system contains a [SelectorFlag] of a
-    /// simple selector with the given column index.
-    pub fn has_simple_selector_col(&self, col_idx: usize) -> bool {
-        self.selector_flags
-            .iter()
-            .any(|f| f.is_simple() && f.col_idx() == Some(col_idx))
-    }
-
-    /// Returns the number of [SelectorFlag]s that track simple selectors.
-    pub fn num_simple_selectors(&self) -> usize {
-        self.selector_flags.iter().filter(|f| f.is_simple()).count()
-    }
-
     /// Obtain a pinned version of this constraint system; a structure with the
     /// minimal parameters needed to determine the rest of the constraint
     /// system.
@@ -1965,6 +1930,22 @@ impl<F: Field> ConstraintSystem<F> {
         });
     }
 
+    /// Replaces every selector with a fixed column, as keygen does, without
+    /// computing the selector polynomials. The result is the constraint system
+    /// held by a verifying key of this circuit.
+    ///
+    /// # Panics
+    ///
+    /// If the selectors of `self` have already been converted to fixed columns.
+    pub fn into_finalized(self) -> Self {
+        assert!(
+            self.num_selectors > 0 || self.gates.iter().all(|g| g.queried_selectors.is_empty()),
+            "the selectors of the constraint system have already been converted to fixed columns"
+        );
+        let fake_selectors = vec![vec![]; self.num_selectors];
+        self.directly_convert_selectors_to_fixed(fake_selectors).0
+    }
+
     /// Does not combine selectors and directly replaces them everywhere with
     /// fixed columns.
     pub fn directly_convert_selectors_to_fixed(
@@ -1975,17 +1956,12 @@ impl<F: Field> ConstraintSystem<F> {
         // counted for this constraint system.
         assert_eq!(selectors.len(), self.num_selectors);
 
-        let nr_fixed_columns = self.num_fixed_columns();
         let (polys, selector_replacements): (Vec<_>, Vec<_>) = selectors
             .into_iter()
-            .enumerate()
-            .map(|(idx, selector)| {
+            .map(|selector| {
                 let poly =
                     selector.iter().map(|b| if *b { F::ONE } else { F::ZERO }).collect::<Vec<_>>();
                 let column = self.fixed_column();
-                if self.selector_flags[idx].is_simple() {
-                    self.selector_flags[idx] = SelectorFlag(true, Some(column.index()));
-                }
                 let rotation = Rotation::cur();
                 let expr = Expression::Fixed(FixedQuery {
                     index: Some(self.query_fixed_index(column, rotation)),
@@ -1998,15 +1974,6 @@ impl<F: Field> ConstraintSystem<F> {
 
         self.replace_selectors_with_fixed(&selector_replacements);
         self.num_selectors = 0;
-
-        // Adjust indices of simple, multiplicative selectors: after converting
-        // selectors to fixed columns, the selector index of a gate should now
-        // track the index of the corresponding fixed column
-        for gate in self.gates.iter_mut() {
-            for s in &mut gate.queried_selectors {
-                s.0 += nr_fixed_columns;
-            }
-        }
 
         (self, polys)
     }
@@ -2076,7 +2043,6 @@ impl<F: Field> ConstraintSystem<F> {
     pub fn selector(&mut self) -> Selector {
         let index = self.num_selectors;
         self.num_selectors += 1;
-        self.selector_flags.push(SelectorFlag(true, None));
         Selector(index, true)
     }
 
@@ -2085,7 +2051,6 @@ impl<F: Field> ConstraintSystem<F> {
     pub fn complex_selector(&mut self) -> Selector {
         let index = self.num_selectors;
         self.num_selectors += 1;
-        self.selector_flags.push(SelectorFlag(false, None));
         Selector(index, false)
     }
 
@@ -2288,6 +2253,21 @@ impl<F: Field> ConstraintSystem<F> {
     /// Returns advice queries
     pub fn advice_queries(&self) -> &Vec<(Column<Advice>, Rotation)> {
         &self.advice_queries
+    }
+
+    /// The labels of the advice columns, in column order.
+    pub(crate) fn advice_labels(&self) -> Vec<PolynomialLabel> {
+        (0..self.num_advice_columns).map(PolynomialLabel::Advice).collect()
+    }
+
+    /// The labels of the polynomials committed to in the verifying key as one
+    /// group: every fixed column, then the fixed permutation polynomials, in
+    /// their `Ord` order.
+    pub fn fixed_polys_labels(&self) -> Vec<PolynomialLabel> {
+        (0..self.num_fixed_columns)
+            .map(PolynomialLabel::Fixed)
+            .chain(self.permutation.polynomial_labels())
+            .collect()
     }
 
     /// Returns instance queries

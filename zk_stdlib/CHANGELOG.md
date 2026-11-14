@@ -8,6 +8,15 @@ We use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 ### Added
+### Changed
+* Point `sha3-circuit` at a revision that requires `midnight-proofs` and `midnight-curves` by crates.io version instead of from the midnight-zk main branch, so that crates patching them to a midnight-zk tag get a single copy of each
+### Removed
+
+## [3.0.0-rc.1]
+### Added
+* `ZkStdLib::verifier_transcript`, the in-circuit transcript of the proofs verified with `ZkStdLib::verifier`, and `ZkStdLib::poseidon_chip` [#638](https://github.com/midnightntwrk/midnight-zk/pull/638)
+* Improved SRS loading for tests [#276](https://github.com/midnightntwrk/midnight-zk/pull/276)
+* Expose the Merkle Mountain Range gadget through `ZkStdLib::mmr` [#509](https://github.com/midnightntwrk/midnight-zk/pull/509)
 * `single-h-commitment` feature and improved SRS loading for tests [#276](https://github.com/midnightntwrk/midnight-zk/pull/276)
 * Added an example verifying an ethereum signature [#177](https://github.com/midnightntwrk/midnight-zk/pull/177)
 * `setup_vk_with_k` for generating a verifying key with an explicit circuit size parameter [#227](https://github.com/midnightntwrk/midnight-zk/pull/227)
@@ -15,13 +24,29 @@ We use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Add `square`, `mod_square` operations in `BigUintGadget` [#259](https://github.com/midnightntwrk/midnight-zk/pull/259)
 * Add `PartialEq` impl for `AssignedBigUint` [#259](https://github.com/midnightntwrk/midnight-zk/pull/259)
 * BREAKING: Implemented linearization prover [#190](https://github.com/midnightntwrk/midnight-zk/pull/190)
+* `DefaultPCS`, the polynomial commitment scheme of zk_stdlib, currently `KZGCommitmentScheme<Bls12>` [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `MidnightPCS`, the catalog of the polynomial commitment schemes supported by zk_stdlib (KZG and fflonk over KZG), with `srs_k`, the size of the SRS for a given circuit size [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `KZG` and `FflonkKZG<LOG2_T_MAX>` (`LOG2_T_MAX` in `1..=4`), the closed catalog of commitment schemes selectable through `MidnightPCS`, and `MidnightPCS::ID`, which identifies them in serialized keys
 
 ### Fixed
 * Fix cost model proof size check to account for committed instance columns [#280](https://github.com/midnightntwrk/midnight-zk/pull/280)
+* `MidnightVK::read` and `MidnightPK::read` reject a `k` outside `1..=F::S` instead of underflowing on `k = 0` [#581](https://github.com/midnightntwrk/midnight-zk/pull/581)
 
 ### Changed
+* BREAKING: `ZkStdLib::verifier::<PCS>()` returns a `VerifierGadget<F, PCS>`, and `MidnightPCS` requires `InCircuitPCS<Fq>` with `CurveChip<Bls12>` as its commitment chip and `AssignedAccumulator<Bls12>` as its verification guard [#638](https://github.com/midnightntwrk/midnight-zk/pull/638)
+* BREAKING: `MidnightVK`, `MidnightPK`, `setup_vk`, `setup_pk`, `prove`, `verify`, `batch_verify` and `cost_model` are generic over the commitment scheme `PCS: MidnightPCS`, which must be given explicitly (e.g. `setup_vk::<_, KZG>`). Serialized verifying keys record their PCS and fail to read under another one. Their format version is 3, and `MidnightVK::read` and `ZkStdLibArch::read` reject other versions, which belong to other proof systems
+* BREAKING: `ZkStdLib::verifier::<PCS>()` is generic over `PCS: MidnightPCS` and verifies proofs committed with `PCS`, which `MidnightPCS` requires to implement `InCircuitPCS<BlstrsEmulation>`. It returns a `VerifierGadget<BlstrsEmulation, PCS>` by value
+* BREAKING: serialized `MidnightPK`s record their PCS, as `MidnightVK`s do, and fail to read under another one
+* Update the golden files following the quotient limbs of `midnight-proofs` being committed to as one group and opened one by one, which changes the proofs [#582](https://github.com/midnightntwrk/midnight-zk/pull/582)
+* `prove` passes the committed-instance column of a relation without a committed instance as an empty instance column, so it is neither committed to nor opened and the proof shrinks by one scalar. `verify` and `batch_verify` take it the same way when given no committed instance [#569](https://github.com/midnightntwrk/midnight-zk/pull/569)
+* `cost_model` and `update_circuit_goldenfiles` take whether the relation has a committed instance [#569](https://github.com/midnightntwrk/midnight-zk/pull/569)
+* `Relation::format_committed_instances` returns an `Option`, `None` for a relation without a committed instance [#569](https://github.com/midnightntwrk/midnight-zk/pull/569)
+* BREAKING: `load_srs::<PCS>` is generic over a `MidnightPCS`: it loads the SRS of size `2^PCS::srs_k(k)` through `PCS::load_params` [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `setup_vk` derives the circuit size from `DefaultPCS::max_k` [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* BREAKING: Update the verifying keys following the removal of the linearization in `midnight-proofs` [#566](https://github.com/midnightntwrk/midnight-zk/pull/566)
+* Update `cardano_signature` example to match the new `ForeignEdwardsEccChip::from_canonical_compressed_bytes` signature [#540](https://github.com/midnightntwrk/midnight-zk/pull/540)
+* Update the verifying keys following the new verifying-key layout of `midnight-proofs`, which commits to the fixed columns as one group [#547](https://github.com/midnightntwrk/midnight-zk/pull/547)
 * Migrate to Rust edition 2024; declare MSRV 1.90. Both are now inherited from the workspace [#508](https://github.com/midnightntwrk/midnight-zk/pull/508)
-* `load_srs` sizes the monomial basis via `PolynomialCommitmentScheme::srs_monomial_blowup` instead of a `single-h-commitment` `cfg` branch [#487](https://github.com/midnightntwrk/midnight-zk/pull/487)
 * `cost_model` passes `KZGCommitmentScheme<Bls12>` to `circuit_model`, removing the `COMMITMENT_BYTE_SIZE`/`SCALAR_BYTE_SIZE` constants [#440](https://github.com/midnightntwrk/midnight-zk/pull/440)
 * `verify` now takes `committed_instance: Option<KZGMultiCommitment<Bls12>>` instead of `Option<G1Affine>`, avoiding a commitment→point→commitment round-trip at call sites [#450](https://github.com/midnightntwrk/midnight-zk/pull/450)
 * Adapt to new `KZGCommitment` API [#381](https://github.com/midnightntwrk/midnight-zk/pull/381)
@@ -34,6 +59,43 @@ We use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Parallelise batch_verifier [#236](https://github.com/midnightntwrk/midnight-zk/pull/236)
 
 ### Removed
+* BREAKING: `DefaultPCS`. Use `KZG` [#634](https://github.com/midnightntwrk/midnight-zk/pull/634)
+* BREAKING: `assign_as_public_input` on `ZkStdLib` and its chips. Use `assign` followed by `constrain_as_public_input` [#619](https://github.com/midnightntwrk/midnight-zk/pull/619)
+* `truncated-challenges` feature; challenges are always truncated [#580](https://github.com/midnightntwrk/midnight-zk/pull/580)
+* `single-h-commitment` feature [#560](https://github.com/midnightntwrk/midnight-zk/pull/560)
+* `Clone` on `MidnightPK`, which holds a proving key, no longer `Clone` [#537](https://github.com/midnightntwrk/midnight-zk/pull/537)
+
+## [2.4.0]
+### Changed
+* Bump `midnight-circuits` to 7.3.0 [#614](https://github.com/midnightntwrk/midnight-zk/pull/614)
+* `assign_as_public_input` always performs the in-circuit checks of `assign` (affects the VKs of relations with byte, Jubjub point or BLS12-381 point public inputs) [#598](https://github.com/midnightntwrk/midnight-zk/pull/598)
+* `DivisionInstructions::div_rem` and `rem` panic when `divisor * (dividend_bound / divisor + 1)` exceeds the field modulus, in particular when no bound is given; `DivisionInstructions` is deprecated [#606](https://github.com/midnightntwrk/midnight-zk/pull/606)
+* Examples use `EccInstructions::x` and `y` instead of the deprecated `x_coordinate` and `y_coordinate`, asserting that secp256k1 points are not the identity (affects the VKs of the Bitcoin signature and credential examples) [#612](https://github.com/midnightntwrk/midnight-zk/issues/612)
+* In-circuit `as_public_input` of Jubjub scalars encodes the canonical value, as `Instantiable::as_public_input` does (affects the VKs of relations with Jubjub scalar public inputs) [#611](https://github.com/midnightntwrk/midnight-zk/pull/611)
+
+## [2.3.5]
+### Changed
+* Bump `midnight-circuits` to 7.2.4 [#485](https://github.com/midnightntwrk/midnight-zk/pull/485)
+
+## [2.3.4]
+### Changed
+* Bump `midnight-circuits` to 7.2.3 and `midnight-proofs` to 0.8.2 for the verifier per-proof length check [#482](https://github.com/midnightntwrk/midnight-zk/pull/482)
+
+## [2.3.3]
+### Changed
+* Display the underlying error message in `Relation::circuit` synthesis errors [#452](https://github.com/midnightntwrk/midnight-zk/pull/452)
+
+## [2.3.2]
+### Changed
+* Bump `midnight-circuits` to 7.2.2 [451](https://github.com/midnightntwrk/midnight-zk/pull/451)
+
+## [2.3.1]
+### Fixed
+* Bug fix in midnight-curves [#434](https://github.com/midnightntwrk/midnight-zk/pull/434)
+
+## [2.3.0]
+### Added
+* `Instantiable::from_public_input`: inverse of `as_public_input` for decoding values from their public input representation [#408](https://github.com/midnightntwrk/midnight-zk/pull/408)
 
 ## [2.2.0]
 ### Changed

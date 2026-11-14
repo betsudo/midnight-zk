@@ -602,7 +602,7 @@ where
         )?;
 
         // Save the assigned constant in the cache.
-        self.cached_fixed.borrow_mut().insert(constant_big.clone(), x.clone());
+        self.cached_fixed.borrow_mut().insert(constant_big, x.clone());
 
         Ok(x)
     }
@@ -651,17 +651,6 @@ where
         layouter.constrain_instance(assigned.cell(), self.config.instance_col, *offset)?;
         *offset += 1;
         Ok(())
-    }
-
-    fn assign_as_public_input(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        value: Value<F>,
-    ) -> Result<AssignedNative<F>, Error> {
-        // There is nothing to optimize when assigning a public native value.
-        let assigned = self.assign(layouter, value)?;
-        self.constrain_as_public_input(layouter, &assigned)?;
-        Ok(assigned)
     }
 }
 
@@ -739,18 +728,6 @@ where
     ) -> Result<(), Error> {
         let assigned_as_native: AssignedNative<F> = assigned.clone().into();
         self.constrain_as_public_input(layouter, &assigned_as_native)
-    }
-
-    fn assign_as_public_input(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        value: Value<bool>,
-    ) -> Result<AssignedBit<F>, Error> {
-        // We could skip the in-circuit boolean assertion as this condition will be
-        // enforced through the public inputs bind anyway. But this takes 1 row anyway.
-        let assigned = self.assign(layouter, value)?;
-        self.constrain_as_public_input(layouter, &assigned)?;
-        Ok(assigned)
     }
 }
 

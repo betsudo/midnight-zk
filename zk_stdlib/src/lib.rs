@@ -16,6 +16,7 @@
 mod external;
 mod instructions;
 pub mod interface;
+pub mod pcs;
 pub mod utils;
 
 use std::{cell::RefCell, cmp::max, convert::TryInto, fmt::Debug, io, rc::Rc};
@@ -35,7 +36,8 @@ use midnight_circuits::{
                 ForeignEdwardsEccChip, ForeignEdwardsEccConfig, nb_foreign_edwards_chip_columns,
             },
             weierstrass_chip::{
-                ForeignWeierstrassEccChip, ForeignWeierstrassEccConfig, nb_foreign_ecc_chip_columns,
+                ForeignWeierstrassEccChip, ForeignWeierstrassEccConfig,
+                NB_FOREIGN_WEIERSTRASS_FIXED_COLS, nb_foreign_ecc_chip_columns,
             },
         },
         hash_to_curve::HashToCurveGadget,
@@ -65,13 +67,14 @@ use midnight_circuits::{
     },
     instructions::{hash::VarHashInstructions, *},
     map::map_gadget::MapGadget,
+    mmr::mmr_gadget::MmrGadget,
     parsing::{
         self, Base64Chip, Base64Config, NB_BASE64_ADVICE_COLS, ParserGadget,
         scanner::{NB_SCANNER_ADVICE_COLS, NB_SCANNER_FIXED_COLS, ScannerChip, ScannerConfig},
     },
     types::{AssignedBit, AssignedByte, AssignedNative, AssignedNativePoint, ComposableChip},
     vec::{AssignedVector, vector_gadget::VectorGadget},
-    verifier::{BlstrsEmulation, VerifierGadget},
+    verifier::{PoseidonTranscriptGadget, VerifierGadget},
 };
 use midnight_curves::{
     Fq,
@@ -83,6 +86,7 @@ use midnight_proofs::{
     circuit::Layouter,
     plonk::{ConstraintSystem, Error},
 };
+pub use pcs::*;
 
 use crate::external::{blake2b::Blake2bWrapper, keccak_sha3::KeccakSha3Wrapper};
 
@@ -109,10 +113,7 @@ type Curve25519BaseChip = FieldChip<F, curve25519_mod::Fp, MEP, NG>;
 type Curve25519ScalarChip = FieldChip<F, curve25519_mod::Scalar, MEP, NG>;
 type Curve25519Chip = ForeignEdwardsEccChip<F, Curve25519, MEP, Curve25519ScalarChip, NG>;
 
-const ZKSTD_VERSION: u32 = 2;
-
-/// Number of instance columns given in committed form in a ZK stdlib proof.
-const NB_COMMITTED_INSTANCES: usize = 1;
+const ZKSTD_VERSION: u32 = 3;
 
 /// Architecture of the standard library. Specifies what chips need to be
 /// configured.
@@ -200,47 +201,6 @@ impl Default for ZkStdLibArch {
     }
 }
 
-/// Serialized layout of [`ZkStdLibArch`] as it existed in
-/// `midnight-zk-stdlib` v1.0.0 (ZKSTD_VERSION 1). Used only for migration
-/// when reading old serialized verifying keys.
-#[derive(Decode)]
-struct ZkStdLibArchV1 {
-    jubjub: bool,
-    poseidon: bool,
-    sha2_256: bool,
-    sha2_512: bool,
-    keccak_256: bool,
-    sha3_256: bool,
-    blake2b: bool,
-    secp256k1: bool,
-    bls12_381: bool,
-    base64: bool,
-    automaton: bool,
-    nr_pow2range_cols: u8,
-}
-
-impl From<ZkStdLibArchV1> for ZkStdLibArch {
-    fn from(v1: ZkStdLibArchV1) -> Self {
-        ZkStdLibArch {
-            jubjub: v1.jubjub,
-            poseidon: v1.poseidon,
-            sha2_256: v1.sha2_256,
-            sha2_512: v1.sha2_512,
-            keccak_256: v1.keccak_256,
-            sha3_256: v1.sha3_256,
-            blake2b: v1.blake2b,
-            secp256k1: v1.secp256k1,
-            p256: false,
-            bls12_381: v1.bls12_381,
-            curve25519: false,
-            base64: v1.base64,
-            automaton: v1.automaton,
-            nb_arith_cols: 5,
-            nr_pow2range_cols: v1.nr_pow2range_cols,
-        }
-    }
-}
-
 impl ZkStdLibArch {
     /// Writes the ZKStd architecture to a buffer.
     pub fn write<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -255,25 +215,28 @@ impl ZkStdLibArch {
         let mut version = [0u8; 4];
         reader.read_exact(&mut version)?;
         let version = u32::from_le_bytes(version);
-        match version {
-            1 => bincode::decode_from_std_read::<ZkStdLibArchV1, _, _>(reader, standard())
-                .map(ZkStdLibArch::from)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
-            2 => bincode::decode_from_std_read(reader, standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
-            _ => Err(io::Error::new(
+        if version != ZKSTD_VERSION {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Unsupported ZKStd version: {}", version),
-            )),
+                format!(
+                    "serialized format version {version} does not match \
+                     midnight-zk-stdlib {} (format version {ZKSTD_VERSION})",
+                    env!("CARGO_PKG_VERSION"),
+                ),
+            ));
         }
+        bincode::decode_from_std_read(reader, standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Reads the ZkStdLib architecture from a buffer where a MidnightVK was
     /// serialized. This enables the reader to know the architecture without
     /// the need of deserializing the full verifying key.
     pub fn read_from_serialized_vk<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        // The current serialization of the verifying key places the architecture at
-        // the beginning.
+        // The current serialization of the verifying key starts with the PCS id,
+        // followed by the architecture.
+        let mut pcs_id = [0u8; 1];
+        reader.read_exact(&mut pcs_id)?;
         Self::read(reader)
     }
 }
@@ -317,6 +280,7 @@ pub struct ZkStdLib {
     varlen_poseidon_gadget: Option<VarLenPoseidonGadget<F>>,
     htc_gadget: Option<HashToCurveGadget<F, C, AssignedNative<F>, PoseidonChip<F>, EccChip<C>>>,
     map_gadget: Option<MapGadget<F, NG, PoseidonChip<F>>>,
+    mmr_gadget: Option<MmrGadget<F, NG, PoseidonChip<F>>>,
     biguint_gadget: BigUintGadget<F, NG>,
     secp256k1_chip: Option<Secp256k1Chip>,
     p256_chip: Option<P256Chip>,
@@ -326,7 +290,6 @@ pub struct ZkStdLib {
     parser_gadget: ParserGadget<F, NG>,
     scanner_chip: Option<ScannerChip<F>>,
     vector_gadget: VectorGadget<F>,
-    verifier_gadget: Option<VerifierGadget<BlstrsEmulation>>,
 
     // Third-party chips.
     keccak_sha3_chip: Option<KeccakSha3Wrapper<F>>,
@@ -372,6 +335,9 @@ impl ZkStdLib {
         let map_gadget = poseidon_gadget
             .as_ref()
             .map(|poseidon_gadget| MapGadget::new(&native_gadget, poseidon_gadget));
+        let mmr_gadget = poseidon_gadget
+            .as_ref()
+            .map(|poseidon_gadget| MmrGadget::new(&native_gadget, poseidon_gadget));
         let secp256k1_scalar_chip = (config.secp256k1_scalar_config.as_ref())
             .map(|scalar_config| FieldChip::new(scalar_config, &native_gadget));
         let secp256k1_chip = (config.secp256k1_config.as_ref())
@@ -405,12 +371,6 @@ impl ZkStdLib {
             config.scanner_config.as_ref().map(|c| ScannerChip::new(c, &native_gadget));
         let vector_gadget = VectorGadget::new(&native_gadget);
 
-        let verifier_gadget = bls12_381_chip.as_ref().zip(poseidon_gadget.as_ref()).map(
-            |(curve_chip, sponge_chip)| {
-                VerifierGadget::<BlstrsEmulation>::new(curve_chip, &native_gadget, sponge_chip)
-            },
-        );
-
         let keccak_sha3_chip = config
             .keccak_sha3_config
             .as_ref()
@@ -430,6 +390,7 @@ impl ZkStdLib {
             poseidon_gadget,
             varlen_poseidon_gadget,
             map_gadget,
+            mmr_gadget,
             htc_gadget,
             biguint_gadget,
             secp256k1_chip,
@@ -440,7 +401,6 @@ impl ZkStdLib {
             parser_gadget,
             scanner_chip,
             vector_gadget,
-            verifier_gadget,
             keccak_sha3_chip,
             blake2b_chip,
             used_sha2_256: Rc::new(RefCell::new(false)),
@@ -511,6 +471,8 @@ impl ZkStdLib {
             arch.sha2_512 as usize * NB_SHA512_FIXED_COLS,
             (arch.keccak_256 || arch.sha3_256) as usize * PACKED_FIXED_COLS,
             arch.automaton as usize * NB_SCANNER_FIXED_COLS,
+            (arch.secp256k1 || arch.p256 || arch.bls12_381) as usize
+                * NB_FOREIGN_WEIERSTRASS_FIXED_COLS,
         ]
         .into_iter()
         .max()
@@ -593,6 +555,7 @@ impl ZkStdLib {
                 meta,
                 &base_config,
                 &advice_columns,
+                &fixed_columns,
                 nb_parallel_range_checks,
                 max_bit_len,
             )
@@ -613,6 +576,7 @@ impl ZkStdLib {
                 meta,
                 &base_config,
                 &advice_columns,
+                &fixed_columns,
                 nb_parallel_range_checks,
                 max_bit_len,
             )
@@ -629,6 +593,7 @@ impl ZkStdLib {
                 meta,
                 &base_config,
                 &advice_columns,
+                &fixed_columns,
                 nb_parallel_range_checks,
                 max_bit_len,
             )
@@ -739,6 +704,34 @@ impl ZkStdLib {
             .unwrap_or_else(|| panic!("ZkStdLibArch must enable poseidon"))
     }
 
+    /// Gadget for Merkle Mountain Range (MMR) operations, hashing with
+    /// Poseidon.
+    ///
+    /// ```
+    /// # midnight_zk_stdlib::run_test_stdlib!(chip, layouter, 13, {
+    /// use midnight_circuits::{hash::poseidon::PoseidonChip, mmr::cpu::Mmr};
+    ///
+    /// let mut mmr = Mmr::<F, PoseidonChip<F>, 5>::new();
+    /// (0..7u64).for_each(|i| mmr.append(F::from(i)));
+    ///
+    /// let mmr_gadget = chip.mmr();
+    /// let state = mmr_gadget.assign(layouter, Value::known(mmr.state()))?;
+    /// let elem: AssignedNative<F> = chip.assign(layouter, Value::known(F::from(3)))?;
+    /// let proof =
+    ///     mmr_gadget.assign_membership_proof(layouter, Value::known(mmr.prove_membership(3)))?;
+    /// mmr_gadget.assert_membership(layouter, &state, &elem, &proof)?;
+    ///
+    /// // The same claim as a bit, for composing with other checks.
+    /// let ok = mmr_gadget.is_member(layouter, &state, &elem, &proof)?;
+    /// chip.assert_equal_to_fixed(layouter, &ok, true)?;
+    /// # });
+    /// ```
+    pub fn mmr(&self) -> &MmrGadget<F, NG, PoseidonChip<F>> {
+        self.mmr_gadget
+            .as_ref()
+            .unwrap_or_else(|| panic!("ZkStdLibArch must enable poseidon"))
+    }
+
     /// Chip for performing in-circuit operations over the Secp256k1 curve, its
     /// scalar field or its base field.
     pub fn secp256k1(&self) -> &Secp256k1Chip {
@@ -800,13 +793,27 @@ impl ZkStdLib {
         (self.scanner_chip.as_ref()).unwrap_or_else(|| panic!("ZkStdLibArch must enable automaton"))
     }
 
-    /// Chip for performing in-circuit verification of proofs
-    /// (generated with Poseidon as the Fiat-Shamir transcript hash).
-    pub fn verifier(&self) -> &VerifierGadget<BlstrsEmulation> {
-        *self.used_bls12_381.borrow_mut() = true;
-        self.verifier_gadget
-            .as_ref()
-            .unwrap_or_else(|| panic!("ZkStdLibArch must enable bls12_381 & poseidon"))
+    /// Chip for performing in-circuit verification of proofs committed with
+    /// `PCS`. The proofs are read from a [`Self::verifier_transcript`].
+    pub fn verifier<PCS: MidnightPCS>(&self) -> VerifierGadget<F, PCS> {
+        // Building the gadget on every call is cheap: `VerifierGadget` has no
+        // configuration of its own (no extra columns or gates), it only clones
+        // the existing chips, whose state (caches, instance offsets) is shared
+        // behind `Rc`.
+        VerifierGadget::new(self.bls12_381(), &self.native_gadget)
+    }
+
+    /// A fresh in-circuit transcript for the proofs verified with
+    /// [`Self::verifier`] (generated with Poseidon as the Fiat-Shamir
+    /// transcript hash).
+    pub fn verifier_transcript(&self) -> PoseidonTranscriptGadget<F> {
+        PoseidonTranscriptGadget::new(self.poseidon_chip())
+    }
+
+    /// Chip for computing Poseidon hashes.
+    pub fn poseidon_chip(&self) -> &PoseidonChip<F> {
+        (self.poseidon_gadget.as_ref())
+            .unwrap_or_else(|| panic!("ZkStdLibArch must enable poseidon"))
     }
 
     /// Assert that a given assigned bit is true.

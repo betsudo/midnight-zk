@@ -21,37 +21,65 @@
 //!  - src/utils/arithmetic.rs
 //!  - src/poly/kzg/mod.rs
 
-use std::{
-    collections::{BTreeSet, HashMap},
-    marker::PhantomData,
-};
+use std::collections::{BTreeSet, HashMap};
 
 use ff::Field;
-use group::Group;
+use midnight_curves::pairing::MultiMillerLoop;
 use midnight_proofs::{
     circuit::{Layouter, Value},
     plonk::Error,
-    poly::{PolynomialLabel, kzg::commitment::KZGCommitment},
+    poly::{
+        PolynomialLabel,
+        kzg::{
+            COLLAPSE_THRESHOLD, KZGCommitmentScheme, KZGEngine,
+            commitment::{KZGCommitment, KZGMultiCommitment},
+            point_set_order,
+        },
+    },
+    transcript::Hashable,
 };
 
-#[cfg(feature = "truncated-challenges")]
-use crate::verifier::utils::truncate;
 use crate::{
     CircuitField,
-    field::AssignedNative,
-    instructions::{ArithInstructions, AssignmentInstructions},
-    types::InnerValue,
+    ecc::curves::{CircuitCurve, WeierstrassCurve},
+    field::{AssignedNative, foreign::params::FieldEmulationParams},
+    instructions::{
+        ArithInstructions, AssignmentInstructions, PublicInputInstructions, ecc::EccInstructions,
+    },
+    types::{InnerValue, Instantiable},
     verifier::{
-        AssignedAccumulator, SelfEmulation,
+        AssignedAccumulator, ScalarChip,
         msm::{AssignedMsm, AssignedPoint},
-        pcs::{InCircuitHomomorphicCommitment, InCircuitPCS, VerifierQuery},
-        transcript_gadget::TranscriptGadget,
+        pcs::{CommitmentBases, InCircuitPCS, VerifierQuery},
+        transcript_gadget::{InCircuitHashable, InCircuitTranscript},
+        types::{AssignedG1, CurveChip},
         utils::{
-            AssignedBoundedScalar, evaluate_interpolated_polynomial, inner_product, mul_add,
-            mul_bounded_scalars, truncated_powers,
+            AssignedBoundedScalar, Coset, evaluate_interpolation_quotient,
+            evaluate_interpolation_quotient_on_cosets, inner_product, mul_add, truncate,
+            truncated_powers,
         },
     },
 };
+
+/// A pairing engine whose KZG proofs can be verified in-circuit, over its
+/// scalar field, with its G1 points emulated.
+pub trait InCircuitKZGEngine:
+    KZGEngine<
+        Fr: CircuitField,
+        G1: WeierstrassCurve<ScalarField = Self::Fr, CryptographicGroup = Self::G1>
+                + FieldEmulationParams<Self::Fr, <Self::G1 as CircuitCurve>::Base>,
+    >
+{
+}
+
+impl<E> InCircuitKZGEngine for E where
+    E: KZGEngine<
+            Fr: CircuitField,
+            G1: WeierstrassCurve<ScalarField = E::Fr, CryptographicGroup = E::G1>
+                    + FieldEmulationParams<E::Fr, <E::G1 as CircuitCurve>::Base>,
+        >
+{
+}
 
 // -------------------------------------
 // See proofs/src/poly/kzg/commitment.rs
@@ -63,20 +91,20 @@ use crate::{
 /// Carries a polynomial commitment (or a lazy linear combination of them)
 /// together with its `PolynomialLabel`(s).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AssignedKZGCommitment<S: SelfEmulation> {
+pub enum AssignedKZGCommitment<E: InCircuitKZGEngine> {
     /// A single committed point with its label.
-    Simple(AssignedPoint<S>, PolynomialLabel),
+    Simple(AssignedPoint<E>, PolynomialLabel),
     /// A lazy linear combination `∑ scalars[i] * points[i]` with per-term
     /// labels, accumulated during verification for MSM batching.
     Linear(
-        Vec<AssignedPoint<S>>,
-        Vec<AssignedBoundedScalar<S::F>>,
+        Vec<AssignedPoint<E>>,
+        Vec<AssignedBoundedScalar<E::Fr>>,
         Vec<PolynomialLabel>,
     ),
 }
 
-impl<S: SelfEmulation> InnerValue for AssignedKZGCommitment<S> {
-    type Element = KZGCommitment<S::Engine>;
+impl<E: InCircuitKZGEngine> InnerValue for AssignedKZGCommitment<E> {
+    type Element = KZGCommitment<E>;
 
     fn value(&self) -> Value<Self::Element> {
         match self.clone() {
@@ -84,9 +112,9 @@ impl<S: SelfEmulation> InnerValue for AssignedKZGCommitment<S> {
                 p.value().map(|p| KZGCommitment::Simple(*p.get_point(), label))
             }
             Self::Linear(points, scalars, labels) => {
-                let points: Vec<Value<S::C>> =
+                let points: Vec<Value<E::G1>> =
                     points.iter().map(|p| p.value().map(|p| *p.get_point())).collect();
-                let scalars: Vec<Value<S::F>> =
+                let scalars: Vec<Value<E::Fr>> =
                     scalars.iter().map(|s| s.scalar.value().copied()).collect();
                 Value::from_iter(points)
                     .zip(Value::from_iter(scalars))
@@ -96,10 +124,10 @@ impl<S: SelfEmulation> InnerValue for AssignedKZGCommitment<S> {
     }
 }
 
-impl<S: SelfEmulation> AssignedKZGCommitment<S> {
+impl<E: InCircuitKZGEngine> AssignedKZGCommitment<E> {
     /// Creates a `Simple` commitment from a variable-base assigned point and
     /// label.
-    pub fn simple(point: S::AssignedPoint, label: PolynomialLabel) -> Self {
+    pub fn simple(point: AssignedG1<E>, label: PolynomialLabel) -> Self {
         AssignedKZGCommitment::Simple(AssignedPoint::Variable(point), label)
     }
 
@@ -112,15 +140,17 @@ impl<S: SelfEmulation> AssignedKZGCommitment<S> {
         AssignedKZGCommitment::Simple(AssignedPoint::Fixed, label)
     }
 
-    /// Assigns a curve point in the circuit and wraps it in a labeled `Simple`
-    /// commitment.
+    /// Assigns a curve point in the circuit (without subgroup check) and wraps
+    /// it in a labeled `Simple` commitment.
     pub fn assign(
-        layouter: &mut impl Layouter<S::F>,
-        curve_chip: &S::CurveChip,
-        point: Value<S::C>,
+        layouter: &mut impl Layouter<E::Fr>,
+        curve_chip: &CurveChip<E>,
+        point: Value<E::G1>,
         label: PolynomialLabel,
     ) -> Result<Self, Error> {
-        curve_chip.assign(layouter, point).map(|p| Self::simple(p, label))
+        curve_chip
+            .assign_without_subgroup_check(layouter, point)
+            .map(|p| Self::simple(p, label))
     }
 
     /// Converts this commitment into an [`AssignedMsm`] for use in the
@@ -131,9 +161,9 @@ impl<S: SelfEmulation> AssignedKZGCommitment<S> {
     /// MSM.
     pub fn into_msm(
         self,
-        layouter: &mut impl Layouter<S::F>,
-        scalar_chip: &S::ScalarChip,
-    ) -> Result<AssignedMsm<S>, Error> {
+        layouter: &mut impl Layouter<E::Fr>,
+        scalar_chip: &ScalarChip<E::Fr>,
+    ) -> Result<AssignedMsm<E>, Error> {
         let one = AssignedBoundedScalar::one(layouter, scalar_chip)?;
         Ok(match self {
             Self::Simple(p, label) => AssignedMsm::new(&[one], &[p], &[label]),
@@ -142,61 +172,13 @@ impl<S: SelfEmulation> AssignedKZGCommitment<S> {
     }
 }
 
-impl<S: SelfEmulation> AssignedKZGCommitment<S> {
-    /// Scales this commitment by a scalar.
-    ///
-    /// `Simple(p, l)` becomes `Linear([p], [scalar], [l])`.
-    /// For `Linear`, all existing scalars are multiplied by `scalar`.
-    fn mul(
-        self,
-        layouter: &mut impl Layouter<S::F>,
-        scalar_chip: &S::ScalarChip,
-        scalar: &AssignedNative<S::F>,
-    ) -> Result<Self, Error> {
-        let scalar = AssignedBoundedScalar::new(scalar, None);
-        match self {
-            Self::Simple(p, label) => Ok(Self::Linear(vec![p], vec![scalar], vec![label])),
-            Self::Linear(points, scalars, labels) => Ok(Self::Linear(
-                points,
-                scalars
-                    .iter()
-                    .map(|s| mul_bounded_scalars(layouter, scalar_chip, s, &scalar))
-                    .collect::<Result<Vec<_>, _>>()?,
-                labels,
-            )),
-        }
-    }
-
-    /// Adds two commitments, merging them into a `Linear` combination.
-    fn add(
-        self,
-        layouter: &mut impl Layouter<S::F>,
-        scalar_chip: &S::ScalarChip,
-        other: Self,
-    ) -> Result<Self, Error> {
-        let one = AssignedBoundedScalar::one(layouter, scalar_chip)?;
-        let (mut points, mut scalars, mut labels) = match self {
-            Self::Simple(p, label) => (vec![p], vec![one.clone()], vec![label]),
-            Self::Linear(points, scalars, labels) => (points, scalars, labels),
-        };
-        let (other_points, other_scalars, other_labels) = match other {
-            Self::Simple(p, label) => (vec![p], vec![one.clone()], vec![label]),
-            Self::Linear(points, scalars, labels) => (points, scalars, labels),
-        };
-        points.extend(other_points);
-        scalars.extend(other_scalars);
-        labels.extend(other_labels);
-        Ok(Self::Linear(points, scalars, labels))
-    }
-}
-
 /// In-circuit analog of
 /// [`KZGMultiCommitment`](midnight_proofs::poly::kzg::commitment::KZGMultiCommitment):
 /// a commitment to one or more polynomials.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AssignedKZGMultiCommitment<S: SelfEmulation>(pub Vec<AssignedKZGCommitment<S>>);
+pub struct AssignedKZGMultiCommitment<E: InCircuitKZGEngine>(pub Vec<AssignedKZGCommitment<E>>);
 
-impl<S: SelfEmulation> AssignedKZGMultiCommitment<S> {
+impl<E: InCircuitKZGEngine> AssignedKZGMultiCommitment<E> {
     fn assert_single(&self) {
         assert_eq!(
             self.0.len(),
@@ -207,61 +189,117 @@ impl<S: SelfEmulation> AssignedKZGMultiCommitment<S> {
 
     /// Returns the single inner [`AssignedKZGCommitment`], panicking if this
     /// commitment does not hold exactly one polynomial.
-    pub(crate) fn into_single(self) -> AssignedKZGCommitment<S> {
+    pub(crate) fn into_single(self) -> AssignedKZGCommitment<E> {
         self.assert_single();
         self.0.into_iter().next().unwrap()
     }
 
-    /// In-circuit commitment to the zero polynomial (the identity point),
-    /// tagged with `label`. Used e.g. for empty committed-instance columns.
-    pub fn commitment_to_zero(
-        layouter: &mut impl Layouter<S::F>,
-        curve_chip: &S::CurveChip,
-        label: PolynomialLabel,
-    ) -> Result<Self, Error>
-    where
-        S::CurveChip: AssignmentInstructions<S::F, S::AssignedPoint>,
-    {
-        let point = curve_chip.assign_fixed(layouter, S::C::identity())?;
-        Ok(Self(vec![AssignedKZGCommitment::simple(point, label)]))
+    /// Assigns the commitment to the group of `labels` from its off-circuit
+    /// value, without subgroup checks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a label is repeated or if `value` does not commit to
+    /// `|labels|` polynomials.
+    fn assign(
+        layouter: &mut impl Layouter<E::Fr>,
+        curve_chip: &CurveChip<E>,
+        value: Value<KZGMultiCommitment<E>>,
+        labels: &[PolynomialLabel],
+    ) -> Result<Self, Error> {
+        PolynomialLabel::assert_distinct(labels);
+        let points = value
+            .map(|com| {
+                assert_eq!(com.0.len(), labels.len());
+                com.0.iter().map(|c| *c.as_point()).collect::<Vec<_>>()
+            })
+            .transpose_vec(labels.len());
+        let inners = (points.into_iter().zip(labels))
+            .map(|(point, label)| {
+                AssignedKZGCommitment::assign(layouter, curve_chip, point, label.clone())
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(AssignedKZGMultiCommitment(inners))
     }
 }
 
-impl<S: SelfEmulation> InnerValue for AssignedKZGMultiCommitment<S> {
-    type Element = midnight_proofs::poly::kzg::commitment::KZGMultiCommitment<S::Engine>;
+impl<E: InCircuitKZGEngine> InnerValue for AssignedKZGMultiCommitment<E> {
+    type Element = KZGMultiCommitment<E>;
 
     fn value(&self) -> Value<Self::Element> {
-        Value::from_iter(self.0.iter().map(|c| c.value()))
-            .map(midnight_proofs::poly::kzg::commitment::KZGMultiCommitment)
+        Value::from_iter(self.0.iter().map(|c| c.value())).map(KZGMultiCommitment)
     }
 }
 
-impl<S: SelfEmulation> InCircuitHomomorphicCommitment<S> for AssignedKZGMultiCommitment<S> {
-    fn mul(
-        self,
-        layouter: &mut impl Layouter<S::F>,
-        scalar_chip: &S::ScalarChip,
-        scalar: &AssignedNative<S::F>,
-    ) -> Result<Self, Error> {
-        self.assert_single();
-        let inner = self.0.into_iter().next().unwrap().mul(layouter, scalar_chip, scalar)?;
-        Ok(Self(vec![inner]))
+impl<E: InCircuitKZGEngine> Instantiable<E::Fr> for AssignedKZGMultiCommitment<E> {
+    /// # Panics
+    ///
+    /// Panics if `com` contains a linear combination of commitments.
+    fn as_public_input(com: &KZGMultiCommitment<E>) -> Vec<E::Fr> {
+        (com.0.iter())
+            .flat_map(|c| match c {
+                KZGCommitment::Simple(point, _) => AssignedG1::<E>::as_public_input(point),
+                KZGCommitment::Linear(..) => {
+                    panic!("linear combinations of commitments cannot be public inputs")
+                }
+            })
+            .collect()
     }
 
-    fn add(
-        self,
-        layouter: &mut impl Layouter<S::F>,
-        scalar_chip: &S::ScalarChip,
-        other: Self,
+    #[cfg(any(test, feature = "testing"))]
+    fn from_public_input(_fields: &[E::Fr]) -> Option<KZGMultiCommitment<E>> {
+        unimplemented!("the labels of a commitment are not part of its public inputs")
+    }
+}
+
+impl<E: InCircuitKZGEngine> InCircuitHashable<E::Fr> for AssignedKZGMultiCommitment<E> {
+    type Chip = CurveChip<E>;
+    type Shape = [PolynomialLabel];
+
+    /// Assigns the commitment to the group of `labels`, or default points if
+    /// `value` is not a commitment to `labels.len()` polynomials.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a label is repeated.
+    fn assign_read(
+        layouter: &mut impl Layouter<E::Fr>,
+        curve_chip: &CurveChip<E>,
+        labels: &[PolynomialLabel],
+        value: Option<KZGMultiCommitment<E>>,
     ) -> Result<Self, Error> {
-        self.assert_single();
-        other.assert_single();
-        let inner = self.0.into_iter().next().unwrap().add(
-            layouter,
-            scalar_chip,
-            other.0.into_iter().next().unwrap(),
-        )?;
-        Ok(Self(vec![inner]))
+        let com = (value.filter(|com| com.0.len() == labels.len()))
+            .unwrap_or_else(|| KZGMultiCommitment(vec![KZGCommitment::default(); labels.len()]));
+        Self::assign(layouter, curve_chip, Value::known(com), labels)
+    }
+
+    /// # Errors
+    ///
+    /// If the commitment contains fixed points or linear combinations.
+    fn to_input(
+        &self,
+        layouter: &mut impl Layouter<E::Fr>,
+        curve_chip: &CurveChip<E>,
+    ) -> Result<Vec<AssignedNative<E::Fr>>, Error> {
+        let mut inputs = vec![];
+        for com in self.0.iter() {
+            match com {
+                AssignedKZGCommitment::Simple(AssignedPoint::Variable(point), _) => {
+                    inputs.extend(curve_chip.as_public_input(layouter, point)?)
+                }
+                AssignedKZGCommitment::Simple(AssignedPoint::Fixed, label) => {
+                    return Err(Error::Synthesis(format!(
+                        "fixed commitments cannot be hashed in-circuit: {label}"
+                    )));
+                }
+                AssignedKZGCommitment::Linear(_, _, labels) => {
+                    return Err(Error::Synthesis(format!(
+                        "linear commitments cannot be hashed in-circuit: {labels:?}"
+                    )));
+                }
+            }
+        }
+        Ok(inputs)
     }
 }
 
@@ -270,14 +308,14 @@ impl<S: SelfEmulation> InCircuitHomomorphicCommitment<S> for AssignedKZGMultiCom
 // --------------------------------
 
 #[derive(Clone, Debug)]
-pub(crate) struct CommitmentData<S: SelfEmulation> {
+pub(crate) struct CommitmentData<F: CircuitField> {
     label: PolynomialLabel,
     set_index: usize,
     point_indices: Vec<usize>,
-    evals: Vec<AssignedNative<S::F>>,
+    evals: Vec<AssignedNative<F>>,
 }
 
-impl<S: SelfEmulation> CommitmentData<S> {
+impl<F: CircuitField> CommitmentData<F> {
     fn new(label: PolynomialLabel) -> Self {
         CommitmentData {
             label,
@@ -288,19 +326,39 @@ impl<S: SelfEmulation> CommitmentData<S> {
     }
 }
 
-type IntermediateSets<S> = (
-    Vec<CommitmentData<S>>,
-    Vec<Vec<AssignedNative<<S as SelfEmulation>::F>>>,
-);
+type IntermediateSets<F> = (Vec<CommitmentData<F>>, Vec<Vec<AssignedNative<F>>>);
+
+/// Groups `points` and their `evals` by the coset they were given as roots of,
+/// if every point was, each coset is whole and `t > 1`.
+fn as_cosets<F: CircuitField>(
+    points: &[AssignedNative<F>],
+    evals: &[AssignedNative<F>],
+    roots_of: &HashMap<AssignedNative<F>, (AssignedNative<F>, usize)>,
+) -> Option<(usize, Vec<Coset<F>>)> {
+    let mut t = None;
+    let mut cosets: Vec<Coset<F>> = Vec::new();
+    for (point, eval) in points.iter().zip(evals) {
+        let (x, point_t) = roots_of.get(point)?;
+        if *t.get_or_insert(*point_t) != *point_t {
+            return None;
+        }
+        match cosets.iter_mut().find(|(y, _)| y == x) {
+            Some((_, coset)) => coset.push((point.clone(), eval.clone())),
+            None => cosets.push((x.clone(), vec![(point.clone(), eval.clone())])),
+        }
+    }
+    let t = t.filter(|t| *t > 1)?;
+    cosets.iter().all(|(_, coset)| coset.len() == t).then_some((t, cosets))
+}
 
 #[allow(clippy::type_complexity)]
-fn construct_intermediate_sets<S: SelfEmulation>(
-    queries: &[(PolynomialLabel, AssignedNative<S::F>, AssignedNative<S::F>)],
-    default_eval: AssignedNative<S::F>,
-) -> Result<IntermediateSets<S>, Error> {
+fn construct_intermediate_sets<F: CircuitField>(
+    queries: &[(PolynomialLabel, AssignedNative<F>, AssignedNative<F>)],
+    default_eval: AssignedNative<F>,
+) -> Result<IntermediateSets<F>, Error> {
     // Construct sets of unique commitments and corresponding information about
     // their queries.
-    let mut commitment_map: Vec<CommitmentData<S>> = vec![];
+    let mut commitment_map: Vec<CommitmentData<F>> = vec![];
 
     // Also construct mapping from a unique point to a point_index. This defines
     // an ordering on the points.
@@ -394,7 +452,7 @@ fn construct_intermediate_sets<S: SelfEmulation>(
     }
 
     // Get actual points in each point set
-    let mut point_sets: Vec<Vec<AssignedNative<S::F>>> = vec![Vec::new(); point_idx_sets.len()];
+    let mut point_sets: Vec<Vec<AssignedNative<F>>> = vec![Vec::new(); point_idx_sets.len()];
     for (point_idx_set, &set_idx) in point_idx_sets.iter() {
         for &point_idx in point_idx_set.iter() {
             let point = inverse_point_index_map.get(&point_idx).unwrap();
@@ -409,12 +467,12 @@ fn construct_intermediate_sets<S: SelfEmulation>(
 // See proofs/src/utils/arithmetic.rs
 // ----------------------------------
 
-fn msm_inner_product<S: SelfEmulation>(
-    layouter: &mut impl Layouter<S::F>,
-    scalar_chip: &S::ScalarChip,
-    msms: &[AssignedMsm<S>],
-    scalars: &[AssignedBoundedScalar<S::F>],
-) -> Result<AssignedMsm<S>, Error> {
+fn msm_inner_product<E: InCircuitKZGEngine>(
+    layouter: &mut impl Layouter<E::Fr>,
+    scalar_chip: &ScalarChip<E::Fr>,
+    msms: &[AssignedMsm<E>],
+    scalars: &[AssignedBoundedScalar<E::Fr>],
+) -> Result<AssignedMsm<E>, Error> {
     let mut res = AssignedMsm::empty();
     let mut msms = msms.to_vec();
     for (msm, s) in msms.iter_mut().zip(scalars) {
@@ -436,7 +494,7 @@ fn evals_inner_product<F: CircuitField>(
     scalars: &[AssignedBoundedScalar<F>],
 ) -> Result<Vec<AssignedNative<F>>, Error> {
     let zero = scalar_chip.assign_fixed(layouter, F::ZERO)?;
-    let mut res = vec![zero.clone(); evals_set[0].len()];
+    let mut res = vec![zero; evals_set[0].len()];
     for (poly_evals, s) in evals_set.iter().zip(scalars) {
         for i in 0..res.len() {
             // res[i] := s.scalar * poly_evals[i] + res[i]
@@ -452,66 +510,61 @@ fn evals_inner_product<F: CircuitField>(
 
 /// Verifies a bunch of KZG queries in a multi-open argument.
 /// The resulting accumulator satisfies the invariant iff all queries are valid.
-pub(crate) fn multi_prepare_kzg<S: SelfEmulation>(
-    layouter: &mut impl Layouter<S::F>,
-    #[cfg(feature = "truncated-challenges")] curve_chip: &S::CurveChip,
-    scalar_chip: &S::ScalarChip,
-    transcript_gadget: &mut TranscriptGadget<S>,
-    queries: &[VerifierQuery<S, InCircuitKZG<S>>],
-) -> Result<AssignedAccumulator<S>, Error> {
+pub(crate) fn multi_prepare_kzg<E, T>(
+    layouter: &mut impl Layouter<E::Fr>,
+    curve_chip: &CurveChip<E>,
+    scalar_chip: &ScalarChip<E::Fr>,
+    queries: &[VerifierQuery<E::Fr, KZGCommitmentScheme<E>>],
+    transcript: &mut T,
+) -> Result<AssignedAccumulator<E>, Error>
+where
+    E: InCircuitKZGEngine,
+    E::Fr: Hashable<T::Hash>,
+    KZGMultiCommitment<E>: Hashable<T::Hash>,
+    T: InCircuitTranscript<E::Fr>,
+{
     let one = AssignedBoundedScalar::one(layouter, scalar_chip)?;
 
-    // Add dummy queries to reduce the number of distinct multi-open point sets.
-    #[cfg(feature = "fewer-point-sets")]
-    let queries = &{
-        let pairs: Vec<_> = queries.iter().map(|q| (q.label.clone(), q.point.clone())).collect();
-        let dummy_openings = midnight_proofs::poly::kzg::compute_dummy_queries(&pairs);
-        let mut queries = queries.to_vec();
-        for (idx, dummy_point) in dummy_openings {
-            queries.push(VerifierQuery {
-                point: dummy_point,
-                commitment: queries[idx].commitment,
-                label: queries[idx].label.clone(),
-                eval: transcript_gadget.read_scalar(layouter)?,
-            });
-        }
-        queries
-    };
-
-    let x1 = transcript_gadget.squeeze_challenge(layouter)?;
-    let x2 = transcript_gadget.squeeze_challenge(layouter)?;
+    let x1 = transcript.squeeze_challenge(layouter)?;
+    let x2 = transcript.squeeze_challenge(layouter)?;
 
     // Peel each query's multi-commitment down to the single inner commitment it
-    // targets, keyed by the query label. A length-1 commitment (the common case,
-    // including the `Linear` linearization commitment) peels to its sole inner;
-    // a batched commitment holds several `Simple`s, so we pick the one whose own
-    // label matches the query.
-    let label_to_commitment: HashMap<PolynomialLabel, &AssignedKZGCommitment<S>> = queries
+    // targets, keyed by the query label. The `Linear` quotient commitment
+    // aggregates many polynomials and carries no single label of its own, so it
+    // is taken as it is. Every `Simple` has to name the queried polynomial,
+    // whether it stands alone or in a batch: matching on the label rather than
+    // on the position keeps a malformed group from aliasing every query onto the
+    // same point.
+    let label_to_commitment: HashMap<PolynomialLabel, &AssignedKZGCommitment<E>> = queries
         .iter()
         .map(|q| {
             let inners = &q.commitment.0;
-            let inner = if inners.len() == 1 {
-                &inners[0]
-            } else {
-                inners
+            let inner = match inners.as_slice() {
+                [single @ AssignedKZGCommitment::Linear(..)] => single,
+                _ => inners
                     .iter()
                     .find(|c| matches!(c, AssignedKZGCommitment::Simple(_, label) if *label == q.label))
-                    .expect("batched commitment has no polynomial matching the query label")
+                    .expect("batched commitment has no polynomial matching the query label"),
             };
             (q.label.clone(), inner)
         })
         .collect();
 
-    let default_eval = scalar_chip.assign_fixed(layouter, S::F::default())?;
+    // The coset of every point given as a root: `point -> (x, t)`.
+    let roots_of: HashMap<_, _> = (queries.iter())
+        .filter_map(|q| q.root_of.clone().map(|root_of| (q.point.clone(), root_of)))
+        .collect();
+
+    let default_eval = scalar_chip.assign_fixed(layouter, E::Fr::default())?;
     let kzg_queries = queries
         .iter()
         .map(|query| (query.label.clone(), query.point.clone(), query.eval.clone()))
         .collect::<Vec<_>>();
-    let (commitment_map, point_sets) =
-        construct_intermediate_sets::<S>(&kzg_queries, default_eval)?;
+    let (commitment_map, point_sets) = construct_intermediate_sets(&kzg_queries, default_eval)?;
 
     let mut q_coms: Vec<_> = vec![vec![]; point_sets.len()];
     let mut q_eval_sets = vec![vec![]; point_sets.len()];
+    let mut set_sizes: Vec<_> = point_sets.iter().map(|points| (points.len(), 0)).collect();
 
     for com_data in commitment_map.into_iter() {
         let mut msm = AssignedMsm::empty();
@@ -523,6 +576,7 @@ pub(crate) fn multi_prepare_kzg<S: SelfEmulation>(
         }
         q_coms[com_data.set_index].push(msm);
         q_eval_sets[com_data.set_index].push(com_data.evals);
+        set_sizes[com_data.set_index].1 += usize::from(!com_data.label.is_fixed());
     }
 
     let truncated_x1_powers = {
@@ -541,84 +595,77 @@ pub(crate) fn multi_prepare_kzg<S: SelfEmulation>(
         .map(|evals| evals_inner_product(layouter, scalar_chip, evals, &truncated_x1_powers))
         .collect::<Result<Vec<_>, Error>>()?;
 
-    // Sort point sets by ascending cardinality to ensure the first set is the one
-    // that contains fixed commitments (which are evaluated at x only). This
-    // property is not necessary for the actual proving system, but it is important
-    // for in-circuit verification of proofs. (It enables an optimization based on
-    // an internal collapse.)
-    //
-    // The (len, i) key provides a deterministic total order even when two sets
-    // share the same cardinality.
     let (q_coms, q_eval_sets, point_sets) = {
-        let mut order: Vec<usize> = (0..point_sets.len()).collect();
-        order.sort_by_key(|&i| (point_sets[i].len(), i));
+        let order = point_set_order(&set_sizes);
         let q_coms: Vec<_> = order.iter().map(|&i| q_coms[i].clone()).collect();
         let q_eval_sets: Vec<_> = order.iter().map(|&i| q_eval_sets[i].clone()).collect();
         let point_sets: Vec<_> = order.iter().map(|&i| point_sets[i].clone()).collect();
         (q_coms, q_eval_sets, point_sets)
     };
 
-    let f_com = transcript_gadget
-        .read_commitment(layouter, &[PolynomialLabel::Custom("kzg_batch".into())])?
-        .into_single();
+    let f_com = <KZGCommitmentScheme<E> as InCircuitPCS<E::Fr>>::read_commitment(
+        layouter,
+        curve_chip,
+        transcript,
+        &[PolynomialLabel::Custom("kzg_batch".into())],
+    )?
+    .into_single();
 
-    let x3 = transcript_gadget.squeeze_challenge(layouter)?;
-    #[cfg(feature = "truncated-challenges")]
-    let x3 = truncate::<S::F>(layouter, scalar_chip, &x3)?;
-    #[cfg(not(feature = "truncated-challenges"))]
-    let x3 = AssignedBoundedScalar::new(&x3, None);
+    let x3 = transcript.squeeze_challenge(layouter)?;
+    let x3 = truncate::<E::Fr>(layouter, scalar_chip, &x3)?;
 
     let mut q_evals_on_x3 = Vec::with_capacity(q_eval_sets.len());
     for _ in 0..q_eval_sets.len() {
-        q_evals_on_x3.push(transcript_gadget.read_scalar(layouter)?);
+        q_evals_on_x3.push(transcript.read(layouter, scalar_chip, &())?);
     }
 
-    let zero = scalar_chip.assign_fixed(layouter, S::F::ZERO)?;
+    let zero = scalar_chip.assign_fixed(layouter, E::Fr::ZERO)?;
     let f_eval = point_sets
         .iter()
         .zip(q_eval_sets.iter())
         .zip(q_evals_on_x3.iter())
         .rev()
         .try_fold(zero, |acc_eval, ((points, evals), proof_eval)| {
-            let r_eval =
-                evaluate_interpolated_polynomial(layouter, scalar_chip, points, evals, &x3.scalar)?;
-
             // eval = (proof_eval - r_eval) / prod_i (x3 - point_i)
-            let den = points.iter().skip(1).try_fold(
-                scalar_chip.sub(layouter, &x3.scalar, &points[0])?,
-                |acc, point| {
-                    // acc * (x3 - point) computed as acc * x3 - acc * point
-                    scalar_chip.add_and_double_mul(
-                        layouter,
-                        (S::F::ZERO, &acc),
-                        (S::F::ZERO, &x3.scalar),
-                        (S::F::ZERO, point),
-                        S::F::ZERO,
-                        (S::F::ONE, -S::F::ONE),
-                    )
-                },
-            )?;
-            let mut eval = scalar_chip.sub(layouter, proof_eval, &r_eval)?;
-            eval = scalar_chip.div(layouter, &eval, &den)?;
+            let eval = match as_cosets(points, evals, &roots_of) {
+                Some((t, cosets)) => evaluate_interpolation_quotient_on_cosets(
+                    layouter,
+                    scalar_chip,
+                    t,
+                    &cosets,
+                    &x3.scalar,
+                    proof_eval,
+                )?,
+                None => evaluate_interpolation_quotient(
+                    layouter,
+                    scalar_chip,
+                    points,
+                    evals,
+                    &x3.scalar,
+                    proof_eval,
+                )?,
+            };
 
             // acc_eval * x2 + eval
             mul_add(layouter, scalar_chip, &acc_eval, &x2, &eval)
         })?;
 
-    let x4 = transcript_gadget.squeeze_challenge(layouter)?;
+    let x4 = transcript.squeeze_challenge(layouter)?;
     let truncated_x4_powers =
-        truncated_powers::<S::F>(layouter, scalar_chip, &x4, q_coms.len() + 1)?;
+        truncated_powers::<E::Fr>(layouter, scalar_chip, &x4, q_coms.len() + 1)?;
 
     let final_com = {
         let mut coms = q_coms;
 
-        // We collapse all AssignedMsm at this point to later leverage the fact that x4
-        // powers are truncated. Exceptionally, the first one is not collapsed,
-        // as the first x4 power is 1.
-        #[cfg(feature = "truncated-challenges")]
-        coms.iter_mut().skip(1).try_for_each(|com| {
-            com.collapse(layouter, curve_chip, scalar_chip, PolynomialLabel::NoLabel)
-        })?;
+        // We collapse every AssignedMsm of at least `COLLAPSE_THRESHOLD` variable
+        // bases at this point to later leverage the fact that x4 powers are
+        // truncated. Exceptionally, the first one is not collapsed, as the first x4
+        // power is 1.
+        (coms.iter_mut().skip(1))
+            .filter(|com| com.nb_variable_bases() >= COLLAPSE_THRESHOLD)
+            .try_for_each(|com| {
+                com.collapse(layouter, curve_chip, scalar_chip, PolynomialLabel::NoLabel)
+            })?;
         coms.push(f_com.into_msm(layouter, scalar_chip)?);
 
         msm_inner_product(layouter, scalar_chip, &coms, &truncated_x4_powers)?
@@ -637,9 +684,13 @@ pub(crate) fn multi_prepare_kzg<S: SelfEmulation>(
         )
     };
 
-    let pi = transcript_gadget
-        .read_commitment(layouter, &[PolynomialLabel::Custom("π".into())])?
-        .into_single();
+    let pi = <KZGCommitmentScheme<E> as InCircuitPCS<E::Fr>>::read_commitment(
+        layouter,
+        curve_chip,
+        transcript,
+        &[PolynomialLabel::Custom("π".into())],
+    )?
+    .into_single();
     let pi_msm = pi.into_msm(layouter, scalar_chip)?;
 
     // Scale zπ
@@ -660,58 +711,87 @@ pub(crate) fn multi_prepare_kzg<S: SelfEmulation>(
     Ok(AssignedAccumulator::new(left, right))
 }
 
-/// KZG instantiation of [`InCircuitPCS`].
-#[derive(Clone, Copy, Debug)]
-pub struct InCircuitKZG<S: SelfEmulation>(PhantomData<S>);
+impl<E: MultiMillerLoop> CommitmentBases<E::G1> for KZGMultiCommitment<E> {
+    fn bases(&self) -> Vec<(PolynomialLabel, E::G1)> {
+        (self.0.iter())
+            .map(|com| match com {
+                KZGCommitment::Simple(point, label) => (label.clone(), *point),
+                KZGCommitment::Linear(..) => panic!("a fixed base cannot be a linear combination"),
+            })
+            .collect()
+    }
+}
 
-impl<S: SelfEmulation> InCircuitPCS<S> for InCircuitKZG<S> {
-    type AssignedCommitment = AssignedKZGMultiCommitment<S>;
+/// In circuit implementation of KZG.
+impl<E: InCircuitKZGEngine> InCircuitPCS<E::Fr> for KZGCommitmentScheme<E> {
+    type CommitmentChip = CurveChip<E>;
+    type AssignedCommitment = AssignedKZGMultiCommitment<E>;
+    type AssignedVerificationGuard = AssignedAccumulator<E>;
 
-    fn fixed_commitment(label: PolynomialLabel) -> Self::AssignedCommitment {
-        AssignedKZGMultiCommitment(vec![AssignedKZGCommitment::fixed(label)])
+    fn fixed_commitment(labels: &[PolynomialLabel]) -> Self::AssignedCommitment {
+        PolynomialLabel::assert_distinct(labels);
+        AssignedKZGMultiCommitment(
+            <Self as InCircuitPCS<E::Fr>>::fixed_base_labels(labels)
+                .into_iter()
+                .map(AssignedKZGCommitment::fixed)
+                .collect(),
+        )
     }
 
-    fn read_commitment(
-        transcript: &mut TranscriptGadget<S>,
-        layouter: &mut impl Layouter<S::F>,
-        labels: &[PolynomialLabel],
-    ) -> Result<Self::AssignedCommitment, Error> {
-        transcript.read_commitment(layouter, labels)
+    fn fixed_base_labels(labels: &[PolynomialLabel]) -> Vec<PolynomialLabel> {
+        labels.to_vec()
     }
 
     fn assign_commitment(
-        layouter: &mut impl Layouter<S::F>,
-        curve_chip: &S::CurveChip,
-        value: Value<S::C>,
-        label: PolynomialLabel,
+        layouter: &mut impl Layouter<E::Fr>,
+        curve_chip: &CurveChip<E>,
+        value: Value<KZGMultiCommitment<E>>,
+        labels: &[PolynomialLabel],
     ) -> Result<Self::AssignedCommitment, Error> {
-        Ok(AssignedKZGMultiCommitment(vec![
-            AssignedKZGCommitment::assign(layouter, curve_chip, value, label)?,
-        ]))
+        AssignedKZGMultiCommitment::assign(layouter, curve_chip, value, labels)
     }
 
-    fn common_commitment(
-        transcript: &mut TranscriptGadget<S>,
-        layouter: &mut impl Layouter<S::F>,
-        commitment: &AssignedKZGMultiCommitment<S>,
-    ) -> Result<(), Error> {
-        transcript.common_commitment(layouter, commitment)
+    /// # Warning
+    ///
+    /// The received points are not enforced to be in the prime-order subgroup.
+    fn read_commitment<T>(
+        layouter: &mut impl Layouter<E::Fr>,
+        curve_chip: &CurveChip<E>,
+        transcript: &mut T,
+        labels: &[PolynomialLabel],
+    ) -> Result<Self::AssignedCommitment, Error>
+    where
+        Self::Commitment: Hashable<T::Hash>,
+        T: InCircuitTranscript<E::Fr>,
+    {
+        // An empty group is never written to the transcript.
+        if labels.is_empty() {
+            return Ok(AssignedKZGMultiCommitment(vec![]));
+        }
+        transcript.read(layouter, curve_chip, labels)
     }
 
-    fn multi_prepare(
-        layouter: &mut impl Layouter<S::F>,
-        _curve_chip: &S::CurveChip,
-        scalar_chip: &S::ScalarChip,
-        transcript: &mut TranscriptGadget<S>,
-        queries: &[VerifierQuery<'_, S, Self>],
-    ) -> Result<AssignedAccumulator<S>, Error> {
-        multi_prepare_kzg(
-            layouter,
-            #[cfg(feature = "truncated-challenges")]
-            _curve_chip,
-            scalar_chip,
-            transcript,
-            queries,
-        )
+    fn commitment_labels(commitment: &Self::AssignedCommitment) -> Vec<PolynomialLabel> {
+        (commitment.0.iter())
+            .flat_map(|c| match c {
+                AssignedKZGCommitment::Simple(_, label) => vec![label.clone()],
+                AssignedKZGCommitment::Linear(_, _, labels) => labels.clone(),
+            })
+            .collect()
+    }
+
+    fn multi_prepare<T>(
+        layouter: &mut impl Layouter<E::Fr>,
+        curve_chip: &CurveChip<E>,
+        scalar_chip: &ScalarChip<E::Fr>,
+        queries: &[VerifierQuery<'_, E::Fr, Self>],
+        transcript: &mut T,
+    ) -> Result<Self::AssignedVerificationGuard, Error>
+    where
+        E::Fr: Hashable<T::Hash>,
+        Self::Commitment: Hashable<T::Hash>,
+        T: InCircuitTranscript<E::Fr>,
+    {
+        multi_prepare_kzg(layouter, curve_chip, scalar_chip, queries, transcript)
     }
 }
