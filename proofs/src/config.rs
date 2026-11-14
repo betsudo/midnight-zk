@@ -298,10 +298,13 @@ impl Default for CancelToken {
 pub struct ProverContext {
     /// How this proof trades memory for CPU and disk.
     pub config: ProverConfig,
-    /// Set to let the caller stop this proof between phases. `None` means the
-    /// proof cannot be cancelled, which is the right default for a library
-    /// call that owns the whole computation.
+    /// Set to let the caller stop this proof between phases. `None` means no
+    /// request token is attached; a process context may still observe the
+    /// legacy host-wide flag.
     pub cancel: Option<CancelToken>,
+    // Keep the legacy host-wide signal when a process context gains a
+    // request-owned token. Cancelling the request token must never write it.
+    process_cancel: Option<&'static AtomicBool>,
 }
 
 impl ProverContext {
@@ -310,10 +313,12 @@ impl ProverContext {
         Self {
             config,
             cancel: None,
+            process_cancel: None,
         }
     }
 
-    /// Attach a cancellation token.
+    /// Attach a cancellation token. A process context also keeps observing
+    /// the legacy host-wide flag; cancelling this token never sets that flag.
     pub fn with_cancel(mut self, token: CancelToken) -> Self {
         self.cancel = Some(token);
         self
@@ -322,6 +327,7 @@ impl ProverContext {
     /// Whether cancellation has been requested for this proof.
     pub fn is_cancelled(&self) -> bool {
         self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
+            || self.process_cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
     /// The process-wide context: [`ProverConfig::process`] plus the legacy
@@ -336,6 +342,7 @@ impl ProverContext {
         Self {
             config: ProverConfig::process().clone(),
             cancel: Some(CancelToken::shared(&crate::plonk::MIDNIGHT_CANCEL)),
+            process_cancel: Some(&crate::plonk::MIDNIGHT_CANCEL),
         }
     }
 }
@@ -444,6 +451,36 @@ mod test {
         assert!(ctx_a.is_cancelled());
         assert!(!ctx_b.is_cancelled());
         assert!(!ctx_none.is_cancelled(), "no token means never cancelled");
+    }
+
+    #[test]
+    fn process_signal_and_request_token_remain_independent() {
+        static HOST_CANCEL: AtomicBool = AtomicBool::new(false);
+        let request = CancelToken::new();
+        let host_context = ProverContext {
+            config: ProverConfig::heap(),
+            cancel: Some(CancelToken::shared(&HOST_CANCEL)),
+            process_cancel: Some(&HOST_CANCEL),
+        };
+        assert!(ProverContext::process().process_cancel.is_some());
+
+        let request_context = host_context.with_cancel(request.clone());
+        let unrelated = ProverContext::new(ProverConfig::heap());
+        assert!(!request_context.is_cancelled());
+        request.cancel();
+        assert!(request_context.is_cancelled());
+        assert!(!HOST_CANCEL.load(Ordering::Acquire));
+        assert!(!unrelated.is_cancelled());
+
+        let fresh_request = ProverContext {
+            config: ProverConfig::heap(),
+            cancel: Some(CancelToken::new()),
+            process_cancel: Some(&HOST_CANCEL),
+        };
+        HOST_CANCEL.store(true, Ordering::Release);
+        assert!(fresh_request.is_cancelled());
+        assert!(!unrelated.is_cancelled());
+        HOST_CANCEL.store(false, Ordering::Release);
     }
 
     #[test]
