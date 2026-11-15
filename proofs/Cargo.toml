@@ -57,9 +57,6 @@ proptest = "1"
 tempfile = "3"
 serde_json = { workspace = true }
 midnight-circuits = { path = "../circuits" }
-# The ZSwap benchmark uses zk-stdlib 2.4.0 circuit types from circuits 7.3.0.
-# Retain the local 7.2.3 dependency for the release-base tests.
-midnight-circuits-v73 = { package = "midnight-circuits", version = "=7.3.0" }
 midnight-zk-stdlib = { path = "../zk_stdlib" }
 sha2 = { workspace = true }
 rand = { workspace = true }
