@@ -3,7 +3,7 @@ use std::fmt::{self, Debug};
 use ff::PrimeField;
 
 use crate::{
-    poly::{Coeff, Polynomial, PolynomialView, commitment::PolynomialCommitmentScheme},
+    poly::{commitment::PolynomialCommitmentScheme, Coeff, Polynomial, PolynomialView},
     utils::arithmetic::eval_polynomial,
 };
 

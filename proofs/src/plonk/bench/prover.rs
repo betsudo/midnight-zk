@@ -8,7 +8,6 @@ use rand_core::{CryptoRng, RngCore};
 
 use crate::{
     plonk::{
-        Error, ProvingKey,
         circuit::Circuit,
         lookup, permutation,
         prover::{
@@ -16,7 +15,7 @@ use crate::{
             write_evals_to_transcript,
         },
         traces::ProverTrace,
-        trash, vanishing,
+        trash, vanishing, Error, ProvingKey,
     },
     poly::{commitment::PolynomialCommitmentScheme, polynomial_views},
     transcript::{Hashable, Sampleable, Transcript},

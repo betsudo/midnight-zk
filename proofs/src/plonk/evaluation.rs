@@ -3,7 +3,7 @@ use group::ff::Field;
 
 use super::{ConstraintSystem, Expression};
 use crate::{
-    plonk::{Any, lookup, permutation, trash},
+    plonk::{lookup, permutation, trash, Any},
     poly::{EvaluationDomain, Polynomial, PolynomialRepresentation, PolynomialView, Rotation},
     utils::arithmetic::parallelize,
 };

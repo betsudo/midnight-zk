@@ -8,8 +8,8 @@ use super::{super::circuit::Any, Argument, ProvingKey};
 use crate::{
     plonk::{self, Error},
     poly::{
-        Coeff, LagrangeCoeff, Polynomial, PolynomialView, ProverQuery, Rotation,
-        commitment::PolynomialCommitmentScheme,
+        commitment::PolynomialCommitmentScheme, Coeff, LagrangeCoeff, Polynomial, PolynomialView,
+        ProverQuery, Rotation,
     },
     transcript::{Hashable, Transcript},
     utils::arithmetic::{eval_polynomial, parallelize},

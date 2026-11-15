@@ -4,18 +4,18 @@ use ff::Field;
 use group::{Curve, Group};
 use itertools::izip;
 use midnight_curves::{
-    CurveAffine, Fq, G1Projective,
     msm::msm_best,
     pairing::{Engine, MillerLoopResult, MultiMillerLoop},
+    CurveAffine, Fq, G1Projective,
 };
 use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 
 use super::params::ParamsVerifierKZG;
 use crate::{
     poly::{
-        CommitmentLabel, Error,
         commitment::{Guard, PolynomialCommitmentScheme},
         kzg::KZGCommitmentScheme,
+        CommitmentLabel, Error,
     },
     utils::{
         arithmetic::{CurveExt, MSM},
@@ -167,7 +167,11 @@ where
 /// `the_msm_fast_path_gate_is_the_measured_boundary` pins both arms against
 /// decimal literals.
 const fn fast_path_max(aarch64: bool) -> usize {
-    if aarch64 { 1 << 21 } else { 1 << 18 }
+    if aarch64 {
+        1 << 21
+    } else {
+        1 << 18
+    }
 }
 
 /// Select the gate without changing the published browser-Wasm path. Native

@@ -30,21 +30,21 @@ use rand_core::OsRng;
 use crate::utils::arithmetic::{truncate, truncated_powers};
 use crate::{
     poly::{
-        Coeff, Error, LagrangeCoeff, Polynomial, ProverQuery,
         commitment::{Params, PolynomialCommitmentScheme},
         kzg::{
-            msm::{DualMSM, MSMKZG, msm_specific},
+            msm::{msm_specific, DualMSM, MSMKZG},
             params::{ParamsKZG, ParamsVerifierKZG},
             utils::construct_intermediate_sets,
         },
         polynomial_inner_product,
         query::{CommitmentLabel, VerifierQuery},
+        Coeff, Error, LagrangeCoeff, Polynomial, ProverQuery,
     },
     transcript::{Hashable, Sampleable, Transcript},
     utils::{
         arithmetic::{
-            CurveAffine, CurveExt, MSM, eval_polynomial, evals_inner_product, inner_product,
-            kate_division, lagrange_interpolate, msm_inner_product, powers,
+            eval_polynomial, evals_inner_product, inner_product, kate_division,
+            lagrange_interpolate, msm_inner_product, powers, CurveAffine, CurveExt, MSM,
         },
         helpers::ProcessedSerdeObject,
     },
@@ -377,18 +377,18 @@ mod tests {
 
     use blake2b_simd::State as Blake2bState;
     use ff::WithSmallOrderMulGroup;
-    use midnight_curves::{CurveAffine, CurveExt, pairing::MultiMillerLoop, serde::SerdeObject};
+    use midnight_curves::{pairing::MultiMillerLoop, serde::SerdeObject, CurveAffine, CurveExt};
     use rand_core::OsRng;
 
     use crate::{
         poly::{
-            CommitmentLabel, EvaluationDomain,
             commitment::{Guard, PolynomialCommitmentScheme},
             kzg::{
-                KZGCommitmentScheme,
                 params::{ParamsKZG, ParamsVerifierKZG},
+                KZGCommitmentScheme,
             },
             query::{ProverQuery, VerifierQuery},
+            CommitmentLabel, EvaluationDomain,
         },
         transcript::{CircuitTranscript, Hashable, Sampleable, Transcript},
         utils::arithmetic::eval_polynomial,

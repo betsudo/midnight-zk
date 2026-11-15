@@ -9,8 +9,8 @@ use super::Argument;
 use crate::{
     plonk::Error,
     poly::{
-        Coeff, EvaluationDomain, ExtendedLagrangeCoeff, Polynomial, ProverQuery,
-        commitment::PolynomialCommitmentScheme,
+        commitment::PolynomialCommitmentScheme, Coeff, EvaluationDomain, ExtendedLagrangeCoeff,
+        Polynomial, ProverQuery,
     },
     transcript::{Hashable, Transcript},
     utils::arithmetic::{eval_polynomial, parallelize},

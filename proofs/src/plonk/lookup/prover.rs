@@ -5,14 +5,14 @@ use group::ff::BatchInvert;
 use rand_core::{CryptoRng, RngCore};
 
 use super::{
-    super::{Error, ProvingKey, circuit::Expression},
+    super::{circuit::Expression, Error, ProvingKey},
     Argument,
 };
 use crate::{
     plonk::evaluation::evaluate,
     poly::{
-        Coeff, EvaluationDomain, LagrangeCoeff, Polynomial, PolynomialView, ProverQuery, Rotation,
-        commitment::PolynomialCommitmentScheme,
+        commitment::PolynomialCommitmentScheme, Coeff, EvaluationDomain, LagrangeCoeff, Polynomial,
+        PolynomialView, ProverQuery, Rotation,
     },
     transcript::{Hashable, Transcript},
     utils::arithmetic::{eval_polynomial, parallelize},

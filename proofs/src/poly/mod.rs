@@ -15,7 +15,7 @@ use ff::{BatchInvert, PrimeField, WithSmallOrderMulGroup};
 use group::ff::Field;
 use midnight_curves::serde::SerdeObject;
 
-use crate::utils::{SerdeFormat, arithmetic::parallelize};
+use crate::utils::{arithmetic::parallelize, SerdeFormat};
 
 mod domain;
 mod query;
@@ -28,7 +28,7 @@ pub mod commitment;
 
 pub use domain::*;
 pub use query::{CommitmentLabel, ProverQuery, VerifierQuery};
-pub(crate) use view::{PolynomialRead, PolynomialView, polynomial_inner_product, polynomial_views};
+pub(crate) use view::{polynomial_inner_product, polynomial_views, PolynomialRead, PolynomialView};
 
 use crate::utils::{helpers::read_f, rational::Rational};
 
