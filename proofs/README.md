@@ -1,5 +1,7 @@
 # Midnight Proofs
 
+See [Ledger9 native proving storage](docs/ledger9-native-memory.md) for the opt-in feature, request policy, Wasm boundary, and qualification gates.
+
 [![Crates.io Version](https://img.shields.io/crates/v/midnight-proofs?label=midnight-proofs)](https://crates.io/crates/midnight-proofs)
 
 Implementation of Plonk proof system with KZG commitments. This repo initially started 
