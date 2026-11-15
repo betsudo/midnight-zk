@@ -64,6 +64,8 @@ criterion = "0.7"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 memmap2 = { version = "0.9", optional = true }
+tempfile = { version = "3", optional = true }
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
@@ -75,8 +77,9 @@ midnight-curves = { version = "0.3.0", features = [
 
 [features]
 default = ["committed-instances"]
-native-memory = ["mmap"]
+native-memory = ["disk-spill"]
 mmap = ["dep:memmap2"]
+disk-spill = ["mmap", "dep:tempfile", "dep:libc"]
 circuit-params = []
 derive_serde = ["midnight-curves/serde"]
 dev-curves = ["midnight-curves/serde", "midnight-curves/dev-curves"]

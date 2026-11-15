@@ -353,6 +353,10 @@ where
         fixed_cosets,
         permutation: permutation_pk,
         ev,
+        #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+        fixed_values_mmap: None,
+        #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+        fixed_polys_mmap: None,
     })
 }
 

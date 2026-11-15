@@ -14,16 +14,16 @@ use crate::{
         vanishing::verifier::{Evaluated, PartiallyEvaluated},
     },
     poly::{
-        Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, PinnedEvaluationDomain,
-        Polynomial, PolynomialView, polynomial_views,
+        polynomial_views, Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff,
+        PinnedEvaluationDomain, Polynomial, PolynomialView,
     },
     transcript::{Hashable, Transcript},
     utils::{
-        SerdeFormat,
         helpers::{
-            ProcessedSerdeObject, byte_length, polynomial_slice_byte_length, read_polynomial_vec,
-            write_polynomial_slice,
+            byte_length, polynomial_slice_byte_length, read_polynomial_vec, write_polynomial_slice,
+            ProcessedSerdeObject,
         },
+        SerdeFormat,
     },
 };
 
@@ -32,6 +32,8 @@ mod error;
 pub(crate) mod evaluation;
 mod keygen;
 pub(crate) mod lookup;
+#[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+mod mmap_pk;
 pub mod permutation;
 pub(crate) mod traces;
 pub(crate) mod trash;
@@ -345,14 +347,26 @@ pub struct ProvingKey<F: PrimeField, CS: PolynomialCommitmentScheme<F>> {
     pub(crate) fixed_cosets: Vec<Polynomial<F, ExtendedLagrangeCoeff>>,
     pub(crate) permutation: permutation::ProvingKey<F>,
     pub(crate) ev: Evaluator<F>,
+    #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+    fixed_values_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, LagrangeCoeff>>>,
+    #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+    fixed_polys_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, Coeff>>>,
 }
 
 impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     pub(crate) fn fixed_values_views(&self) -> Vec<PolynomialView<'_, F, LagrangeCoeff>> {
+        #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+        if let Some(mapped) = &self.fixed_values_mmap {
+            return mapped.views();
+        }
         polynomial_views(&self.fixed_values)
     }
 
     pub(crate) fn fixed_polys_views(&self) -> Vec<PolynomialView<'_, F, Coeff>> {
+        #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+        if let Some(mapped) = &self.fixed_polys_mmap {
+            return mapped.views();
+        }
         polynomial_views(&self.fixed_polys)
     }
 
@@ -374,7 +388,7 @@ where
     pub fn bytes_length(&self, format: SerdeFormat) -> usize {
         self.vk.bytes_length(format)
             + 12 // bytes used for encoding the length(u32) of "l0", "l_last" & "l_active_row" polys
-            + polynomial_slice_byte_length(&self.fixed_values)
+            + polynomial_slice_byte_length(&self.fixed_values_views())
             + self.permutation.bytes_length()
     }
 }
@@ -396,7 +410,7 @@ where
     ///   serializing the rest of the data (in the form of field polynomials)
     pub fn write<W: io::Write>(&self, writer: &mut W, format: SerdeFormat) -> io::Result<()> {
         self.vk.write(writer, format)?;
-        write_polynomial_slice(&self.fixed_values, writer)?;
+        write_polynomial_slice(&self.fixed_values_views(), writer)?;
         self.permutation.write(writer)?;
         Ok(())
     }
@@ -450,7 +464,68 @@ where
             fixed_cosets,
             permutation,
             ev,
+            #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+            fixed_values_mmap: None,
+            #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+            fixed_polys_mmap: None,
         })
+    }
+
+    /// Read a key using native mapped storage for its fixed polynomial columns.
+    /// The serialized key and proof APIs are unchanged. This path still builds
+    /// derived cosets eagerly; deferring them requires the later coset slice.
+    /// An unavailable native feature or a Wasm target returns `Unsupported`
+    /// before consuming `reader`.
+    pub fn read_mapped<R: io::Read, ConcreteCircuit: Circuit<F>>(
+        reader: &mut R,
+        format: SerdeFormat,
+        #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
+        spill_dir: Option<&std::path::Path>,
+    ) -> io::Result<Self> {
+        #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+        {
+            let mut key = Self::read::<R, ConcreteCircuit>(
+                reader,
+                format,
+                #[cfg(feature = "circuit-params")]
+                params,
+            )?;
+            key.map_fixed_columns(spill_dir)?;
+            Ok(key)
+        }
+        #[cfg(not(all(feature = "disk-spill", not(target_family = "wasm"))))]
+        {
+            let _ = (reader, format, spill_dir);
+            #[cfg(feature = "circuit-params")]
+            let _ = params;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "mapped proving keys require native disk-spill support",
+            ))
+        }
+    }
+
+    #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+    fn map_fixed_columns(&mut self, spill_dir: Option<&std::path::Path>) -> io::Result<()> {
+        if !self.fixed_values.is_empty() {
+            let width = self.fixed_values[0].values.len();
+            let mapped = mmap_pk::spill_vec_to_disk(
+                spill_dir,
+                std::mem::take(&mut self.fixed_values),
+                width,
+            )?;
+            self.fixed_values_mmap = Some(std::sync::Arc::new(mapped));
+        }
+        if !self.fixed_polys.is_empty() {
+            let width = self.fixed_polys[0].values.len();
+            let mapped = mmap_pk::spill_vec_to_disk(
+                spill_dir,
+                std::mem::take(&mut self.fixed_polys),
+                width,
+            )?;
+            self.fixed_polys_mmap = Some(std::sync::Arc::new(mapped));
+        }
+        Ok(())
     }
 
     /// Writes a proving key to a vector of bytes using [`Self::write`].

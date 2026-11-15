@@ -552,4 +552,63 @@ fn plonk_api() {
         pk.get_vk(),
         &proof[..],
     );
+
+    #[cfg(not(all(feature = "disk-spill", not(target_family = "wasm"))))]
+    {
+        use midnight_proofs::utils::SerdeFormat;
+
+        let key_bytes = pk.to_bytes(SerdeFormat::RawBytes);
+        let mut input = key_bytes.as_slice();
+        let original_len = input.len();
+        let error = ProvingKey::<Scalar, Scheme>::read_mapped::<_, MyCircuit<Scalar>>(
+            &mut input,
+            SerdeFormat::RawBytes,
+            #[cfg(feature = "circuit-params")]
+            (),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(input.len(), original_len);
+    }
+
+    #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+    {
+        use midnight_proofs::utils::SerdeFormat;
+
+        let key_bytes = pk.to_bytes(SerdeFormat::RawBytes);
+        let mapped = ProvingKey::<Scalar, Scheme>::read_mapped::<_, MyCircuit<Scalar>>(
+            &mut key_bytes.as_slice(),
+            SerdeFormat::RawBytes,
+            #[cfg(feature = "circuit-params")]
+            (),
+            None,
+        )
+        .expect("native mapped key load");
+        assert_eq!(mapped.to_bytes(SerdeFormat::RawBytes), key_bytes);
+        assert_eq!(
+            mapped.bytes_length(SerdeFormat::RawBytes),
+            pk.bytes_length(SerdeFormat::RawBytes)
+        );
+
+        let mapped_proof =
+            create_proof::<Scalar, Scheme, CircuitTranscript<State>, _>(rng, &params, &mapped);
+        verify_proof::<_, _, CircuitTranscript<State>>(
+            &params.verifier_params(),
+            mapped.get_vk(),
+            &mapped_proof,
+        );
+
+        let missing_dir = tempfile::tempdir().unwrap().path().join("missing");
+        assert!(
+            ProvingKey::<Scalar, Scheme>::read_mapped::<_, MyCircuit<Scalar>>(
+                &mut key_bytes.as_slice(),
+                SerdeFormat::RawBytes,
+                #[cfg(feature = "circuit-params")]
+                (),
+                Some(&missing_dir),
+            )
+            .is_err()
+        );
+    }
 }
