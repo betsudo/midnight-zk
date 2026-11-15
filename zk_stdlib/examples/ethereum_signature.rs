@@ -115,6 +115,7 @@ impl Relation for EthereumSigExample {
         secp256k1_curve.assert_non_zero(layouter, &r_point)?;
 
         // 2. r_point.x should be equal to r.
+        #[expect(deprecated, reason = "preserve published Ledger9 circuit shape")]
         let r_point_x = secp256k1_curve.x_coordinate(&r_point);
         let r_point_x_bits = secp256k1_base.assigned_to_le_bytes(layouter, &r_point_x, None)?;
         let r_point_x_scalar =

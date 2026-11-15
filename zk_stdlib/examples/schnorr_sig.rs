@@ -130,6 +130,7 @@ impl Relation for SchnorrExample {
         let rv =
             (std_lib.jubjub()).msm(layouter, &[sig_s, sig_e.clone()], &[generator, pk.clone()])?;
 
+        #[expect(deprecated, reason = "preserve published Ledger9 circuit shape")]
         let coords = |p| (jubjub.x_coordinate(p), jubjub.y_coordinate(p));
         let (pkx, pky) = coords(&pk);
         let (rx, ry) = coords(&rv);

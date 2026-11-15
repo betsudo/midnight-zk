@@ -94,6 +94,7 @@ impl Relation for BitcoinSigExample {
         let tag = std_lib.assign_many_fixed(layouter, &tag_value)?;
 
         let rx_bytes = secp256k1_base.assigned_to_be_bytes(layouter, &rx, None)?;
+        #[expect(deprecated, reason = "preserve published Ledger9 circuit shape")]
         let pk_x = secp256k1_curve.x_coordinate(&pk);
         let pk_x_bytes = secp256k1_base.assigned_to_be_bytes(layouter, &pk_x, None)?;
 
@@ -130,11 +131,13 @@ impl Relation for BitcoinSigExample {
         secp256k1_curve.assert_non_zero(layouter, &r_point)?;
 
         //  2. It should have an even y coordinate.
+        #[expect(deprecated, reason = "preserve published Ledger9 circuit shape")]
         let y = secp256k1_curve.y_coordinate(&r_point);
         let y_sign = secp256k1_base.sgn0(layouter, &y)?;
         std_lib.assert_false(layouter, &y_sign)?;
 
         // 3. r_point.x should be equal to the rx that was hashed.
+        #[expect(deprecated, reason = "preserve published Ledger9 circuit shape")]
         let r_point_x = secp256k1_curve.x_coordinate(&r_point);
         secp256k1_base.assert_equal(layouter, &r_point_x, &rx)
     }
