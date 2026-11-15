@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://book.async.rs/overview
 ### Changed
 
 ### Fixed
+* Read BLS12-381 BLST generator constants without assuming native alignment on Wasm targets.
 
 ### Removed
 
