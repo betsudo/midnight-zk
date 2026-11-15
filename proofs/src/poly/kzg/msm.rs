@@ -170,6 +170,21 @@ const fn fast_path_max(aarch64: bool) -> usize {
     if aarch64 { 1 << 21 } else { 1 << 18 }
 }
 
+/// Select the gate without changing the published browser-Wasm path. Native
+/// x86 uses its measured 2^18 boundary even without the memory capability;
+/// the separate aarch64 raise belongs to the opt-in.
+const fn selected_fast_path_max(native_memory: bool, wasm: bool, aarch64: bool) -> usize {
+    if wasm {
+        2 << 18
+    } else if !aarch64 {
+        fast_path_max(false)
+    } else if native_memory {
+        fast_path_max(true)
+    } else {
+        2 << 18
+    }
+}
+
 #[allow(unsafe_code)]
 /// Wrapper over the MSM function to use the blstrs underlying function
 pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) -> C::Curve {
@@ -185,14 +200,13 @@ pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) ->
         return C::Curve::identity();
     }
 
-    // Keep the published 0.8.2 path when native-memory is off, including on
-    // Wasm. The measured, target-specific gate is part of the native opt-in.
-    const FAST_PATH_MAX: usize =
-        if cfg!(all(feature = "native-memory", not(target_family = "wasm"))) {
-            fast_path_max(cfg!(target_arch = "aarch64"))
-        } else {
-            2 << 18
-        };
+    // Fix the documented x86 threshold independently of the memory feature.
+    // Keep browser-Wasm's published path; raise aarch64 only with native-memory.
+    const FAST_PATH_MAX: usize = selected_fast_path_max(
+        cfg!(feature = "native-memory"),
+        cfg!(target_family = "wasm"),
+        cfg!(target_arch = "aarch64"),
+    );
     if coeffs.len() <= FAST_PATH_MAX
         && TypeId::of::<C>() == TypeId::of::<midnight_curves::G1Affine>()
     {
@@ -373,7 +387,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::fast_path_max;
+    use super::{fast_path_max, selected_fast_path_max};
 
     /// The gate is a measured boundary, so it is pinned against decimal
     /// literals: `1 << 18` on both sides of an assertion proves nothing, and
@@ -391,6 +405,12 @@ mod test {
             2_097_152,
             "aarch64 must gate at 2^21 so k=21 stays on the fast path"
         );
+        assert_eq!(selected_fast_path_max(false, false, false), 262_144);
+        assert_eq!(selected_fast_path_max(true, false, false), 262_144);
+        assert_eq!(selected_fast_path_max(false, false, true), 524_288);
+        assert_eq!(selected_fast_path_max(true, false, true), 2_097_152);
+        assert_eq!(selected_fast_path_max(true, true, false), 524_288);
+        assert_eq!(selected_fast_path_max(true, true, true), 524_288);
     }
     use ff::Field;
     use group::Group;
