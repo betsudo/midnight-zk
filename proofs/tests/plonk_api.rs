@@ -553,10 +553,13 @@ fn plonk_api() {
         &proof[..],
     );
 
+    use midnight_proofs::utils::SerdeFormat;
+    for format in [SerdeFormat::RawBytes, SerdeFormat::Processed] {
+        assert_eq!(pk.bytes_length(format), pk.to_bytes(format).len());
+    }
+
     #[cfg(not(all(feature = "disk-spill", not(target_family = "wasm"))))]
     {
-        use midnight_proofs::utils::SerdeFormat;
-
         let key_bytes = pk.to_bytes(SerdeFormat::RawBytes);
         let mut input = key_bytes.as_slice();
         let original_len = input.len();
@@ -574,9 +577,8 @@ fn plonk_api() {
 
     #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
     {
-        use midnight_proofs::utils::SerdeFormat;
-
         let key_bytes = pk.to_bytes(SerdeFormat::RawBytes);
+        assert_eq!(pk.bytes_length(SerdeFormat::RawBytes), key_bytes.len());
         let mapped = ProvingKey::<Scalar, Scheme>::read_mapped::<_, MyCircuit<Scalar>>(
             &mut key_bytes.as_slice(),
             SerdeFormat::RawBytes,
@@ -586,9 +588,12 @@ fn plonk_api() {
         )
         .expect("native mapped key load");
         assert_eq!(mapped.to_bytes(SerdeFormat::RawBytes), key_bytes);
+        assert_eq!(mapped.bytes_length(SerdeFormat::RawBytes), key_bytes.len());
+        let processed_bytes = pk.to_bytes(SerdeFormat::Processed);
+        assert_eq!(mapped.to_bytes(SerdeFormat::Processed), processed_bytes);
         assert_eq!(
-            mapped.bytes_length(SerdeFormat::RawBytes),
-            pk.bytes_length(SerdeFormat::RawBytes)
+            mapped.bytes_length(SerdeFormat::Processed),
+            processed_bytes.len()
         );
 
         let mapped_proof =

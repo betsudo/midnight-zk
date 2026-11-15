@@ -219,7 +219,7 @@ where
 impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>> VerifyingKey<F, CS> {
     /// Return the bytes_length of a VerifyingKey
     pub fn bytes_length(&self, format: SerdeFormat) -> usize {
-        10 + (self.fixed_commitments.len() * byte_length::<CS::Commitment>(format))
+        6 + (self.fixed_commitments.len() * byte_length::<CS::Commitment>(format))
             + self.permutation.bytes_length(format)
     }
 
@@ -387,9 +387,8 @@ where
     /// Gets the total number of bytes in the serialization of `self`
     pub fn bytes_length(&self, format: SerdeFormat) -> usize {
         self.vk.bytes_length(format)
-            + 12 // bytes used for encoding the length(u32) of "l0", "l_last" & "l_active_row" polys
             + polynomial_slice_byte_length(&self.fixed_values_views())
-            + self.permutation.bytes_length()
+            + polynomial_slice_byte_length(&self.permutation.permutations)
     }
 }
 
@@ -435,6 +434,21 @@ where
         format: SerdeFormat,
         #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
     ) -> io::Result<Self> {
+        Self::read_inner::<R, ConcreteCircuit>(
+            reader,
+            format,
+            #[cfg(feature = "circuit-params")]
+            params,
+            false,
+        )
+    }
+
+    fn read_inner<R: io::Read, ConcreteCircuit: Circuit<F>>(
+        reader: &mut R,
+        format: SerdeFormat,
+        #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
+        defer_cosets: bool,
+    ) -> io::Result<Self> {
         let vk = VerifyingKey::<F, CS>::read::<R, ConcreteCircuit>(
             reader,
             format,
@@ -447,12 +461,21 @@ where
             .iter()
             .map(|poly| vk.domain.lagrange_to_coeff(poly.clone()))
             .collect();
-        let fixed_cosets = fixed_polys
-            .iter()
-            .map(|poly| vk.domain.coeff_to_extended(poly.clone()))
-            .collect();
-        let permutation =
-            permutation::ProvingKey::read(reader, format, &vk.domain, &vk.cs.permutation)?;
+        let fixed_cosets = if defer_cosets {
+            Vec::new()
+        } else {
+            fixed_polys
+                .iter()
+                .map(|poly| vk.domain.coeff_to_extended(poly.clone()))
+                .collect()
+        };
+        let permutation = permutation::ProvingKey::read(
+            reader,
+            format,
+            &vk.domain,
+            &vk.cs.permutation,
+            defer_cosets,
+        )?;
         let ev = Evaluator::new(vk.cs());
         Ok(Self {
             vk,
@@ -473,9 +496,9 @@ where
 
     /// Read a key using native mapped storage for its fixed polynomial columns.
     /// The serialized key and proof APIs are unchanged. This path still builds
-    /// derived cosets eagerly; deferring them requires the later coset slice.
-    /// An unavailable native feature or a Wasm target returns `Unsupported`
-    /// before consuming `reader`.
+    /// defers derived cosets until proof creation, avoiding their load-time
+    /// peak. An unavailable native feature or a Wasm target returns
+    /// `Unsupported` before consuming `reader`.
     pub fn read_mapped<R: io::Read, ConcreteCircuit: Circuit<F>>(
         reader: &mut R,
         format: SerdeFormat,
@@ -484,11 +507,12 @@ where
     ) -> io::Result<Self> {
         #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
         {
-            let mut key = Self::read::<R, ConcreteCircuit>(
+            let mut key = Self::read_inner::<R, ConcreteCircuit>(
                 reader,
                 format,
                 #[cfg(feature = "circuit-params")]
                 params,
+                true,
             )?;
             key.map_fixed_columns(spill_dir)?;
             Ok(key)

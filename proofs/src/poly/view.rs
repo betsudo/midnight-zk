@@ -48,6 +48,16 @@ impl<'a, F, B> PolynomialView<'a, F, B> {
             _marker: PhantomData,
         }
     }
+
+    pub(crate) fn materialise(&self) -> Polynomial<F, B>
+    where
+        F: Clone,
+    {
+        Polynomial {
+            values: self.values.to_vec(),
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<F, B> Deref for PolynomialView<'_, F, B> {

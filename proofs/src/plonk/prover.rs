@@ -9,13 +9,12 @@ use ff::{Field, FromUniformBytes, PrimeField, WithSmallOrderMulGroup};
 use rand_core::{CryptoRng, RngCore};
 
 use super::{
-    Error, ProvingKey,
     circuit::{
+        sealed::{self},
         Advice, Any, Assignment, Challenge, Circuit, Column, ConstraintSystem, Fixed, FloorPlanner,
         Instance, Selector,
-        sealed::{self},
     },
-    lookup, permutation, vanishing,
+    lookup, permutation, vanishing, Error, ProvingKey,
 };
 #[cfg(feature = "committed-instances")]
 use crate::poly::EvaluationDomain;
@@ -23,9 +22,9 @@ use crate::{
     circuit::Value,
     plonk::{traces::ProverTrace, trash},
     poly::{
-        Coeff, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, PolynomialRepresentation,
-        PolynomialView, ProverQuery, batch_invert_rational, commitment::PolynomialCommitmentScheme,
-        polynomial_views,
+        batch_invert_rational, commitment::PolynomialCommitmentScheme, polynomial_views, Coeff,
+        ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, PolynomialRepresentation, PolynomialView,
+        ProverQuery,
     },
     transcript::{Hashable, Sampleable, Transcript},
     utils::{arithmetic::eval_polynomial, rational::Rational},
@@ -646,8 +645,34 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
         instance_cosets.iter().map(|polys| polynomial_views(polys)).collect();
     let advice_refs: Vec<_> = advice_views.iter().map(Vec::as_slice).collect();
     let instance_refs: Vec<_> = instance_views.iter().map(Vec::as_slice).collect();
-    let fixed_views = polynomial_views(&pk.fixed_cosets);
-    let permutation_views = polynomial_views(&pk.permutation.cosets);
+    // A mapped key defers these derived cosets until the proof needs them.
+    // Keep the default key's eagerly cached path unchanged.
+    let built_fixed_cosets: Vec<_> = if pk.fixed_cosets.is_empty() {
+        pk.fixed_polys_views()
+            .iter()
+            .map(|poly| pk.vk.domain.coeff_to_extended(poly.materialise()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let built_permutation_cosets: Vec<_> = if pk.permutation.cosets.is_empty() {
+        pk.permutation_polys_views()
+            .iter()
+            .map(|poly| pk.vk.domain.coeff_to_extended(poly.materialise()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let fixed_views = if built_fixed_cosets.is_empty() {
+        polynomial_views(&pk.fixed_cosets)
+    } else {
+        polynomial_views(&built_fixed_cosets)
+    };
+    let permutation_views = if built_permutation_cosets.is_empty() {
+        polynomial_views(&pk.permutation.cosets)
+    } else {
+        polynomial_views(&built_permutation_cosets)
+    };
 
     // Evaluate the numerator polynomial nu(X) of the quotient polynomial
     // h(X) = nu(X) / (X^n-1): nu(X) is a random linear combination of all
@@ -952,7 +977,7 @@ fn test_create_proof() {
     use crate::{
         circuit::SimpleFloorPlanner,
         plonk::{keygen_pk, keygen_vk_with_k},
-        poly::kzg::{KZGCommitmentScheme, params::ParamsKZG},
+        poly::kzg::{params::ParamsKZG, KZGCommitmentScheme},
         transcript::CircuitTranscript,
     };
 
