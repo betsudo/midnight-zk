@@ -43,7 +43,8 @@ let cancel = CancelToken::new();
 let mut policy = ProverConfig::mapped_key_and_cosets();
 policy.coset_spill_floor_k = 18;
 let context = ProverContext::new(policy).with_cancel(cancel.clone());
-// Pass &context to context-aware key initialization and proving.
+// Pass &context to context-aware proving. A consumer can use
+// context.config when reading a serialized proving key.
 // The request owner can later call cancel.cancel().
 ```
 
@@ -53,9 +54,10 @@ let context = ProverContext::new(policy).with_cancel(cancel.clone());
 | `mapped_key()` | Temporary native mapping | Heap | Explicit native request |
 | `mapped_key_and_cosets()` | Temporary native mapping | Mapping at or above the configured `k` floor | Explicit native request |
 
-A mapped-key request needs serialized key bytes; an initialized heap key
-cannot be silently converted to mapped storage. Coset-only spill can reuse a
-heap-initialized key. Below the floor, cosets stay on the heap.
+The mapped key reader accepts serialized key bytes. The Ledger consumer
+bridge rejects attempts to retroactively map an initialized heap key;
+coset-only spill can reuse that heap key. Below the floor, cosets stay on
+the heap.
 [`mmap_pk.rs`](../src/plonk/mmap_pk.rs) reserves backing space before
 writing and retains mappings for the lifetime of their typed views.
 [`cosets.rs`](../src/plonk/cosets.rs) streams transformed polynomials into
@@ -78,8 +80,9 @@ feature in a unified graph, but `ProverConfig::ensure_supported()` returns
 The IR, proving-key, proof, transcript, and verifier encodings do not
 change with this storage choice.
 
-`CancelToken` is shared only with its clones. Key admission and prover
-phase boundaries check it; a single low-level key read is not interruptible.
+`CancelToken` is shared only with its clones. The proofs crate checks it
+at prover phase boundaries. Ledger's policy-aware key admission also checks
+it, but a single low-level key read is not interruptible.
 Cancellation cannot undo transcript commitments already written. Discard
 the transcript after any proving error, and do not resume it. Separate
 requests must use separate tokens.
