@@ -142,21 +142,66 @@ pub(crate) fn read_polynomial_vec<R: io::Read, F: PrimeField + SerdeObject, B>(
         .collect::<io::Result<Vec<_>>>()
 }
 
-/// Writes a slice of polynomials to buffer
-pub(crate) fn write_polynomial_slice<W: io::Write, F: PrimeField + SerdeObject, B>(
-    slice: &[Polynomial<F, B>],
+/// Writes a homogeneous slice of owned or borrowed polynomials to a buffer.
+pub(crate) fn write_polynomial_slice<W: io::Write, F: PrimeField + SerdeObject, P>(
+    slice: &[P],
     writer: &mut W,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    P: crate::poly::PolynomialRead<F>,
+{
     writer.write_all(&(slice.len() as u32).to_be_bytes())?;
     for poly in slice.iter() {
-        poly.write(writer)?;
+        writer.write_all(&(poly.values().len() as u32).to_be_bytes())?;
+        for value in poly.values() {
+            value.write_raw(writer)?;
+        }
     }
     Ok(())
 }
 
-/// Gets the total number of bytes of a slice of polynomials, assuming all
-/// polynomials are the same length
-pub(crate) fn polynomial_slice_byte_length<F: PrimeField, B>(slice: &[Polynomial<F, B>]) -> usize {
+/// Gets the total number of bytes written by [`write_polynomial_slice`].
+pub(crate) fn polynomial_slice_byte_length<F: PrimeField, P>(slice: &[P]) -> usize
+where
+    P: crate::poly::PolynomialRead<F>,
+{
     let field_len = F::default().to_repr().as_ref().len();
-    4 + slice.len() * (4 + field_len * slice.first().map(|poly| poly.len()).unwrap_or(0))
+    4 + slice.iter().map(|poly| 4 + field_len * poly.values().len()).sum::<usize>()
+}
+
+#[cfg(test)]
+mod polynomial_slice_tests {
+    use midnight_curves::Fq;
+
+    use super::{
+        polynomial_slice_byte_length, read_polynomial_vec, write_polynomial_slice, SerdeFormat,
+    };
+    use crate::poly::{LagrangeCoeff, Polynomial};
+
+    #[test]
+    fn byte_length_matches_encoding_for_uneven_polynomials() {
+        let polynomials: Vec<Polynomial<Fq, LagrangeCoeff>> =
+            [0, 1, 3].into_iter().map(Polynomial::init).collect();
+        let mut bytes = Vec::new();
+        write_polynomial_slice(&polynomials, &mut bytes).unwrap();
+        assert_eq!(polynomial_slice_byte_length(&polynomials), bytes.len());
+        assert_eq!(polynomial_slice_byte_length::<Fq, _>(&polynomials[..0]), 4);
+        let borrowed: Vec<_> = polynomials.iter().collect();
+        let mut borrowed_bytes = Vec::new();
+        write_polynomial_slice(&borrowed, &mut borrowed_bytes).unwrap();
+        assert_eq!(borrowed_bytes, bytes);
+        assert_eq!(polynomial_slice_byte_length(&borrowed), bytes.len());
+
+        let decoded: Vec<Polynomial<Fq, LagrangeCoeff>> =
+            read_polynomial_vec(&mut bytes.as_slice(), SerdeFormat::RawBytes).unwrap();
+        assert_eq!(
+            decoded.iter().map(|poly| &poly.values).collect::<Vec<_>>(),
+            polynomials.iter().map(|poly| &poly.values).collect::<Vec<_>>()
+        );
+        assert!(read_polynomial_vec::<_, Fq, LagrangeCoeff>(
+            &mut &bytes[..bytes.len() - 1],
+            SerdeFormat::RawBytes,
+        )
+        .is_err());
+    }
 }
