@@ -30,20 +30,21 @@ use rand_core::OsRng;
 use crate::utils::arithmetic::{truncate, truncated_powers};
 use crate::{
     poly::{
+        Coeff, Error, LagrangeCoeff, Polynomial, ProverQuery,
         commitment::{Params, PolynomialCommitmentScheme},
         kzg::{
-            msm::{msm_specific, DualMSM, MSMKZG},
+            msm::{DualMSM, MSMKZG, msm_specific},
             params::{ParamsKZG, ParamsVerifierKZG},
             utils::construct_intermediate_sets,
         },
+        polynomial_inner_product,
         query::{CommitmentLabel, VerifierQuery},
-        Coeff, Error, LagrangeCoeff, Polynomial, ProverQuery,
     },
     transcript::{Hashable, Sampleable, Transcript},
     utils::{
         arithmetic::{
-            eval_polynomial, evals_inner_product, inner_product, kate_division,
-            lagrange_interpolate, msm_inner_product, powers, CurveAffine, CurveExt, MSM,
+            CurveAffine, CurveExt, MSM, eval_polynomial, evals_inner_product, inner_product,
+            kate_division, lagrange_interpolate, msm_inner_product, powers,
         },
         helpers::ProcessedSerdeObject,
     },
@@ -119,7 +120,7 @@ where
         let mut q_polys = vec![vec![]; point_sets.len()];
 
         for com_data in poly_map.iter() {
-            q_polys[com_data.set_index].push(com_data.commitment.poly.clone());
+            q_polys[com_data.set_index].push(com_data.commitment.poly);
         }
 
         let q_polys = q_polys
@@ -131,7 +132,7 @@ where
                 #[cfg(not(feature = "truncated-challenges"))]
                 let x1 = powers(x1);
 
-                inner_product(polys, x1)
+                polynomial_inner_product(polys, x1)
             })
             .collect::<Vec<_>>();
 
@@ -376,18 +377,18 @@ mod tests {
 
     use blake2b_simd::State as Blake2bState;
     use ff::WithSmallOrderMulGroup;
-    use midnight_curves::{pairing::MultiMillerLoop, serde::SerdeObject, CurveAffine, CurveExt};
+    use midnight_curves::{CurveAffine, CurveExt, pairing::MultiMillerLoop, serde::SerdeObject};
     use rand_core::OsRng;
 
     use crate::{
         poly::{
+            CommitmentLabel, EvaluationDomain,
             commitment::{Guard, PolynomialCommitmentScheme},
             kzg::{
-                params::{ParamsKZG, ParamsVerifierKZG},
                 KZGCommitmentScheme,
+                params::{ParamsKZG, ParamsVerifierKZG},
             },
             query::{ProverQuery, VerifierQuery},
-            CommitmentLabel, EvaluationDomain,
         },
         transcript::{CircuitTranscript, Hashable, Sampleable, Transcript},
         utils::arithmetic::eval_polynomial,
@@ -506,18 +507,9 @@ mod tests {
         transcript.write(&cvy).unwrap();
 
         let queries = [
-            ProverQuery {
-                point: x,
-                poly: &ax,
-            },
-            ProverQuery {
-                point: x,
-                poly: &bx,
-            },
-            ProverQuery {
-                point: y,
-                poly: &cx,
-            },
+            ProverQuery::new(x, &ax),
+            ProverQuery::new(x, &bx),
+            ProverQuery::new(y, &cx),
         ]
         .into_iter();
 

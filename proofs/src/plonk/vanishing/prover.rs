@@ -9,8 +9,8 @@ use super::Argument;
 use crate::{
     plonk::Error,
     poly::{
-        commitment::PolynomialCommitmentScheme, Coeff, EvaluationDomain, ExtendedLagrangeCoeff,
-        Polynomial, ProverQuery,
+        Coeff, EvaluationDomain, ExtendedLagrangeCoeff, Polynomial, ProverQuery,
+        commitment::PolynomialCommitmentScheme,
     },
     transcript::{Hashable, Transcript},
     utils::arithmetic::{eval_polynomial, parallelize},
@@ -182,13 +182,7 @@ impl<F: WithSmallOrderMulGroup<3>> Constructed<F> {
 impl<F: PrimeField> Evaluated<F> {
     pub(crate) fn open(&self, x: F) -> impl Iterator<Item = ProverQuery<'_, F>> + Clone {
         iter::empty()
-            .chain(Some(ProverQuery {
-                point: x,
-                poly: &self.h_poly,
-            }))
-            .chain(Some(ProverQuery {
-                point: x,
-                poly: &self.committed.random_poly,
-            }))
+            .chain(Some(ProverQuery::new(x, &self.h_poly)))
+            .chain(Some(ProverQuery::new(x, &self.committed.random_poly)))
     }
 }

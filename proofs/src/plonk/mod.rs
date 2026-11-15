@@ -15,15 +15,15 @@ use crate::{
     },
     poly::{
         Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, PinnedEvaluationDomain,
-        Polynomial,
+        Polynomial, PolynomialView, polynomial_views,
     },
     transcript::{Hashable, Transcript},
     utils::{
-        helpers::{
-            byte_length, polynomial_slice_byte_length, read_polynomial_vec, write_polynomial_slice,
-            ProcessedSerdeObject,
-        },
         SerdeFormat,
+        helpers::{
+            ProcessedSerdeObject, byte_length, polynomial_slice_byte_length, read_polynomial_vec,
+            write_polynomial_slice,
+        },
     },
 };
 
@@ -345,6 +345,20 @@ pub struct ProvingKey<F: PrimeField, CS: PolynomialCommitmentScheme<F>> {
     pub(crate) fixed_cosets: Vec<Polynomial<F, ExtendedLagrangeCoeff>>,
     pub(crate) permutation: permutation::ProvingKey<F>,
     pub(crate) ev: Evaluator<F>,
+}
+
+impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
+    pub(crate) fn fixed_values_views(&self) -> Vec<PolynomialView<'_, F, LagrangeCoeff>> {
+        polynomial_views(&self.fixed_values)
+    }
+
+    pub(crate) fn fixed_polys_views(&self) -> Vec<PolynomialView<'_, F, Coeff>> {
+        polynomial_views(&self.fixed_polys)
+    }
+
+    pub(crate) fn permutation_polys_views(&self) -> Vec<PolynomialView<'_, F, Coeff>> {
+        polynomial_views(&self.permutation.polys)
+    }
 }
 
 impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS>

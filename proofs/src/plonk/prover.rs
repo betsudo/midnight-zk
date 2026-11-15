@@ -9,12 +9,13 @@ use ff::{Field, FromUniformBytes, PrimeField, WithSmallOrderMulGroup};
 use rand_core::{CryptoRng, RngCore};
 
 use super::{
+    Error, ProvingKey,
     circuit::{
-        sealed::{self},
         Advice, Any, Assignment, Challenge, Circuit, Column, ConstraintSystem, Fixed, FloorPlanner,
         Instance, Selector,
+        sealed::{self},
     },
-    lookup, permutation, vanishing, Error, ProvingKey,
+    lookup, permutation, vanishing,
 };
 #[cfg(feature = "committed-instances")]
 use crate::poly::EvaluationDomain;
@@ -22,8 +23,9 @@ use crate::{
     circuit::Value,
     plonk::{traces::ProverTrace, trash},
     poly::{
-        batch_invert_rational, commitment::PolynomialCommitmentScheme, Coeff,
-        ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, PolynomialRepresentation, ProverQuery,
+        Coeff, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, PolynomialRepresentation,
+        PolynomialView, ProverQuery, batch_invert_rational, commitment::PolynomialCommitmentScheme,
+        polynomial_views,
     },
     transcript::{Hashable, Sampleable, Transcript},
     utils::{arithmetic::eval_polynomial, rational::Rational},
@@ -103,35 +105,42 @@ where
     let instance = compute_instances(params, pk, instances, nb_committed_instances, transcript)?;
 
     let (advice, challenges) = parse_advices(params, pk, circuits, instances, transcript, rng)?;
+    let fixed_values = pk.fixed_values_views();
+    let advice_values: Vec<_> =
+        advice.iter().map(|row| polynomial_views(&row.advice_polys)).collect();
+    let instance_values: Vec<_> =
+        instance.iter().map(|row| polynomial_views(&row.instance_values)).collect();
 
     // Sample theta challenge for keeping lookup columns linearly independent
     let theta: F = transcript.squeeze_challenge();
 
-    let lookups: Vec<Vec<lookup::prover::Permuted<F>>> = instance
+    let lookups: Vec<Vec<lookup::prover::Permuted<F>>> = instance_values
         .iter()
-        .zip(advice.iter())
-        .map(|(instance, advice)| -> Result<Vec<_>, Error> {
-            // Construct and commit to permuted values for each lookup
-            pk.vk
-                .cs
-                .lookups
-                .iter()
-                .map(|lookup| {
-                    lookup.commit_permuted(
-                        pk,
-                        params,
-                        domain,
-                        theta,
-                        &advice.advice_polys,
-                        &pk.fixed_values,
-                        &instance.instance_values,
-                        &challenges,
-                        rng,
-                        transcript,
-                    )
-                })
-                .collect()
-        })
+        .zip(advice_values.iter())
+        .map(
+            |(instance_values, advice_values)| -> Result<Vec<_>, Error> {
+                // Construct and commit to permuted values for each lookup
+                pk.vk
+                    .cs
+                    .lookups
+                    .iter()
+                    .map(|lookup| {
+                        lookup.commit_permuted(
+                            pk,
+                            params,
+                            domain,
+                            theta,
+                            advice_values,
+                            &fixed_values,
+                            instance_values,
+                            &challenges,
+                            rng,
+                            transcript,
+                        )
+                    })
+                    .collect()
+            },
+        )
         .collect::<Result<Vec<_>, _>>()?;
 
     // Sample beta challenge
@@ -141,17 +150,17 @@ where
     let gamma: F = transcript.squeeze_challenge();
 
     // Commit to permutations.
-    let permutations: Vec<permutation::prover::Committed<F>> = instance
+    let permutations: Vec<permutation::prover::Committed<F>> = instance_values
         .iter()
-        .zip(advice.iter())
-        .map(|(instance, advice)| {
+        .zip(advice_values.iter())
+        .map(|(instance_values, advice_values)| {
             pk.vk.cs.permutation.commit(
                 params,
                 pk,
                 &pk.permutation,
-                &advice.advice_polys,
-                &pk.fixed_values,
-                &instance.instance_values,
+                advice_values,
+                &fixed_values,
+                instance_values,
                 beta,
                 gamma,
                 rng,
@@ -174,28 +183,30 @@ where
     // Trash argument
     let trash_challenge: F = transcript.squeeze_challenge();
 
-    let trashcans: Vec<Vec<trash::prover::Committed<F>>> = instance
+    let trashcans: Vec<Vec<trash::prover::Committed<F>>> = instance_values
         .iter()
-        .zip(advice.iter())
-        .map(|(instance, advice)| -> Result<Vec<_>, Error> {
-            pk.vk
-                .cs
-                .trashcans
-                .iter()
-                .map(|trash| {
-                    trash.commit::<CS, _>(
-                        params,
-                        domain,
-                        trash_challenge,
-                        &advice.advice_polys,
-                        &pk.fixed_values,
-                        &instance.instance_values,
-                        &challenges,
-                        transcript,
-                    )
-                })
-                .collect()
-        })
+        .zip(advice_values.iter())
+        .map(
+            |(instance_values, advice_values)| -> Result<Vec<_>, Error> {
+                pk.vk
+                    .cs
+                    .trashcans
+                    .iter()
+                    .map(|trash| {
+                        trash.commit::<CS, _>(
+                            params,
+                            domain,
+                            trash_challenge,
+                            advice_values,
+                            &fixed_values,
+                            instance_values,
+                            &challenges,
+                            transcript,
+                        )
+                    })
+                    .collect()
+            },
+        )
         .collect::<Result<Vec<_>, _>>()?;
 
     // Commit to the vanishing argument's random polynomial for blinding h(x_3)
@@ -293,7 +304,7 @@ where
     let vanishing = vanishing.evaluate(x, domain, transcript)?;
 
     // Evaluate common permutation data
-    pk.permutation.evaluate(x, transcript)?;
+    pk.permutation.evaluate(&pk.permutation_polys_views(), x, transcript)?;
 
     // Evaluate the permutations, if any, at omega^i x.
     let permutations: Vec<permutation::prover::Evaluated<F>> = permutations
@@ -630,15 +641,23 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
         })
         .collect();
 
+    let advice_views: Vec<_> = advice_cosets.iter().map(|polys| polynomial_views(polys)).collect();
+    let instance_views: Vec<_> =
+        instance_cosets.iter().map(|polys| polynomial_views(polys)).collect();
+    let advice_refs: Vec<_> = advice_views.iter().map(Vec::as_slice).collect();
+    let instance_refs: Vec<_> = instance_views.iter().map(Vec::as_slice).collect();
+    let fixed_views = polynomial_views(&pk.fixed_cosets);
+    let permutation_views = polynomial_views(&pk.permutation.cosets);
+
     // Evaluate the numerator polynomial nu(X) of the quotient polynomial
     // h(X) = nu(X) / (X^n-1): nu(X) is a random linear combination of all
     // independent identities
     pk.ev.evaluate_numerator::<ExtendedLagrangeCoeff>(
         &pk.vk.domain,
         &pk.vk.cs,
-        &advice_cosets.iter().map(|a| a.as_slice()).collect::<Vec<_>>(),
-        &instance_cosets.iter().map(|i| i.as_slice()).collect::<Vec<_>>(),
-        &pk.fixed_cosets,
+        &advice_refs,
+        &instance_refs,
+        &fixed_views,
         challenges,
         *y,
         *beta,
@@ -648,10 +667,10 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
         lookups,
         trashcans,
         permutations,
-        &pk.l0,
-        &pk.l_last,
-        &pk.l_active_row,
-        &pk.permutation.cosets,
+        PolynomialView::new(&pk.l0.values),
+        PolynomialView::new(&pk.l_last.values),
+        PolynomialView::new(&pk.l_active_row.values),
+        &permutation_views,
     )
 }
 
@@ -700,11 +719,12 @@ where
     }
 
     // Compute and hash fixed evals (shared across all circuit instances)
+    let fixed_polys = pk.fixed_polys_views();
     let fixed_evals: Vec<_> = meta
         .fixed_queries
         .iter()
         .map(|&(column, at)| {
-            eval_polynomial(&pk.fixed_polys[column.index()], domain.rotate_omega(x, at))
+            eval_polynomial(&fixed_polys[column.index()], domain.rotate_omega(x, at))
         })
         .collect();
 
@@ -733,6 +753,8 @@ pub(super) fn compute_queries<
     x: F,
 ) -> Vec<ProverQuery<'a, F>> {
     let domain = pk.vk.get_domain();
+    let fixed_polys = pk.fixed_polys_views();
+    let permutation_polys = pk.permutation_polys_views();
     instance_polys
         .iter()
         .zip(advice_polys.iter())
@@ -742,19 +764,16 @@ pub(super) fn compute_queries<
         .flat_map(
             move |((((instance, advice), permutation), lookups), trash)| {
                 iter::empty()
-                    .chain(
-                        pk.vk.cs.advice_queries.iter().map(move |&(column, at)| ProverQuery {
-                            point: domain.rotate_omega(x, at),
-                            poly: &advice[column.index()],
-                        }),
-                    )
+                    .chain(pk.vk.cs.advice_queries.iter().map(move |&(column, at)| {
+                        ProverQuery::new(domain.rotate_omega(x, at), &advice[column.index()])
+                    }))
                     .chain(
                         pk.vk.cs.instance_queries.iter().filter_map(move |&(column, at)| {
                             if column.index() < nb_committed_instances {
-                                Some(ProverQuery {
-                                    point: domain.rotate_omega(x, at),
-                                    poly: &instance[column.index()],
-                                })
+                                Some(ProverQuery::new(
+                                    domain.rotate_omega(x, at),
+                                    &instance[column.index()],
+                                ))
                             } else {
                                 None
                             }
@@ -765,13 +784,10 @@ pub(super) fn compute_queries<
                     .chain(trash.iter().flat_map(move |p| p.open(x)))
             },
         )
-        .chain(
-            pk.vk.cs.fixed_queries.iter().map(move |&(column, at)| ProverQuery {
-                point: domain.rotate_omega(x, at),
-                poly: &pk.fixed_polys[column.index()],
-            }),
-        )
-        .chain(pk.permutation.open(x))
+        .chain(pk.vk.cs.fixed_queries.iter().map(move |&(column, at)| {
+            ProverQuery::from_view(domain.rotate_omega(x, at), fixed_polys[column.index()])
+        }))
+        .chain(permutation_polys.into_iter().map(move |poly| ProverQuery::from_view(x, poly)))
         // We query the h(X) polynomial at x
         .chain(vanishing.open(x))
         .collect::<Vec<_>>()
@@ -936,7 +952,7 @@ fn test_create_proof() {
     use crate::{
         circuit::SimpleFloorPlanner,
         plonk::{keygen_pk, keygen_vk_with_k},
-        poly::kzg::{params::ParamsKZG, KZGCommitmentScheme},
+        poly::kzg::{KZGCommitmentScheme, params::ParamsKZG},
         transcript::CircuitTranscript,
     };
 
