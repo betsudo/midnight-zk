@@ -34,6 +34,7 @@ hex-literal = "1.1"
 
 [dev-dependencies]
 criterion = "0.7"
+tempfile = "3"
 rand_chacha = { workspace = true }
 goldenfile = "=1.8.0"
 num-bigint = { workspace = true, features = ["rand"] }
@@ -50,6 +51,7 @@ midnight-curves = { version = "0.3.0", features = ["portable"] }
 
 [features]
 default = []
+native-memory = ["midnight-proofs/native-memory"]
 # Feature that exposes some testing functionality, such as load from scratch or instantiable
 testing = ["num-bigint/rand"]
 heap_profiling = []

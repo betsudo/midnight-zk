@@ -100,9 +100,11 @@ use midnight_curves::{
 };
 use midnight_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
+    config::{ProverConfig, ProverContext},
     dev::cost_model::{circuit_model, CircuitModel},
     plonk::{
-        self, keygen_vk_with_k, prepare, Circuit, ConstraintSystem, Error, ProvingKey, VerifyingKey,
+        self, keygen_vk_with_k, prepare, Circuit, ConstraintSystem, Error, ProveWithPolicyError,
+        ProvingKey, VerifyingKey,
     },
     poly::{
         commitment::{Guard, Params},
@@ -1641,6 +1643,18 @@ impl<Rel: Relation> MidnightPK<Rel> {
     /// # WARNING
     /// Use `RawBytesUnchecked` only if you trust the party who wrote the key.
     pub fn read<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self> {
+        Self::read_with_policy(reader, format, &ProverConfig::heap())
+    }
+
+    /// Read a proving key under an explicit storage policy. The serialized
+    /// format is identical to [`Self::read`]. A mapped-key request uses native
+    /// backing; the coset setting is applied later during proof creation.
+    pub fn read_with_policy<R: io::Read>(
+        reader: &mut R,
+        format: SerdeFormat,
+        policy: &ProverConfig,
+    ) -> io::Result<Self> {
+        policy.ensure_supported()?;
         let mut byte = [0u8; 1];
 
         reader.read_exact(&mut byte)?;
@@ -1648,17 +1662,23 @@ impl<Rel: Relation> MidnightPK<Rel> {
 
         let relation = Rel::read_relation(reader)?;
 
-        let pk = ProvingKey::read::<R, MidnightCircuit<Rel>>(
-            reader,
-            format,
-            MidnightCircuit::new(
-                &relation,
-                Value::unknown(),
-                Value::unknown(),
-                Some(k as u32),
-            )
-            .params(),
-        )?;
+        let circuit_params = MidnightCircuit::new(
+            &relation,
+            Value::unknown(),
+            Value::unknown(),
+            Some(k as u32),
+        )
+        .params();
+        let pk = if policy.map_prover_key {
+            ProvingKey::read_mapped::<R, MidnightCircuit<Rel>>(
+                reader,
+                format,
+                circuit_params,
+                policy.spill_dir.as_deref(),
+            )?
+        } else {
+            ProvingKey::read::<R, MidnightCircuit<Rel>>(reader, format, circuit_params)?
+        };
 
         Ok(MidnightPK { k, relation, pk })
     }
@@ -2002,6 +2022,73 @@ where
         rng,
     )
     .map_err(|e| circuit.take_error().unwrap_or_else(|| e.into()))
+}
+
+/// Error from the opt-in relation proof API. Circuit errors retain the
+/// relation's original type, while storage and cancellation remain typed.
+#[derive(Debug)]
+pub enum ProveWithContextError<E: std::fmt::Debug> {
+    /// The relation, witness, or ordinary PLONK proving failed.
+    Relation(E),
+    /// The explicit proving storage or request cancellation failed.
+    Prover(ProveWithPolicyError),
+}
+
+impl<E: std::fmt::Debug> std::fmt::Display for ProveWithContextError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Relation(error) => write!(f, "Relation proof error: {error:?}"),
+            Self::Prover(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for ProveWithContextError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Relation(error) => Some(error),
+            Self::Prover(error) => Some(error),
+        }
+    }
+}
+
+/// Produce a proof with a request-owned memory and cancellation context.
+pub fn prove_with_context<R: Relation, H: TranscriptHash>(
+    context: &ProverContext,
+    params: &ParamsKZG<midnight_curves::Bls12>,
+    pk: &MidnightPK<R>,
+    relation: &R,
+    instance: &R::Instance,
+    witness: R::Witness,
+    rng: impl RngCore + CryptoRng,
+) -> Result<Vec<u8>, ProveWithContextError<R::Error>>
+where
+    G1Projective: Hashable<H>,
+    F: Hashable<H> + Sampleable<H>,
+{
+    let pi = R::format_instance(instance).map_err(ProveWithContextError::Relation)?;
+    let com_inst = R::format_committed_instances(&witness);
+    let circuit = MidnightCircuit::new(
+        relation,
+        Value::known(instance.clone()),
+        Value::known(witness),
+        Some(pk.k as u32),
+    );
+    BlstPLONK::<MidnightCircuit<R>>::prove_with_context::<H>(
+        context,
+        params,
+        &pk.pk,
+        &circuit,
+        1,
+        &[com_inst.as_slice(), &pi],
+        rng,
+    )
+    .map_err(|error| match error {
+        ProveWithPolicyError::Proof(error) => {
+            ProveWithContextError::Relation(circuit.take_error().unwrap_or_else(|| error.into()))
+        }
+        other => ProveWithContextError::Prover(other),
+    })
 }
 
 /// Verifies the given proof of relation `R` with respect to the given instance.

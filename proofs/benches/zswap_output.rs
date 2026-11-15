@@ -6,7 +6,7 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use ff::Field;
 use group::Group;
-use midnight_circuits::{
+use midnight_circuits_v73::{
     ecc::{hash_to_curve::HashToCurveGadget, native::EccChip},
     hash::poseidon::PoseidonChip,
     instructions::{

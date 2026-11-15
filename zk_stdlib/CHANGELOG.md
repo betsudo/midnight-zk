@@ -8,6 +8,7 @@ We use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 ### Added
+* Add opt-in `prove_with_context` and `MidnightPK::read_with_policy` entry points for request-local cancellation and native storage. The original `prove` and `read` entry points retain their released heap behavior; serialized keys and proofs are unchanged.
 ### Changed
 ### Removed
 
