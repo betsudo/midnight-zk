@@ -289,7 +289,7 @@ where
 
     let domain = pk.get_vk().get_domain();
 
-    let nu_poly = compute_nu_poly_with_policy(pk, &trace, &ctx.cosets)?;
+    let nu_poly = compute_nu_poly_with_policy(pk, &trace, &ctx.config.coset_policy())?;
     ctx.checkpoint("finalise.nu")?;
 
     let ProverTrace {
@@ -492,7 +492,7 @@ where
         + Ord
         + FromUniformBytes<64>,
 {
-    ctx.cosets.ensure_supported()?;
+    ctx.config.ensure_supported()?;
     ctx.checkpoint("proof.start")?;
     let trace = compute_trace(
         params,

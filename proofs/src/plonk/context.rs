@@ -5,7 +5,8 @@ use std::sync::{
     Arc,
 };
 
-use super::{CosetStoragePolicy, ProveWithPolicyError};
+use super::ProveWithPolicyError;
+use crate::config::ProverConfig;
 
 /// A cancellation handle shared only with its clones.
 #[derive(Clone, Debug, Default)]
@@ -32,15 +33,16 @@ impl CancelToken {
 /// heap behavior with no cancellation token.
 #[derive(Clone, Debug, Default)]
 pub struct ProverContext {
-    pub(crate) cosets: CosetStoragePolicy,
+    /// Storage policy for this request.
+    pub config: ProverConfig,
     pub(crate) cancel: Option<CancelToken>,
 }
 
 impl ProverContext {
-    /// Select a coset policy for this proof.
-    pub fn new(cosets: CosetStoragePolicy) -> Self {
+    /// Select a storage policy for this proof.
+    pub fn new(config: impl Into<ProverConfig>) -> Self {
         Self {
-            cosets,
+            config: config.into(),
             cancel: None,
         }
     }
@@ -51,8 +53,13 @@ impl ProverContext {
         self
     }
 
+    /// Whether cancellation was requested for this proof.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
+    }
+
     pub(crate) fn checkpoint(&self, phase: &'static str) -> Result<(), ProveWithPolicyError> {
-        if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+        if self.is_cancelled() {
             return Err(ProveWithPolicyError::Cancelled { phase });
         }
         Ok(())
