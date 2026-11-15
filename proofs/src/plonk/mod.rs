@@ -28,6 +28,7 @@ use crate::{
 };
 
 mod circuit;
+mod cosets;
 mod error;
 pub(crate) mod evaluation;
 mod keygen;
@@ -48,6 +49,7 @@ mod verifier;
 use std::{io, iter};
 
 pub use circuit::*;
+pub use cosets::CosetStoragePolicy;
 pub use error::*;
 pub(crate) use evaluation::Evaluator;
 use ff::{PrimeField, WithSmallOrderMulGroup};

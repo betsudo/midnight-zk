@@ -14,7 +14,8 @@ use super::{
         Advice, Any, Assignment, Challenge, Circuit, Column, ConstraintSystem, Fixed, FloorPlanner,
         Instance, Selector,
     },
-    lookup, permutation, vanishing, Error, ProvingKey,
+    cosets::{build_cosets, Cosets},
+    lookup, permutation, vanishing, CosetStoragePolicy, Error, ProveWithPolicyError, ProvingKey,
 };
 #[cfg(feature = "committed-instances")]
 use crate::poly::EvaluationDomain;
@@ -259,7 +260,8 @@ pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transc
     trace: ProverTrace<F>,
     transcript: &mut T,
     rng: &mut (impl RngCore + CryptoRng),
-) -> Result<(), Error>
+    policy: &CosetStoragePolicy,
+) -> Result<(), ProveWithPolicyError>
 where
     CS::Commitment: Hashable<T::Hash>,
     F: WithSmallOrderMulGroup<3>
@@ -274,7 +276,7 @@ where
 
     let domain = pk.get_vk().get_domain();
 
-    let nu_poly = compute_nu_poly(pk, &trace);
+    let nu_poly = compute_nu_poly_with_policy(pk, &trace, policy)?;
 
     let ProverTrace {
         advice_polys,
@@ -345,7 +347,8 @@ where
         x,
     );
 
-    CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure)
+    CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure)?;
+    Ok(())
 }
 
 /// This creates a proof for the provided `circuit` when given the public
@@ -367,7 +370,7 @@ pub fn create_proof<
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     instances: &[&[&[F]]],
     transcript: &mut T,
-    mut rng: impl RngCore + CryptoRng,
+    rng: impl RngCore + CryptoRng,
 ) -> Result<(), Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -378,6 +381,56 @@ where
         + Ord
         + FromUniformBytes<64>,
 {
+    create_proof_with_coset_policy(
+        &CosetStoragePolicy::Heap,
+        params,
+        pk,
+        circuits,
+        #[cfg(feature = "committed-instances")]
+        nb_committed_instances,
+        instances,
+        transcript,
+        rng,
+    )
+    .map_err(|error| match error {
+        ProveWithPolicyError::Proof(error) => error,
+        // The heap policy does not use fallible storage. Preserve the legacy
+        // result type even if a future heap implementation adds an I/O path.
+        ProveWithPolicyError::Storage(error) => {
+            Error::Synthesis(format!("heap prover storage failed: {error}"))
+        }
+    })
+}
+
+/// Create a proof with an explicit, request-local coset storage choice.
+/// A requested native spill fails if the feature or temporary storage is
+/// unavailable; it never silently falls back to unbounded heap storage.
+#[allow(clippy::too_many_arguments)]
+pub fn create_proof_with_coset_policy<
+    F,
+    CS: PolynomialCommitmentScheme<F>,
+    T: Transcript,
+    ConcreteCircuit: Circuit<F>,
+>(
+    policy: &CosetStoragePolicy,
+    params: &CS::Parameters,
+    pk: &ProvingKey<F, CS>,
+    circuits: &[ConcreteCircuit],
+    #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
+    instances: &[&[&[F]]],
+    transcript: &mut T,
+    mut rng: impl RngCore + CryptoRng,
+) -> Result<(), ProveWithPolicyError>
+where
+    CS::Commitment: Hashable<T::Hash>,
+    F: WithSmallOrderMulGroup<3>
+        + Sampleable<T::Hash>
+        + Hashable<T::Hash>
+        + Hash
+        + Ord
+        + FromUniformBytes<64>,
+{
+    policy.ensure_supported()?;
     let trace = compute_trace(
         params,
         pk,
@@ -396,6 +449,7 @@ where
         trace,
         transcript,
         &mut rng,
+        policy,
     )
 }
 
@@ -602,10 +656,20 @@ where
     Ok((advice, challenges))
 }
 
+#[cfg(feature = "bench-internal")]
 pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>>(
     pk: &ProvingKey<F, CS>,
     trace: &ProverTrace<F>,
 ) -> Polynomial<F, ExtendedLagrangeCoeff> {
+    compute_nu_poly_with_policy(pk, trace, &CosetStoragePolicy::Heap)
+        .expect("heap coset construction cannot fail")
+}
+
+fn compute_nu_poly_with_policy<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>>(
+    pk: &ProvingKey<F, CS>,
+    trace: &ProverTrace<F>,
+    policy: &CosetStoragePolicy,
+) -> std::io::Result<Polynomial<F, ExtendedLagrangeCoeff>> {
     let ProverTrace {
         advice_polys,
         instance_polys,
@@ -620,64 +684,62 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
         y,
         ..
     } = &trace;
-    // Calculate the advice and instance cosets
-    let advice_cosets: Vec<Vec<Polynomial<F, ExtendedLagrangeCoeff>>> = advice_polys
+    let k = pk.vk.domain.k();
+    let advice_cosets: Vec<Cosets<F>> = advice_polys
         .iter()
         .map(|advice_polys| {
-            advice_polys
-                .iter()
-                .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
-                .collect()
+            build_cosets(advice_polys, k, policy, |poly| {
+                pk.vk.get_domain().coeff_to_extended(poly.materialise())
+            })
         })
-        .collect();
-    let instance_cosets: Vec<Vec<Polynomial<F, ExtendedLagrangeCoeff>>> = instance_polys
+        .collect::<std::io::Result<_>>()?;
+    let instance_cosets: Vec<Cosets<F>> = instance_polys
         .iter()
         .map(|instance_polys| {
-            instance_polys
-                .iter()
-                .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
-                .collect()
+            build_cosets(instance_polys, k, policy, |poly| {
+                pk.vk.get_domain().coeff_to_extended(poly.materialise())
+            })
         })
-        .collect();
+        .collect::<std::io::Result<_>>()?;
 
-    let advice_views: Vec<_> = advice_cosets.iter().map(|polys| polynomial_views(polys)).collect();
-    let instance_views: Vec<_> =
-        instance_cosets.iter().map(|polys| polynomial_views(polys)).collect();
+    let advice_views: Vec<_> = advice_cosets.iter().map(Cosets::views).collect();
+    let instance_views: Vec<_> = instance_cosets.iter().map(Cosets::views).collect();
     let advice_refs: Vec<_> = advice_views.iter().map(Vec::as_slice).collect();
     let instance_refs: Vec<_> = instance_views.iter().map(Vec::as_slice).collect();
-    // A mapped key defers these derived cosets until the proof needs them.
-    // Keep the default key's eagerly cached path unchanged.
-    let built_fixed_cosets: Vec<_> = if pk.fixed_cosets.is_empty() {
-        pk.fixed_polys_views()
-            .iter()
-            .map(|poly| pk.vk.domain.coeff_to_extended(poly.materialise()))
-            .collect()
+    // A mapped key defers these arrays; an explicit spill policy rebuilds
+    // even a cached heap array so the evaluator uses file-backed storage.
+    let built_fixed_cosets = if policy.should_spill_at(k) || pk.fixed_cosets.is_empty() {
+        let fixed_polys = pk.fixed_polys_views();
+        Some(build_cosets(&fixed_polys, k, policy, |poly| {
+            pk.vk.domain.coeff_to_extended(poly.materialise())
+        })?)
     } else {
-        Vec::new()
+        None
     };
-    let built_permutation_cosets: Vec<_> = if pk.permutation.cosets.is_empty() {
-        pk.permutation_polys_views()
-            .iter()
-            .map(|poly| pk.vk.domain.coeff_to_extended(poly.materialise()))
-            .collect()
+    let built_permutation_cosets = if policy.should_spill_at(k) || pk.permutation.cosets.is_empty()
+    {
+        let permutation_polys = pk.permutation_polys_views();
+        Some(build_cosets(&permutation_polys, k, policy, |poly| {
+            pk.vk.domain.coeff_to_extended(poly.materialise())
+        })?)
     } else {
-        Vec::new()
+        None
     };
-    let fixed_views = if built_fixed_cosets.is_empty() {
+    let fixed_views = if let Some(cosets) = &built_fixed_cosets {
+        cosets.views()
+    } else {
         polynomial_views(&pk.fixed_cosets)
-    } else {
-        polynomial_views(&built_fixed_cosets)
     };
-    let permutation_views = if built_permutation_cosets.is_empty() {
-        polynomial_views(&pk.permutation.cosets)
+    let permutation_views = if let Some(cosets) = &built_permutation_cosets {
+        cosets.views()
     } else {
-        polynomial_views(&built_permutation_cosets)
+        polynomial_views(&pk.permutation.cosets)
     };
 
     // Evaluate the numerator polynomial nu(X) of the quotient polynomial
     // h(X) = nu(X) / (X^n-1): nu(X) is a random linear combination of all
     // independent identities
-    pk.ev.evaluate_numerator::<ExtendedLagrangeCoeff>(
+    Ok(pk.ev.evaluate_numerator::<ExtendedLagrangeCoeff>(
         &pk.vk.domain,
         &pk.vk.cs,
         &advice_refs,
@@ -696,7 +758,7 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
         PolynomialView::new(&pk.l_last.values),
         PolynomialView::new(&pk.l_active_row.values),
         &permutation_views,
-    )
+    ))
 }
 
 pub(super) fn write_evals_to_transcript<F, CS, T>(

@@ -7,6 +7,11 @@ use assert_matches::assert_matches;
 use blake2b_simd::State;
 use ff::{FromUniformBytes, WithSmallOrderMulGroup};
 use midnight_curves::serde::SerdeObject;
+#[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+use midnight_proofs::plonk::{
+    create_proof_with_coset_policy as create_plonk_proof_with_coset_policy, CosetStoragePolicy,
+    ProveWithPolicyError,
+};
 use midnight_proofs::{
     circuit::{Cell, Layouter, SimpleFloorPlanner, Value},
     dev::MockProver,
@@ -603,6 +608,54 @@ fn plonk_api() {
             mapped.get_vk(),
             &mapped_proof,
         );
+
+        let (a, instance, lookup_table) = common!(Scalar);
+        let circuit = MyCircuit {
+            a: Value::known(a),
+            lookup_table,
+        };
+        let spill_policy = CosetStoragePolicy::Spill {
+            min_k: 0,
+            dir: None,
+        };
+        let mut transcript = CircuitTranscript::<State>::init();
+        create_plonk_proof_with_coset_policy::<Scalar, Scheme, _, _>(
+            &spill_policy,
+            &params,
+            &mapped,
+            &[circuit.clone(), circuit.clone()],
+            #[cfg(feature = "committed-instances")]
+            0,
+            &[&[&[instance]], &[&[instance]]],
+            &mut transcript,
+            rng,
+        )
+        .expect("spilled proof generation");
+        let spilled_proof = transcript.finalize();
+        verify_proof::<_, _, CircuitTranscript<State>>(
+            &params.verifier_params(),
+            mapped.get_vk(),
+            &spilled_proof,
+        );
+
+        let missing_spill_dir = tempfile::tempdir().unwrap().path().join("missing-spill");
+        let mut failed_transcript = CircuitTranscript::<State>::init();
+        let error = create_plonk_proof_with_coset_policy::<Scalar, Scheme, _, _>(
+            &CosetStoragePolicy::Spill {
+                min_k: 0,
+                dir: Some(missing_spill_dir),
+            },
+            &params,
+            &mapped,
+            &[circuit.clone(), circuit],
+            #[cfg(feature = "committed-instances")]
+            0,
+            &[&[&[instance]], &[&[instance]]],
+            &mut failed_transcript,
+            rng,
+        )
+        .expect_err("requested spill must fail explicitly");
+        assert!(matches!(error, ProveWithPolicyError::Storage(_)));
 
         let missing_dir = tempfile::tempdir().unwrap().path().join("missing");
         assert!(

@@ -98,6 +98,47 @@ impl error::Error for Error {
     }
 }
 
+/// Error from the opt-in policy-aware proof API.
+///
+/// The released [`Error`] enum remains unchanged for existing callers.
+#[derive(Debug)]
+pub enum ProveWithPolicyError {
+    /// A regular proving or circuit error.
+    Proof(Error),
+    /// The requested storage capability or temporary backing failed.
+    Storage(io::Error),
+}
+
+impl From<Error> for ProveWithPolicyError {
+    fn from(error: Error) -> Self {
+        Self::Proof(error)
+    }
+}
+
+impl From<io::Error> for ProveWithPolicyError {
+    fn from(error: io::Error) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl fmt::Display for ProveWithPolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Proof(error) => write!(f, "{error}"),
+            Self::Storage(error) => write!(f, "Prover storage error: {error}"),
+        }
+    }
+}
+
+impl error::Error for ProveWithPolicyError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Proof(error) => Some(error),
+            Self::Storage(error) => Some(error),
+        }
+    }
+}
+
 /// This is an error that could occur during table synthesis.
 #[derive(Debug)]
 pub enum TableError {

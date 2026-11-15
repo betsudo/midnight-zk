@@ -381,6 +381,38 @@ where
     spill_iter_to_disk(spill_dir, polys.drain(..), n_polys, n_per_poly)
 }
 
+/// Transform coefficient views one at a time into mapped extended cosets.
+/// The source polynomials remain owned by the caller; only one transformed
+/// polynomial is resident on the heap during the spill.
+pub(crate) fn spill_with_transform<F, P, T>(
+    spill_dir: Option<&std::path::Path>,
+    inputs: &[P],
+    mut transform: T,
+) -> io::Result<MmappedPolys<F, crate::poly::ExtendedLagrangeCoeff>>
+where
+    F: Copy,
+    P: PolynomialRead<F, Basis = crate::poly::Coeff>,
+    T: for<'a> FnMut(
+        PolynomialView<'a, F, crate::poly::Coeff>,
+    ) -> Polynomial<F, crate::poly::ExtendedLagrangeCoeff>,
+{
+    let (first, rest) = inputs.split_first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot spill an empty coset batch",
+        )
+    })?;
+    let first = transform(PolynomialView::new(first.values()));
+    let width = first.values.len();
+    let remaining = rest.iter().map(|input| transform(PolynomialView::new(input.values())));
+    spill_iter_to_disk(
+        spill_dir,
+        std::iter::once(first).chain(remaining),
+        inputs.len(),
+        width,
+    )
+}
+
 #[cfg(test)]
 mod test {
     use midnight_curves::Fq as Fp;
