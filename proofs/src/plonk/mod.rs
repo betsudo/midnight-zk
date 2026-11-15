@@ -28,6 +28,7 @@ use crate::{
 };
 
 mod circuit;
+mod context;
 mod cosets;
 mod error;
 pub(crate) mod evaluation;
@@ -49,6 +50,7 @@ mod verifier;
 use std::{io, iter};
 
 pub use circuit::*;
+pub use context::{CancelToken, ProverContext};
 pub use cosets::CosetStoragePolicy;
 pub use error::*;
 pub(crate) use evaluation::Evaluator;

@@ -15,7 +15,8 @@ use super::{
         Instance, Selector,
     },
     cosets::{build_cosets, Cosets},
-    lookup, permutation, vanishing, CosetStoragePolicy, Error, ProveWithPolicyError, ProvingKey,
+    lookup, permutation, vanishing, CosetStoragePolicy, Error, ProveWithPolicyError, ProverContext,
+    ProvingKey,
 };
 #[cfg(feature = "committed-instances")]
 use crate::poly::EvaluationDomain;
@@ -56,6 +57,7 @@ where
 /// are zero-padded internally.
 ///
 /// The trace can then be used to finalise proofs, or to fold them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_trace<
     F,
     CS: PolynomialCommitmentScheme<F>,
@@ -72,7 +74,8 @@ pub(crate) fn compute_trace<
     instances: &[&[&[F]]],
     transcript: &mut T,
     rng: &mut (impl RngCore + CryptoRng),
-) -> Result<ProverTrace<F>, Error>
+    ctx: &ProverContext,
+) -> Result<ProverTrace<F>, ProveWithPolicyError>
 where
     CS::Commitment: Hashable<T::Hash>,
     F: WithSmallOrderMulGroup<3>
@@ -82,18 +85,19 @@ where
         + Ord
         + FromUniformBytes<64>,
 {
+    ctx.checkpoint("trace.start")?;
     #[cfg(not(feature = "committed-instances"))]
     let nb_committed_instances: usize = 0;
 
     if circuits.len() != instances.len() {
-        return Err(Error::InvalidInstances);
+        return Err(Error::InvalidInstances.into());
     }
 
     for instances in instances.iter() {
         if instances.len() != pk.vk.cs.num_instance_columns
             || instances.len() < nb_committed_instances
         {
-            return Err(Error::InvalidInstances);
+            return Err(Error::InvalidInstances.into());
         }
     }
 
@@ -103,8 +107,10 @@ where
     let domain = &pk.vk.domain;
 
     let instance = compute_instances(params, pk, instances, nb_committed_instances, transcript)?;
+    ctx.checkpoint("trace.instances")?;
 
     let (advice, challenges) = parse_advices(params, pk, circuits, instances, transcript, rng)?;
+    ctx.checkpoint("trace.advice")?;
     let fixed_values = pk.fixed_values_views();
     let advice_values: Vec<_> =
         advice.iter().map(|row| polynomial_views(&row.advice_polys)).collect();
@@ -142,6 +148,7 @@ where
             },
         )
         .collect::<Result<Vec<_>, _>>()?;
+    ctx.checkpoint("trace.lookups")?;
 
     // Sample beta challenge
     let beta: F = transcript.squeeze_challenge();
@@ -168,6 +175,7 @@ where
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    ctx.checkpoint("trace.permutations")?;
 
     let lookups: Vec<Vec<lookup::prover::Committed<F>>> = lookups
         .into_iter()
@@ -179,6 +187,7 @@ where
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
+    ctx.checkpoint("trace.lookup_products")?;
 
     // Trash argument
     let trash_challenge: F = transcript.squeeze_challenge();
@@ -208,9 +217,11 @@ where
             },
         )
         .collect::<Result<Vec<_>, _>>()?;
+    ctx.checkpoint("trace.trash")?;
 
     // Commit to the vanishing argument's random polynomial for blinding h(x_3)
     let vanishing = vanishing::Argument::<F, CS>::commit(params, domain, rng, transcript)?;
+    ctx.checkpoint("trace.vanishing")?;
 
     // Obtain challenge for keeping all separate gates linearly independent
     let y: F = transcript.squeeze_challenge();
@@ -227,6 +238,7 @@ where
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    ctx.checkpoint("trace.coefficients")?;
 
     Ok(ProverTrace {
         advice_polys,
@@ -260,7 +272,7 @@ pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transc
     trace: ProverTrace<F>,
     transcript: &mut T,
     rng: &mut (impl RngCore + CryptoRng),
-    policy: &CosetStoragePolicy,
+    ctx: &ProverContext,
 ) -> Result<(), ProveWithPolicyError>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -271,12 +283,14 @@ where
         + Ord
         + FromUniformBytes<64>,
 {
+    ctx.checkpoint("finalise.start")?;
     #[cfg(not(feature = "committed-instances"))]
     let nb_committed_instances: usize = 0;
 
     let domain = pk.get_vk().get_domain();
 
-    let nu_poly = compute_nu_poly_with_policy(pk, &trace, policy)?;
+    let nu_poly = compute_nu_poly_with_policy(pk, &trace, &ctx.cosets)?;
+    ctx.checkpoint("finalise.nu")?;
 
     let ProverTrace {
         advice_polys,
@@ -290,6 +304,7 @@ where
 
     // Construct the vanishing argument's h(X) commitments
     let vanishing = vanishing.construct::<CS, T>(params, domain, nu_poly, transcript, rng)?;
+    ctx.checkpoint("finalise.vanishing")?;
 
     let x: F = transcript.squeeze_challenge();
 
@@ -301,6 +316,7 @@ where
         x,
         transcript,
     )?;
+    ctx.checkpoint("finalise.evaluations")?;
 
     let vanishing = vanishing.evaluate(x, domain, transcript)?;
 
@@ -346,6 +362,7 @@ where
         &vanishing,
         x,
     );
+    ctx.checkpoint("finalise.queries")?;
 
     CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure)?;
     Ok(())
@@ -399,6 +416,9 @@ where
         ProveWithPolicyError::Storage(error) => {
             Error::Synthesis(format!("heap prover storage failed: {error}"))
         }
+        ProveWithPolicyError::Cancelled { phase } => {
+            Error::Synthesis(format!("unexpected legacy proof cancellation at {phase}"))
+        }
     })
 }
 
@@ -419,6 +439,48 @@ pub fn create_proof_with_coset_policy<
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     instances: &[&[&[F]]],
     transcript: &mut T,
+    rng: impl RngCore + CryptoRng,
+) -> Result<(), ProveWithPolicyError>
+where
+    CS::Commitment: Hashable<T::Hash>,
+    F: WithSmallOrderMulGroup<3>
+        + Sampleable<T::Hash>
+        + Hashable<T::Hash>
+        + Hash
+        + Ord
+        + FromUniformBytes<64>,
+{
+    create_proof_with_context(
+        &ProverContext::new(policy.clone()),
+        params,
+        pk,
+        circuits,
+        #[cfg(feature = "committed-instances")]
+        nb_committed_instances,
+        instances,
+        transcript,
+        rng,
+    )
+}
+
+/// Create a proof with request-local coset storage and cancellation controls.
+/// Cancellation is checked between prover phases and never affects another
+/// request or key generation. Discard the transcript after any error: proving
+/// may already have written commitments before cancellation is observed.
+#[allow(clippy::too_many_arguments)]
+pub fn create_proof_with_context<
+    F,
+    CS: PolynomialCommitmentScheme<F>,
+    T: Transcript,
+    ConcreteCircuit: Circuit<F>,
+>(
+    ctx: &ProverContext,
+    params: &CS::Parameters,
+    pk: &ProvingKey<F, CS>,
+    circuits: &[ConcreteCircuit],
+    #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
+    instances: &[&[&[F]]],
+    transcript: &mut T,
     mut rng: impl RngCore + CryptoRng,
 ) -> Result<(), ProveWithPolicyError>
 where
@@ -430,7 +492,8 @@ where
         + Ord
         + FromUniformBytes<64>,
 {
-    policy.ensure_supported()?;
+    ctx.cosets.ensure_supported()?;
+    ctx.checkpoint("proof.start")?;
     let trace = compute_trace(
         params,
         pk,
@@ -440,6 +503,7 @@ where
         instances,
         transcript,
         &mut rng,
+        ctx,
     )?;
     finalise_proof(
         params,
@@ -449,7 +513,7 @@ where
         trace,
         transcript,
         &mut rng,
-        policy,
+        ctx,
     )
 }
 

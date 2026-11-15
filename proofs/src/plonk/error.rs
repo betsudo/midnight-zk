@@ -107,6 +107,11 @@ pub enum ProveWithPolicyError {
     Proof(Error),
     /// The requested storage capability or temporary backing failed.
     Storage(io::Error),
+    /// The request's cancellation token was set at this phase boundary.
+    Cancelled {
+        /// The phase at which proving stopped.
+        phase: &'static str,
+    },
 }
 
 impl From<Error> for ProveWithPolicyError {
@@ -126,6 +131,7 @@ impl fmt::Display for ProveWithPolicyError {
         match self {
             Self::Proof(error) => write!(f, "{error}"),
             Self::Storage(error) => write!(f, "Prover storage error: {error}"),
+            Self::Cancelled { phase } => write!(f, "Proof cancelled at {phase}"),
         }
     }
 }
@@ -135,6 +141,7 @@ impl error::Error for ProveWithPolicyError {
         match self {
             Self::Proof(error) => Some(error),
             Self::Storage(error) => Some(error),
+            Self::Cancelled { .. } => None,
         }
     }
 }
