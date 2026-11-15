@@ -32,6 +32,11 @@ harness = false
 ff = { workspace = true }
 group = { workspace = true }
 midnight-curves = "0.3.1"
+# Memory-mapped SRS support: `read_mmap_arc` constructs a
+# `ParamsKZG` whose `g`/`g_lagrange` are slice views over a file
+# mapping instead of heap Vecs. Saves the ~300 MiB heap
+# allocation for the SRS at k=20 and lets the OS evict cold pages
+# during heavy prove phases. Native builds may opt in with `native-memory`.
 rand_core = { workspace = true, features = ["getrandom"] }
 tracing = { workspace = true }
 blake2b_simd = { workspace = true }
@@ -49,12 +54,16 @@ num-bigint = { workspace = true }
 [dev-dependencies]
 assert_matches = "1.5"
 proptest = "1"
+tempfile = "3"
 serde_json = { workspace = true }
 midnight-circuits = { path = "../circuits" }
 midnight-zk-stdlib = { path = "../zk_stdlib" }
 sha2 = { workspace = true }
 rand = { workspace = true }
 criterion = "0.7"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+memmap2 = { version = "0.9", optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
@@ -66,6 +75,8 @@ midnight-curves = { version = "0.3.0", features = [
 
 [features]
 default = ["committed-instances"]
+native-memory = ["mmap"]
+mmap = ["dep:memmap2"]
 circuit-params = []
 derive_serde = ["midnight-curves/serde"]
 dev-curves = ["midnight-curves/serde", "midnight-curves/dev-curves"]
