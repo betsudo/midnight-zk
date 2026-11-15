@@ -669,6 +669,29 @@ fn plonk_api() {
     #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
     {
         let key_bytes = pk.to_bytes(SerdeFormat::RawBytes);
+        let private_dir = tempfile::tempdir().expect("private mapped-key test directory");
+        let storage_error = ProvingKey::<Scalar, Scheme>::read_mapped::<_, MyCircuit<Scalar>>(
+            &mut key_bytes.as_slice(),
+            SerdeFormat::RawBytes,
+            #[cfg(feature = "circuit-params")]
+            (),
+            Some(&private_dir.path().join("missing")),
+        )
+        .expect_err("unavailable mapped-key directory must fail");
+        assert!(storage_error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<midnight_proofs::plonk::MappedKeyStorageFailure>()));
+        let malformed_error = ProvingKey::<Scalar, Scheme>::read_mapped::<_, MyCircuit<Scalar>>(
+            &mut &key_bytes[..1],
+            SerdeFormat::RawBytes,
+            #[cfg(feature = "circuit-params")]
+            (),
+            Some(private_dir.path()),
+        )
+        .expect_err("truncated supplied key must fail decoding");
+        assert!(!malformed_error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<midnight_proofs::plonk::MappedKeyStorageFailure>()));
         assert_eq!(pk.bytes_length(SerdeFormat::RawBytes), key_bytes.len());
         let mapped = ProvingKey::<Scalar, Scheme>::read_mapped::<_, MyCircuit<Scalar>>(
             &mut key_bytes.as_slice(),

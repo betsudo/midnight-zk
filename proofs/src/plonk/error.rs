@@ -146,6 +146,25 @@ impl error::Error for ProveWithPolicyError {
     }
 }
 
+/// Marks an I/O failure in native temporary backing for a mapped proving key.
+///
+/// Key decoding errors remain ordinary `io::Error`s so callers can distinguish
+/// malformed supplied keys from failures on operator-owned storage.
+#[derive(Debug)]
+pub struct MappedKeyStorageFailure(pub io::Error);
+
+impl fmt::Display for MappedKeyStorageFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Mapped proving-key storage failed: {}", self.0)
+    }
+}
+
+impl error::Error for MappedKeyStorageFailure {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 /// This is an error that could occur during table synthesis.
 #[derive(Debug)]
 pub enum TableError {

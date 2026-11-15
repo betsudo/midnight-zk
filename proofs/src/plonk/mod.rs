@@ -518,7 +518,8 @@ where
                 params,
                 true,
             )?;
-            key.map_fixed_columns(spill_dir)?;
+            key.map_fixed_columns(spill_dir)
+                .map_err(|error| io::Error::new(error.kind(), MappedKeyStorageFailure(error)))?;
             Ok(key)
         }
         #[cfg(not(all(feature = "disk-spill", not(target_family = "wasm"))))]
