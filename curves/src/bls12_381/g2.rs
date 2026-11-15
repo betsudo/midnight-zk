@@ -303,7 +303,9 @@ impl PrimeCurveAffine for G2Affine {
     }
 
     fn generator() -> Self {
-        G2Affine(unsafe { *blst_p2_affine_generator() })
+        // SAFETY: BLST returns a valid initialized generator for the process lifetime;
+        // read_unaligned also supports Wasm data-segment alignment.
+        G2Affine(unsafe { core::ptr::read_unaligned(blst_p2_affine_generator()) })
     }
 
     fn is_identity(&self) -> Choice {
@@ -679,7 +681,9 @@ impl Group for G2Projective {
     }
 
     fn generator() -> Self {
-        G2Projective(unsafe { *blst_p2_generator() })
+        // SAFETY: BLST returns a valid initialized generator for the process lifetime;
+        // read_unaligned also supports Wasm data-segment alignment.
+        G2Projective(unsafe { core::ptr::read_unaligned(blst_p2_generator()) })
     }
 
     fn is_identity(&self) -> Choice {
