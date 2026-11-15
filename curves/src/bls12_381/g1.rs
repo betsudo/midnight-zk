@@ -677,7 +677,9 @@ impl Group for G1Projective {
     }
 
     fn generator() -> Self {
-        G1Projective(unsafe { *blst_p1_generator() })
+        // BLST's static generator can be underaligned in a Wasm data segment.
+        // SAFETY: BLST returns a valid initialized generator for the process lifetime.
+        G1Projective(unsafe { core::ptr::read_unaligned(blst_p1_generator()) })
     }
 
     fn is_identity(&self) -> Choice {
@@ -745,7 +747,9 @@ impl PrimeCurveAffine for G1Affine {
     }
 
     fn generator() -> Self {
-        G1Affine(unsafe { *blst_p1_affine_generator() })
+        // SAFETY: BLST returns a valid initialized generator for the process lifetime;
+        // read_unaligned also supports Wasm data-segment alignment.
+        G1Affine(unsafe { core::ptr::read_unaligned(blst_p1_affine_generator()) })
     }
 
     fn is_identity(&self) -> Choice {

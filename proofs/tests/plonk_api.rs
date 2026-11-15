@@ -7,13 +7,16 @@ use assert_matches::assert_matches;
 use blake2b_simd::State;
 use ff::{FromUniformBytes, WithSmallOrderMulGroup};
 use midnight_curves::serde::SerdeObject;
+#[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+use midnight_proofs::plonk::create_proof_with_coset_policy as create_plonk_proof_with_coset_policy;
 use midnight_proofs::{
     circuit::{Cell, Layouter, SimpleFloorPlanner, Value},
     dev::MockProver,
     plonk::{
-        create_proof as create_plonk_proof, keygen_pk, keygen_vk, keygen_vk_with_k,
-        prepare as prepare_plonk_proof, Advice, Circuit, Column, ConstraintSystem, Constraints,
-        Error, Fixed, ProvingKey, TableColumn, VerifyingKey,
+        create_proof as create_plonk_proof, create_proof_with_context, keygen_pk, keygen_vk,
+        keygen_vk_with_k, prepare as prepare_plonk_proof, Advice, CancelToken, Circuit, Column,
+        ConstraintSystem, Constraints, CosetStoragePolicy, Error, Fixed, ProveWithPolicyError,
+        ProverContext, ProvingKey, TableColumn, VerifyingKey,
     },
     poly::{
         commitment::{Guard, PolynomialCommitmentScheme},
@@ -76,6 +79,7 @@ fn plonk_api() {
     struct MyCircuit<F: Field> {
         a: Value<F>,
         lookup_table: Vec<F>,
+        cancel_during_synthesis: Option<CancelToken>,
     }
 
     struct StandardPlonk<F: Field> {
@@ -272,6 +276,7 @@ fn plonk_api() {
             Self {
                 a: Value::unknown(),
                 lookup_table: self.lookup_table.clone(),
+                cancel_during_synthesis: None,
             }
         }
 
@@ -392,6 +397,10 @@ fn plonk_api() {
 
             cs.lookup_table(&mut layouter, &self.lookup_table)?;
 
+            if let Some(token) = &self.cancel_during_synthesis {
+                token.cancel();
+            }
+
             Ok(())
         }
     }
@@ -411,6 +420,7 @@ fn plonk_api() {
             let empty_circuit: MyCircuit<$field> = MyCircuit {
                 a: Value::unknown(),
                 lookup_table: lookup_table.clone(),
+                cancel_during_synthesis: None,
             };
 
             // Check that we get an error if we try to initialize the proving key with a value of
@@ -445,6 +455,7 @@ fn plonk_api() {
         let empty_circuit: MyCircuit<F> = MyCircuit {
             a: Value::unknown(),
             lookup_table,
+            cancel_during_synthesis: None,
         };
 
         // Initialize the proving key
@@ -478,6 +489,7 @@ fn plonk_api() {
         let circuit: MyCircuit<F> = MyCircuit {
             a: Value::known(a),
             lookup_table,
+            cancel_during_synthesis: None,
         };
 
         let mut transcript = T::init();
@@ -552,4 +564,219 @@ fn plonk_api() {
         pk.get_vk(),
         &proof[..],
     );
+
+    let cancelled = CancelToken::new();
+    let active = CancelToken::new();
+    let cancelled_context =
+        ProverContext::new(CosetStoragePolicy::Heap).with_cancel(cancelled.clone());
+    let active_context = ProverContext::new(CosetStoragePolicy::Heap).with_cancel(active);
+    cancelled.cancel();
+    let (a, instance, lookup_table) = common!(Scalar);
+    let circuit = MyCircuit {
+        a: Value::known(a),
+        lookup_table,
+        cancel_during_synthesis: None,
+    };
+    let mut cancelled_transcript = CircuitTranscript::<State>::init();
+    let error = create_proof_with_context::<Scalar, Scheme, _, _>(
+        &cancelled_context,
+        &params,
+        &pk,
+        std::slice::from_ref(&circuit),
+        #[cfg(feature = "committed-instances")]
+        0,
+        &[&[&[instance]]],
+        &mut cancelled_transcript,
+        rng,
+    )
+    .expect_err("cancelled request must stop before proving");
+    assert!(matches!(
+        error,
+        ProveWithPolicyError::Cancelled {
+            phase: "proof.start"
+        }
+    ));
+    let mut active_transcript = CircuitTranscript::<State>::init();
+    create_proof_with_context::<Scalar, Scheme, _, _>(
+        &active_context,
+        &params,
+        &pk,
+        std::slice::from_ref(&circuit),
+        #[cfg(feature = "committed-instances")]
+        0,
+        &[&[&[instance]]],
+        &mut active_transcript,
+        rng,
+    )
+    .expect("another request remains active");
+    let mut active_verify =
+        CircuitTranscript::<State>::init_from_bytes(&active_transcript.finalize());
+    let verifier = prepare_plonk_proof(
+        pk.get_vk(),
+        #[cfg(feature = "committed-instances")]
+        &[&[]],
+        &[&[&[instance]]],
+        &mut active_verify,
+    )
+    .expect("prepare active proof");
+    verifier.verify(&params.verifier_params()).expect("active proof verifies");
+
+    let midflight = CancelToken::new();
+    let mut midflight_circuit = circuit.clone();
+    midflight_circuit.cancel_during_synthesis = Some(midflight.clone());
+    let mut midflight_transcript = CircuitTranscript::<State>::init();
+    let error = create_proof_with_context::<Scalar, Scheme, _, _>(
+        &ProverContext::default().with_cancel(midflight),
+        &params,
+        &pk,
+        &[midflight_circuit],
+        #[cfg(feature = "committed-instances")]
+        0,
+        &[&[&[instance]]],
+        &mut midflight_transcript,
+        rng,
+    )
+    .expect_err("a request cancelled during synthesis must stop after advice");
+    assert!(matches!(
+        error,
+        ProveWithPolicyError::Cancelled {
+            phase: "trace.advice"
+        }
+    ));
+
+    use midnight_proofs::utils::SerdeFormat;
+    for format in [SerdeFormat::RawBytes, SerdeFormat::Processed] {
+        assert_eq!(pk.bytes_length(format), pk.to_bytes(format).len());
+    }
+
+    #[cfg(not(all(feature = "disk-spill", not(target_family = "wasm"))))]
+    {
+        let key_bytes = pk.to_bytes(SerdeFormat::RawBytes);
+        let mut input = key_bytes.as_slice();
+        let original_len = input.len();
+        let error = ProvingKey::<Scalar, Scheme>::read_mapped::<_, MyCircuit<Scalar>>(
+            &mut input,
+            SerdeFormat::RawBytes,
+            #[cfg(feature = "circuit-params")]
+            (),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(input.len(), original_len);
+    }
+
+    #[cfg(all(feature = "disk-spill", not(target_family = "wasm")))]
+    {
+        let key_bytes = pk.to_bytes(SerdeFormat::RawBytes);
+        let private_dir = tempfile::tempdir().expect("private mapped-key test directory");
+        let storage_error = ProvingKey::<Scalar, Scheme>::read_mapped::<_, MyCircuit<Scalar>>(
+            &mut key_bytes.as_slice(),
+            SerdeFormat::RawBytes,
+            #[cfg(feature = "circuit-params")]
+            (),
+            Some(&private_dir.path().join("missing")),
+        )
+        .expect_err("unavailable mapped-key directory must fail");
+        assert!(storage_error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<midnight_proofs::plonk::MappedKeyStorageFailure>()));
+        let malformed_error = ProvingKey::<Scalar, Scheme>::read_mapped::<_, MyCircuit<Scalar>>(
+            &mut &key_bytes[..1],
+            SerdeFormat::RawBytes,
+            #[cfg(feature = "circuit-params")]
+            (),
+            Some(private_dir.path()),
+        )
+        .expect_err("truncated supplied key must fail decoding");
+        assert!(!malformed_error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<midnight_proofs::plonk::MappedKeyStorageFailure>()));
+        assert_eq!(pk.bytes_length(SerdeFormat::RawBytes), key_bytes.len());
+        let mapped = ProvingKey::<Scalar, Scheme>::read_mapped::<_, MyCircuit<Scalar>>(
+            &mut key_bytes.as_slice(),
+            SerdeFormat::RawBytes,
+            #[cfg(feature = "circuit-params")]
+            (),
+            None,
+        )
+        .expect("native mapped key load");
+        assert_eq!(mapped.to_bytes(SerdeFormat::RawBytes), key_bytes);
+        assert_eq!(mapped.bytes_length(SerdeFormat::RawBytes), key_bytes.len());
+        let processed_bytes = pk.to_bytes(SerdeFormat::Processed);
+        assert_eq!(mapped.to_bytes(SerdeFormat::Processed), processed_bytes);
+        assert_eq!(
+            mapped.bytes_length(SerdeFormat::Processed),
+            processed_bytes.len()
+        );
+
+        let mapped_proof =
+            create_proof::<Scalar, Scheme, CircuitTranscript<State>, _>(rng, &params, &mapped);
+        verify_proof::<_, _, CircuitTranscript<State>>(
+            &params.verifier_params(),
+            mapped.get_vk(),
+            &mapped_proof,
+        );
+
+        let (a, instance, lookup_table) = common!(Scalar);
+        let circuit = MyCircuit {
+            a: Value::known(a),
+            lookup_table,
+            cancel_during_synthesis: None,
+        };
+        let spill_policy = CosetStoragePolicy::Spill {
+            min_k: 0,
+            dir: None,
+        };
+        let mut transcript = CircuitTranscript::<State>::init();
+        create_plonk_proof_with_coset_policy::<Scalar, Scheme, _, _>(
+            &spill_policy,
+            &params,
+            &mapped,
+            &[circuit.clone(), circuit.clone()],
+            #[cfg(feature = "committed-instances")]
+            0,
+            &[&[&[instance]], &[&[instance]]],
+            &mut transcript,
+            rng,
+        )
+        .expect("spilled proof generation");
+        let spilled_proof = transcript.finalize();
+        verify_proof::<_, _, CircuitTranscript<State>>(
+            &params.verifier_params(),
+            mapped.get_vk(),
+            &spilled_proof,
+        );
+
+        let missing_spill_dir = tempfile::tempdir().unwrap().path().join("missing-spill");
+        let mut failed_transcript = CircuitTranscript::<State>::init();
+        let error = create_plonk_proof_with_coset_policy::<Scalar, Scheme, _, _>(
+            &CosetStoragePolicy::Spill {
+                min_k: 0,
+                dir: Some(missing_spill_dir),
+            },
+            &params,
+            &mapped,
+            &[circuit.clone(), circuit],
+            #[cfg(feature = "committed-instances")]
+            0,
+            &[&[&[instance]], &[&[instance]]],
+            &mut failed_transcript,
+            rng,
+        )
+        .expect_err("requested spill must fail explicitly");
+        assert!(matches!(error, ProveWithPolicyError::Storage(_)));
+
+        let missing_dir = tempfile::tempdir().unwrap().path().join("missing");
+        assert!(
+            ProvingKey::<Scalar, Scheme>::read_mapped::<_, MyCircuit<Scalar>>(
+                &mut key_bytes.as_slice(),
+                SerdeFormat::RawBytes,
+                #[cfg(feature = "circuit-params")]
+                (),
+                Some(&missing_dir),
+            )
+            .is_err()
+        );
+    }
 }

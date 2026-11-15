@@ -158,6 +158,37 @@ where
     }
 }
 
+/// The largest MSM the blstrs fast path may take, as a function of the target
+/// rather than of `cfg!` — so a test can assert both arms on one machine.
+///
+/// The numbers are measurements, not preferences: blstrs regresses above 2^18
+/// on x86, and keeps winning past 2^20 on aarch64. Writing them as shifts is
+/// how `2 << 18` — which is 2^19, not 2^18 — got past review once already, so
+/// `the_msm_fast_path_gate_is_the_measured_boundary` pins both arms against
+/// decimal literals.
+const fn fast_path_max(aarch64: bool) -> usize {
+    if aarch64 {
+        1 << 21
+    } else {
+        1 << 18
+    }
+}
+
+/// Select the gate without changing the published browser-Wasm path. Native
+/// x86 uses its measured 2^18 boundary even without the memory capability;
+/// the separate aarch64 raise belongs to the opt-in.
+const fn selected_fast_path_max(native_memory: bool, wasm: bool, aarch64: bool) -> usize {
+    if wasm {
+        2 << 18
+    } else if !aarch64 {
+        fast_path_max(false)
+    } else if native_memory {
+        fast_path_max(true)
+    } else {
+        2 << 18
+    }
+}
+
 #[allow(unsafe_code)]
 /// Wrapper over the MSM function to use the blstrs underlying function
 pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) -> C::Curve {
@@ -173,9 +204,16 @@ pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) ->
         return C::Curve::identity();
     }
 
-    // We empirically checked that for MSMs larger than 2**18, the blstrs
-    // implementation regresses.
-    if coeffs.len() <= (2 << 18) && TypeId::of::<C>() == TypeId::of::<midnight_curves::G1Affine>() {
+    // Fix the documented x86 threshold independently of the memory feature.
+    // Keep browser-Wasm's published path; raise aarch64 only with native-memory.
+    const FAST_PATH_MAX: usize = selected_fast_path_max(
+        cfg!(feature = "native-memory"),
+        cfg!(target_family = "wasm"),
+        cfg!(target_arch = "aarch64"),
+    );
+    if coeffs.len() <= FAST_PATH_MAX
+        && TypeId::of::<C>() == TypeId::of::<midnight_curves::G1Affine>()
+    {
         // Safe: we just checked type
         let coeffs_slice = coeffs.as_slice();
         let bases_slice = bases.as_slice();
@@ -184,10 +222,61 @@ pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) ->
         let res = G1Projective::multi_exp(bases, coeffs);
         unsafe { std::mem::transmute_copy(&res) }
     } else {
-        let mut affine_bases = vec![C::identity(); coeffs.len()];
-        C::Curve::batch_normalize(&bases, &mut affine_bases);
-        msm_best(&coeffs, &affine_bases)
+        // The native-memory Pippenger fallback chunks the input. The released
+        // path allocates `affine_bases: Vec<C> = vec![identity; n]`
+        // (192 MiB at n=2^21, 384 MiB at n=2^22) and then `msm_best`
+        // internally allocates another `bases_local: Vec<Affine<F>>`
+        // of the same size — at k=22 that's 768 MiB per MSM call.
+        //
+        // Pippenger composes naturally over chunks: split coeffs/bases
+        // into fixed-size chunks, run msm_best on each, sum the
+        // partial G1Projective results. Per-chunk peak heap drops to
+        // ~24 MiB (256K bases × 96 B) regardless of total n. Trade:
+        // a few % more CPU because msm_best's window size `c` is
+        // chosen per-chunk and a smaller `c` does more total windows.
+        //
+        // This focused release-base slice uses the measured 2^18 chunk size.
+        // The later explicit runtime-policy slice owns the override knob.
+        #[cfg(all(feature = "native-memory", not(target_family = "wasm")))]
+        {
+            msm_chunked::<C>(&coeffs, &bases, 1 << 18)
+        }
+        #[cfg(not(all(feature = "native-memory", not(target_family = "wasm"))))]
+        {
+            let mut affine_bases = vec![C::identity(); coeffs.len()];
+            C::Curve::batch_normalize(&bases, &mut affine_bases);
+            msm_best(&coeffs, &affine_bases)
+        }
     }
+}
+
+/// Pippenger over fixed-size chunks, summing the partial results.
+///
+/// Chunking is a pure restructuring of the same sum: Pippenger composes over
+/// any partition of the input, so the result must equal the unchunked one for
+/// every `chunk`. That is a property worth asserting rather than assuming —
+/// this sits on the `commit_lagrange` path, and an optimisation that quietly
+/// changed a commitment would still pass every other test in the suite.
+/// `chunked_msm_agrees_with_unchunked` in this module's tests is that
+/// assertion. Named in prose rather than linked: it is `#[cfg(test)]`, so a
+/// doc build cannot resolve a link to it.
+#[cfg(any(test, all(feature = "native-memory", not(target_family = "wasm"))))]
+fn msm_chunked<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve], chunk: usize) -> C::Curve {
+    if coeffs.len() <= chunk {
+        let mut affine_bases = vec![C::identity(); coeffs.len()];
+        C::Curve::batch_normalize(bases, &mut affine_bases);
+        return msm_best(coeffs, &affine_bases);
+    }
+
+    let mut acc = C::Curve::identity();
+    for (c_chunk, b_chunk) in coeffs.chunks(chunk).zip(bases.chunks(chunk)) {
+        let mut affine_chunk = vec![C::identity(); c_chunk.len()];
+        C::Curve::batch_normalize(b_chunk, &mut affine_chunk);
+        acc += msm_best(c_chunk, &affine_chunk);
+        // affine_chunk + msm_best's bases_local drop here, freeing
+        // ~48 MiB before the next iteration allocates.
+    }
+    acc
 }
 
 /// Two channel MSM accumulator
@@ -297,5 +386,99 @@ where
         let terms = &[term_1, term_2];
 
         bool::from(E::multi_miller_loop(&terms[..]).final_exponentiation().is_identity())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{fast_path_max, selected_fast_path_max};
+
+    /// The gate is a measured boundary, so it is pinned against decimal
+    /// literals: `1 << 18` on both sides of an assertion proves nothing, and
+    /// the defect this guards against was exactly a shift off by one bit
+    /// (`2 << 18` = 524_288). F-043.
+    #[test]
+    fn the_msm_fast_path_gate_is_the_measured_boundary() {
+        assert_eq!(
+            fast_path_max(false),
+            262_144,
+            "x86 must gate at the measured 2^18, above which blstrs regresses"
+        );
+        assert_eq!(
+            fast_path_max(true),
+            2_097_152,
+            "aarch64 must gate at 2^21 so k=21 stays on the fast path"
+        );
+        assert_eq!(selected_fast_path_max(false, false, false), 262_144);
+        assert_eq!(selected_fast_path_max(true, false, false), 262_144);
+        assert_eq!(selected_fast_path_max(false, false, true), 524_288);
+        assert_eq!(selected_fast_path_max(true, false, true), 2_097_152);
+        assert_eq!(selected_fast_path_max(true, true, false), 524_288);
+        assert_eq!(selected_fast_path_max(true, true, true), 524_288);
+    }
+    use ff::Field;
+    use group::Group;
+    use midnight_curves::{Fq, G1Affine, G1Projective};
+    use rand_core::OsRng;
+
+    use super::msm_chunked;
+
+    /// Chunking must not change the answer.
+    ///
+    /// `msm_chunked` splits the input, runs Pippenger per chunk and sums the
+    /// partials. That is only valid because the sum is associative over any
+    /// partition — so the same inputs must give the same point for every
+    /// chunk size, including sizes that do not divide the length evenly.
+    ///
+    /// Without this the optimisation could change a commitment and every
+    /// other test in the suite would still pass, because nothing else
+    /// compares the two arms.
+    #[test]
+    fn chunked_msm_agrees_with_unchunked() {
+        const N: usize = 64;
+
+        let coeffs: Vec<Fq> = (0..N).map(|_| Fq::random(OsRng)).collect();
+        let bases: Vec<G1Projective> = (0..N).map(|_| G1Projective::random(OsRng)).collect();
+
+        // `chunk >= N` takes the single-shot arm: the reference answer.
+        let reference = msm_chunked::<G1Affine>(&coeffs, &bases, N);
+
+        // Sizes chosen to cover the cases the loop can get wrong: a divisor,
+        // a non-divisor leaving a short final chunk, one larger than the
+        // input, and the degenerate chunk of one.
+        for chunk in [1usize, 3, 7, 8, 16, N - 1, N, N + 1, 4096] {
+            let got = msm_chunked::<G1Affine>(&coeffs, &bases, chunk);
+            assert_eq!(
+                got, reference,
+                "chunked MSM disagreed with the unchunked result at chunk={chunk}"
+            );
+        }
+    }
+
+    /// Zero coefficients must not shift the result.
+    ///
+    /// `msm_specific` filters zero scalars before chunking, so the chunk
+    /// boundaries land on a *different* partition than the caller's indices.
+    /// This checks the arithmetic is indifferent to that.
+    #[test]
+    fn chunked_msm_is_indifferent_to_zero_coefficients() {
+        const N: usize = 32;
+
+        let mut coeffs: Vec<Fq> = (0..N).map(|_| Fq::random(OsRng)).collect();
+        let bases: Vec<G1Projective> = (0..N).map(|_| G1Projective::random(OsRng)).collect();
+        for (i, c) in coeffs.iter_mut().enumerate() {
+            if i % 3 == 0 {
+                *c = Fq::ZERO;
+            }
+        }
+
+        let reference = msm_chunked::<G1Affine>(&coeffs, &bases, N);
+        for chunk in [1usize, 5, 16] {
+            assert_eq!(
+                msm_chunked::<G1Affine>(&coeffs, &bases, chunk),
+                reference,
+                "zero coefficients changed the result at chunk={chunk}"
+            );
+        }
     }
 }

@@ -238,8 +238,10 @@ impl<S: SelfEmulation> Instantiable<S::F> for AssignedMsm<S> {
         .collect::<Vec<_>>()
     }
 
+    /// Always returns `None`: the flat encoding loses the structural metadata
+    /// needed to rebuild the MSM, so it is not invertible.
     fn from_public_input(_fields: &[S::F]) -> Option<Msm<S>> {
-        unimplemented!("not invertible: the flat encoding loses structural metadata.")
+        None
     }
 }
 
@@ -464,6 +466,16 @@ impl<S: SelfEmulation> AssignedMsm<S> {
         self.scalars = vec![AssignedBoundedScalar::one(layouter, scalar_chip)?];
 
         Ok(())
+    }
+
+    /// Whether the MSM is a single base-scalar pair with no fixed-base scalars
+    /// left, as [`collapse`](Self::collapse) after
+    /// [`resolve_fixed_bases`](Self::resolve_fixed_bases) leaves it.
+    ///
+    /// This is a check on the shape only: the value of the scalar is a witness
+    /// and is not inspected.
+    pub fn is_collapsed(&self) -> bool {
+        self.bases.len() == 1 && self.scalars.len() == 1 && self.fixed_base_scalars.is_empty()
     }
 
     /// Given the actual fixed bases, resolves the fixed-base part of the MSM

@@ -98,6 +98,73 @@ impl error::Error for Error {
     }
 }
 
+/// Error from the opt-in policy-aware proof API.
+///
+/// The released [`Error`] enum remains unchanged for existing callers.
+#[derive(Debug)]
+pub enum ProveWithPolicyError {
+    /// A regular proving or circuit error.
+    Proof(Error),
+    /// The requested storage capability or temporary backing failed.
+    Storage(io::Error),
+    /// The request's cancellation token was set at this phase boundary.
+    Cancelled {
+        /// The phase at which proving stopped.
+        phase: &'static str,
+    },
+}
+
+impl From<Error> for ProveWithPolicyError {
+    fn from(error: Error) -> Self {
+        Self::Proof(error)
+    }
+}
+
+impl From<io::Error> for ProveWithPolicyError {
+    fn from(error: io::Error) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl fmt::Display for ProveWithPolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Proof(error) => write!(f, "{error}"),
+            Self::Storage(error) => write!(f, "Prover storage error: {error}"),
+            Self::Cancelled { phase } => write!(f, "Proof cancelled at {phase}"),
+        }
+    }
+}
+
+impl error::Error for ProveWithPolicyError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Proof(error) => Some(error),
+            Self::Storage(error) => Some(error),
+            Self::Cancelled { .. } => None,
+        }
+    }
+}
+
+/// Marks an I/O failure in native temporary backing for a mapped proving key.
+///
+/// Key decoding errors remain ordinary `io::Error`s so callers can distinguish
+/// malformed supplied keys from failures on operator-owned storage.
+#[derive(Debug)]
+pub struct MappedKeyStorageFailure(pub io::Error);
+
+impl fmt::Display for MappedKeyStorageFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Mapped proving-key storage failed: {}", self.0)
+    }
+}
+
+impl error::Error for MappedKeyStorageFailure {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 /// This is an error that could occur during table synthesis.
 #[derive(Debug)]
 pub enum TableError {

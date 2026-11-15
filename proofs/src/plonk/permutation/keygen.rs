@@ -259,16 +259,7 @@ pub(crate) fn compute_polys_and_cosets<F: WithSmallOrderMulGroup<3>>(
     Vec<Polynomial<F, Coeff>>,
     Vec<Polynomial<F, ExtendedLagrangeCoeff>>,
 ) {
-    let mut polys = vec![domain.empty_coeff(); p.columns.len()];
-    {
-        parallelize(&mut polys, |o, start| {
-            for (x, poly) in o.iter_mut().enumerate() {
-                let i = start + x;
-                let permutation_poly = permutations[i].clone();
-                *poly = domain.lagrange_to_coeff(permutation_poly);
-            }
-        });
-    }
+    let polys = compute_polys(domain, p, permutations);
     let mut cosets = vec![domain.empty_extended(); p.columns.len()];
     {
         parallelize(&mut cosets, |o, start| {
@@ -280,4 +271,22 @@ pub(crate) fn compute_polys_and_cosets<F: WithSmallOrderMulGroup<3>>(
         });
     }
     (polys, cosets)
+}
+
+pub(crate) fn compute_polys<F: WithSmallOrderMulGroup<3>>(
+    domain: &EvaluationDomain<F>,
+    p: &Argument,
+    permutations: &[Polynomial<F, LagrangeCoeff>],
+) -> Vec<Polynomial<F, Coeff>> {
+    let mut polys = vec![domain.empty_coeff(); p.columns.len()];
+    {
+        parallelize(&mut polys, |o, start| {
+            for (x, poly) in o.iter_mut().enumerate() {
+                let i = start + x;
+                let permutation_poly = permutations[i].clone();
+                *poly = domain.lagrange_to_coeff(permutation_poly);
+            }
+        });
+    }
+    polys
 }

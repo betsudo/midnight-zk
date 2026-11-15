@@ -1,6 +1,6 @@
 [package]
 name = "midnight-zk-stdlib"
-version = "2.3.4"
+version = "2.4.0"
 edition = "2021"
 license-file.workspace = true
 description = "Standard library of circuits and utilities for Midnight zero-knowledge proofs"
@@ -11,7 +11,7 @@ description = "Standard library of circuits and utilities for Midnight zero-know
 group = { workspace = true }
 ff = { workspace = true }
 blake2b_simd = { workspace = true }
-midnight-circuits = { version = "7.2.3", features = ["testing"] }
+midnight-circuits = { version = "7.3.0", features = ["testing"] }
 midnight-curves = { version = "0.3.1" }
 midnight-proofs = { version = "0.8.2", default-features = false, features = [
     "circuit-params",
@@ -34,6 +34,7 @@ hex-literal = "1.1"
 
 [dev-dependencies]
 criterion = "0.7"
+tempfile = "3"
 rand_chacha = { workspace = true }
 goldenfile = "=1.8.0"
 num-bigint = { workspace = true, features = ["rand"] }
@@ -50,6 +51,7 @@ midnight-curves = { version = "0.3.0", features = ["portable"] }
 
 [features]
 default = []
+native-memory = ["midnight-proofs/native-memory"]
 # Feature that exposes some testing functionality, such as load from scratch or instantiable
 testing = ["num-bigint/rand"]
 heap_profiling = []

@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+* Add opt-in `native-memory` proving with explicit per-request mapped SRS/key and coset storage policies, and request-local cancellation. Default proving remains heap-backed and serialized key/SRS formats remain compatible with 0.8.2.
+* Add published-source SRS format coverage and native storage policy tests.
 
 ### Changed
+* Share polynomial encoding across owned and mapped storage, stream derived cosets under the native policy, and bound the native Pippenger fallback to avoid proof-size-dependent scratch growth.
 
 ### Removed
 

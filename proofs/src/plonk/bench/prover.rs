@@ -17,7 +17,7 @@ use crate::{
         traces::ProverTrace,
         trash, vanishing, Error, ProvingKey,
     },
-    poly::commitment::PolynomialCommitmentScheme,
+    poly::{commitment::PolynomialCommitmentScheme, polynomial_views},
     transcript::{Hashable, Sampleable, Transcript},
 };
 
@@ -134,6 +134,9 @@ where
                         .iter()
                         .zip(adv.iter())
                         .map(|(instance, advice)| -> Result<Vec<_>, Error> {
+                            let advice_values = polynomial_views(&advice.advice_polys);
+                            let fixed_values = pk.fixed_values_views();
+                            let instance_values = polynomial_views(&instance.instance_values);
                             pk.vk
                                 .cs
                                 .lookups
@@ -144,9 +147,9 @@ where
                                         params,
                                         domain,
                                         theta,
-                                        &advice.advice_polys,
-                                        &pk.fixed_values,
-                                        &instance.instance_values,
+                                        &advice_values,
+                                        &fixed_values,
+                                        &instance_values,
                                         &challenges,
                                         rng,
                                         &mut t,
@@ -163,6 +166,9 @@ where
             .iter()
             .zip(advice.iter())
             .map(|(instance, advice)| -> Result<Vec<_>, Error> {
+                let advice_values = polynomial_views(&advice.advice_polys);
+                let fixed_values = pk.fixed_values_views();
+                let instance_values = polynomial_views(&instance.instance_values);
                 // Construct and commit to permuted values for each lookup
                 pk.vk
                     .cs
@@ -174,9 +180,9 @@ where
                             params,
                             domain,
                             theta,
-                            &advice.advice_polys,
-                            &pk.fixed_values,
-                            &instance.instance_values,
+                            &advice_values,
+                            &fixed_values,
+                            &instance_values,
                             &challenges,
                             rng,
                             transcript,
@@ -203,13 +209,16 @@ where
                         .iter()
                         .zip(adv.iter())
                         .map(|(instance, advice)| {
+                            let advice_values = polynomial_views(&advice.advice_polys);
+                            let fixed_values = pk.fixed_values_views();
+                            let instance_values = polynomial_views(&instance.instance_values);
                             pk.vk.cs.permutation.commit(
                                 params,
                                 pk,
                                 &pk.permutation,
-                                &advice.advice_polys,
-                                &pk.fixed_values,
-                                &instance.instance_values,
+                                &advice_values,
+                                &fixed_values,
+                                &instance_values,
                                 beta,
                                 gamma,
                                 rng,
@@ -225,13 +234,16 @@ where
             .iter()
             .zip(advice.iter())
             .map(|(instance, advice)| {
+                let advice_values = polynomial_views(&advice.advice_polys);
+                let fixed_values = pk.fixed_values_views();
+                let instance_values = polynomial_views(&instance.instance_values);
                 pk.vk.cs.permutation.commit(
                     params,
                     pk,
                     &pk.permutation,
-                    &advice.advice_polys,
-                    &pk.fixed_values,
-                    &instance.instance_values,
+                    &advice_values,
+                    &fixed_values,
+                    &instance_values,
                     beta,
                     gamma,
                     rng,
@@ -286,6 +298,9 @@ where
                         .iter()
                         .zip(adv.iter())
                         .map(|(instance, advice)| -> Result<Vec<_>, Error> {
+                            let advice_values = polynomial_views(&advice.advice_polys);
+                            let fixed_values = pk.fixed_values_views();
+                            let instance_values = polynomial_views(&instance.instance_values);
                             pk.vk
                                 .cs
                                 .trashcans
@@ -295,9 +310,9 @@ where
                                         params,
                                         domain,
                                         trash_challenge,
-                                        &advice.advice_polys,
-                                        &pk.fixed_values,
-                                        &instance.instance_values,
+                                        &advice_values,
+                                        &fixed_values,
+                                        &instance_values,
                                         &challenges,
                                         &mut t,
                                     )
@@ -313,6 +328,9 @@ where
             .iter()
             .zip(advice.iter())
             .map(|(instance, advice)| -> Result<Vec<_>, Error> {
+                let advice_values = polynomial_views(&advice.advice_polys);
+                let fixed_values = pk.fixed_values_views();
+                let instance_values = polynomial_views(&instance.instance_values);
                 pk.vk
                     .cs
                     .trashcans
@@ -322,9 +340,9 @@ where
                             params,
                             domain,
                             trash_challenge,
-                            &advice.advice_polys,
-                            &pk.fixed_values,
-                            &instance.instance_values,
+                            &advice_values,
+                            &fixed_values,
+                            &instance_values,
                             &challenges,
                             transcript,
                         )
@@ -490,12 +508,12 @@ where
         b.iter_batched(
             || transcript.clone(),
             |mut t| {
-                let _ = pk.permutation.evaluate(x, &mut t);
+                let _ = pk.permutation.evaluate(&pk.permutation_polys_views(), x, &mut t);
             },
             criterion::BatchSize::SmallInput,
         )
     });
-    pk.permutation.evaluate(x, transcript)?;
+    pk.permutation.evaluate(&pk.permutation_polys_views(), x, transcript)?;
 
     // Evaluate the permutations, if any, at omega^i x.
     let permutations: Vec<permutation::prover::Evaluated<F>> = permutations

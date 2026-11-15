@@ -44,7 +44,7 @@ jobs:
   test-circuits:
     if: github.event.pull_request.draft == false
     name: Test circuits
-    runs-on: ubuntu-latest-16-core-x64
+    runs-on: ${{ vars.LARGE_RUNNER || 'ubuntu-latest' }}
 
     env:
       RUST_BACKTRACE: full
@@ -62,7 +62,7 @@ jobs:
     needs: download-srs
     if: github.event.pull_request.draft == false
     name: Test zk-stdlib
-    runs-on: ubuntu-latest-16-core-x64
+    runs-on: ${{ vars.LARGE_RUNNER || 'ubuntu-latest' }}
 
     env:
       RUST_BACKTRACE: full
@@ -89,7 +89,7 @@ jobs:
     needs: download-srs
     if: github.event.pull_request.draft == false
     name: Test VK consistency
-    runs-on: ubuntu-latest-16-core-x64
+    runs-on: ${{ vars.LARGE_RUNNER || 'ubuntu-latest' }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -164,9 +164,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # Keep the published 0.8.2 line on one formatter; moving nightly rewrites
+      # unchanged release sources and obscures the optimization review.
       - uses: dtolnay/rust-toolchain@nightly
-      - run: rustup component add rustfmt --toolchain nightly
-      - run: cargo +nightly fmt --all -- --check
+        with:
+          toolchain: nightly-2026-05-29
+          components: rustfmt
+      - run: cargo +nightly-2026-05-29 fmt --all -- --check
 
   clippy:
     if: github.event.pull_request.draft == false

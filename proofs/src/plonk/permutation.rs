@@ -4,7 +4,7 @@ use super::circuit::{Any, Column};
 use crate::{
     poly::{Coeff, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, Rotation},
     utils::{
-        helpers::{polynomial_slice_byte_length, read_polynomial_vec, write_polynomial_slice},
+        helpers::{read_polynomial_vec, write_polynomial_slice},
         SerdeFormat,
     },
 };
@@ -150,9 +150,17 @@ impl<F: WithSmallOrderMulGroup<3> + SerdeObject> ProvingKey<F> {
         format: SerdeFormat,
         domain: &EvaluationDomain<F>,
         p: &Argument,
+        defer_cosets: bool,
     ) -> io::Result<Self> {
         let permutations = read_polynomial_vec(reader, format)?;
-        let (polys, cosets) = compute_polys_and_cosets::<F>(domain, p, &permutations);
+        let (polys, cosets) = if defer_cosets {
+            (
+                keygen::compute_polys::<F>(domain, p, &permutations),
+                Vec::new(),
+            )
+        } else {
+            compute_polys_and_cosets::<F>(domain, p, &permutations)
+        };
         Ok(ProvingKey {
             permutations,
             polys,
@@ -168,14 +176,6 @@ impl<F: WithSmallOrderMulGroup<3> + SerdeObject> ProvingKey<F> {
     }
 }
 
-impl<F: PrimeField> ProvingKey<F> {
-    /// Gets the total number of bytes in the serialization of `self`
-    pub(super) fn bytes_length(&self) -> usize {
-        polynomial_slice_byte_length(&self.permutations)
-            + polynomial_slice_byte_length(&self.polys)
-            + polynomial_slice_byte_length(&self.cosets)
-    }
-}
 #[derive(Debug)]
 pub(crate) struct Evaluated<F: PrimeField> {
     pub permutation_product_eval: F,

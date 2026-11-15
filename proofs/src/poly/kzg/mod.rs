@@ -11,6 +11,8 @@ use std::marker::PhantomData;
 
 use midnight_curves::pairing::Engine;
 
+/// Storage backing for SRS bases (owned `Vec` vs mmap view).
+pub(crate) mod bases;
 /// Multiscalar multiplication engines
 pub mod msm;
 /// KZG commitment scheme
@@ -34,6 +36,7 @@ use crate::{
             params::{ParamsKZG, ParamsVerifierKZG},
             utils::construct_intermediate_sets,
         },
+        polynomial_inner_product,
         query::{CommitmentLabel, VerifierQuery},
         Coeff, Error, LagrangeCoeff, Polynomial, ProverQuery,
     },
@@ -86,9 +89,16 @@ where
     ) -> E::G1 {
         let size = poly.values.len();
 
-        assert!(params.g_lagrange.len() >= size);
+        // `g_lagrange_slice()` lazy-inits the Lagrange basis if it was
+        // never loaded or was released via `drop_lazy_bases`. The hot
+        // path (already-cached) is a single non-blocking load.
+        let g_lagrange = params.g_lagrange_slice();
+        assert!(g_lagrange.len() >= size);
 
-        msm_specific::<E::G1Affine>(&poly.values, &params.g_lagrange[0..size])
+        // `poly.values` is upstream's name for the scalars; `g_lagrange` is
+        // the lazily-loaded basis this patch introduces. The patch's own
+        // `scalars` binding does not exist at this base.
+        msm_specific::<E::G1Affine>(&poly.values, &g_lagrange[0..size])
     }
 
     fn multi_open<T: Transcript>(
@@ -110,7 +120,7 @@ where
         let mut q_polys = vec![vec![]; point_sets.len()];
 
         for com_data in poly_map.iter() {
-            q_polys[com_data.set_index].push(com_data.commitment.poly.clone());
+            q_polys[com_data.set_index].push(com_data.commitment.poly);
         }
 
         let q_polys = q_polys
@@ -122,7 +132,7 @@ where
                 #[cfg(not(feature = "truncated-challenges"))]
                 let x1 = powers(x1);
 
-                inner_product(polys, x1)
+                polynomial_inner_product(polys, x1)
             })
             .collect::<Vec<_>>();
 
@@ -497,18 +507,9 @@ mod tests {
         transcript.write(&cvy).unwrap();
 
         let queries = [
-            ProverQuery {
-                point: x,
-                poly: &ax,
-            },
-            ProverQuery {
-                point: x,
-                poly: &bx,
-            },
-            ProverQuery {
-                point: y,
-                poly: &cx,
-            },
+            ProverQuery::new(x, &ax),
+            ProverQuery::new(x, &bx),
+            ProverQuery::new(y, &cx),
         ]
         .into_iter();
 

@@ -25,8 +25,10 @@ use std::{
 
 use midnight_curves::Bls12;
 use midnight_proofs::{
+    config::ProverContext,
     plonk::{
-        create_proof, keygen_pk, keygen_vk, prepare, Circuit, Error, ProvingKey, VerifyingKey,
+        create_proof, create_proof_with_context, keygen_pk, keygen_vk, prepare, Circuit, Error,
+        ProveWithPolicyError, ProvingKey, VerifyingKey,
     },
     poly::{
         commitment::Guard,
@@ -98,16 +100,50 @@ macro_rules! plonk_api {
                 $projective: Hashable<H>,
                 $native: Hashable<H> + Sampleable<H>,
             {
+                let mut transcript = CircuitTranscript::init();
+                create_proof::<
+                    $native,
+                    KZGCommitmentScheme<$engine>,
+                    CircuitTranscript<H>,
+                    Relation,
+                >(
+                    params,
+                    pk,
+                    std::slice::from_ref(circuit),
+                    nb_instance_commitments,
+                    &[pi],
+                    &mut transcript,
+                    rng,
+                )?;
+                Ok(transcript.finalize())
+            }
+
+            /// PLONK proving with a request-owned memory and cancellation context.
+            pub fn prove_with_context<H>(
+                context: &ProverContext,
+                params: &ParamsKZG<$engine>,
+                pk: &ProvingKey<$native, KZGCommitmentScheme<$engine>>,
+                circuit: &Relation,
+                nb_instance_commitments: usize,
+                pi: &[&[$native]],
+                rng: impl RngCore + CryptoRng,
+            ) -> Result<Vec<u8>, ProveWithPolicyError>
+            where
+                H: TranscriptHash,
+                $projective: Hashable<H>,
+                $native: Hashable<H> + Sampleable<H>,
+            {
                 #[cfg(test)]
                 let start = Instant::now();
                 let proof = {
                     let mut transcript = CircuitTranscript::init();
-                    create_proof::<
+                    create_proof_with_context::<
                         $native,
                         KZGCommitmentScheme<$engine>,
                         CircuitTranscript<H>,
                         Relation,
                     >(
+                        context,
                         params,
                         pk,
                         std::slice::from_ref(circuit),
