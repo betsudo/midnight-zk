@@ -133,8 +133,8 @@ have a different proof/key transcript boundary. Rebase a proposed slice
 onto the chosen upstream target only after its 0.8.2 Ledger9 artifact gate
 is recorded; then rerun exact-head native, Wasm, serialization, proof,
 and failure-path checks on that target. A passing 0.8.3 build alone does not
-establish 0.8.2 key compatibility. The local `codex/ledger9-zk-upstream-stack`
-is only a preliminary 0.8.3 SRS port, not the full proposal.
+establish 0.8.2 key compatibility. An SRS-only 0.8.3 port would be an
+incomplete proposal without the key, coset, context, and consumer gates.
 
 The cross-repository landing order is proofs storage/context API, Ledger
 provider and trait prerequisites, ZKIR V3 context adapter, then the final
