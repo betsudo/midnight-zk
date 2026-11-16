@@ -15,8 +15,9 @@ are working references; they are not upstream submissions.
 | [Ledger #38](https://github.com/betsudo/midnight-ledger/pull/38) | Integrated into `integration/ledger9/ledger-9.1.0.1` | Adds bounded HTTP ingress and queued-work admission, policy-aware parameter/key loading, cancellation, and the V3 consumer adapter. | The Cargo feature supplies native capability; CLI policy selects it per request. V2 and Wasm retain heap routes. The mapped SRS companion directory must be operator-owned and immutable while mapped. |
 | [Ledger #39](https://github.com/betsudo/midnight-ledger/pull/39) | Qualification follow-up | Adds official k=4/k=6 parameter fixtures, an independently published SDK testkit V3 key, heap/mapped/spill assertions, and Node/Wasm-to-native proof verification. | This is a small-circuit compatibility gate, not a high-`k` memory benchmark or deployed-dApp key test. |
 | [ZK #13](https://github.com/betsudo/midnight-zk/pull/13) | Upstream-plan follow-up | Maps the merged source commits into five upstream review units and records the cross-repository landing order. | This is documentation, not a port to current upstream `main`; the newer proof transcript must be reconciled before an upstream PR. |
+| [ZKIR #5](https://github.com/betsudo/midnight-zkir/pull/5) | V3 guide follow-up | Records the published-key qualification and distinguishes local Node/Wasm proof exchange from hosted Wasm compilation. | Documentation only; high-`k`, browser, and deployed-dApp evidence remain open. |
 
-The first three PRs are the delivered optimization graph. The last two
+The first three PRs are the delivered optimization graph. The last three
 make its evidence and upstream proposal easier to review. Dependency pins
 in the integration graph are fork-local; they are not part of the proposed
 upstream library API.
