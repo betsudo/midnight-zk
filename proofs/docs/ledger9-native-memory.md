@@ -91,7 +91,7 @@ requests must use separate tokens.
 
 - Preserve proof and key compatibility with released 0.8.2 artifacts, including per-`k` parameters and keys.
 - Check native default, native `native-memory`, Wasm default, Wasm `native-memory`, and Wasm all-features builds. Mapped policy on Wasm must return `Unsupported`.
-- Verify the Ledger9 V3 TypeScript/Wasm-to-native proof exchange against exact pinned commits. Local k=4/k=6 checks now use official per-`k` parameters and an independently published SDK testkit key; exact-head CI, deployed dApp key coverage, and high-`k` capacity remain separate gates.
+- Verify the Ledger9 V3 TypeScript/Wasm-to-native proof exchange against exact pinned commits. Local k=4/k=6 checks use official per-`k` parameters and an independently published SDK testkit key; the fork's exact-head native and Wasm CI passed. Deployed dApp key coverage, high-`k` capacity, and CI on future upstream-target ports remain separate gates.
 - Measure high-`k` peak memory and latency in separate processes on intended native and mobile targets. A forced spill below `k=18` is a functional stress case, not evidence of memory savings.
 
 Record source heads, target/device, policy, peak RSS, elapsed time, and disk
@@ -100,6 +100,10 @@ published-source alignment, storage primitives and unsafe boundary,
 context-aware API, then consumer integration. Tracking:
 [ZK #5](https://github.com/betsudo/midnight-zk/issues/5) and
 [Ledger #14](https://github.com/betsudo/midnight-ledger/issues/14).
+
+For a cross-repository summary of the optimization PRs, qualification
+evidence, and remaining gates, see the
+[Ledger9 contribution review map](ledger9-contribution-review.md).
 
 ## Upstream contribution slices
 
