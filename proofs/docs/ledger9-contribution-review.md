@@ -8,13 +8,13 @@ are working references; they are not upstream submissions.
 
 ## PRs and ownership
 
-| PR | State | Contribution | Boundary to review |
+| PR | Delivery role | Contribution | Boundary to review |
 | --- | --- | --- | --- |
-| [ZK #11](https://github.com/betsudo/midnight-zk/pull/11) | Merged into `integration/ledger9/proofs-0.8.2` | Adds opt-in `native-memory`: mapped SRS and proving-key storage, streamed coset spill, request context, and cooperative cancellation. Aligns circuits 7.3.0 and stdlib 2.4.0 to their published sources. | The default heap API and proof/key encodings remain compatible. Native-only dependencies are target gated; requested mapped storage on Wasm returns `Unsupported`. Review release alignment separately from memory changes. |
-| [ZKIR #3](https://github.com/betsudo/midnight-zkir/pull/3) | Merged into `integration/ledger9/zkir-3.2.1` | Forwards one request-owned V3 context through key initialization and proving, with exact ZK and Ledger API pins. | Legacy `prove` and tagged formats remain unchanged. A mapped key needs serialized bytes; an initialized heap key can be reused for heap or coset-only spill. |
-| [Ledger #38](https://github.com/betsudo/midnight-ledger/pull/38) | Merged into `integration/ledger9/ledger-9.1.0.1` | Adds bounded HTTP ingress and queued-work admission, policy-aware parameter/key loading, cancellation, and the V3 consumer adapter. | The Cargo feature supplies native capability; CLI policy selects it per request. V2 and Wasm retain heap routes. The mapped SRS companion directory must be operator-owned and immutable while mapped. |
-| [Ledger #39](https://github.com/betsudo/midnight-ledger/pull/39) | Open for review | Adds official k=4/k=6 parameter fixtures, an independently published SDK testkit V3 key, heap/mapped/spill assertions, and Node/Wasm-to-native proof verification. | This is a small-circuit compatibility gate, not a high-`k` memory benchmark or deployed-dApp key test. |
-| [ZK #13](https://github.com/betsudo/midnight-zk/pull/13) | Open for review | Maps the merged source commits into five upstream review units and records the cross-repository landing order. | This is documentation, not a port to current upstream `main`; the newer proof transcript must be reconciled before an upstream PR. |
+| [ZK #11](https://github.com/betsudo/midnight-zk/pull/11) | Integrated into `integration/ledger9/proofs-0.8.2` | Adds opt-in `native-memory`: mapped SRS and proving-key storage, streamed coset spill, request context, and cooperative cancellation. Aligns circuits 7.3.0 and stdlib 2.4.0 to their published sources. | The default heap API and proof/key encodings remain compatible. Native-only dependencies are target gated; requested mapped storage on Wasm returns `Unsupported`. Review release alignment separately from memory changes. |
+| [ZKIR #3](https://github.com/betsudo/midnight-zkir/pull/3) | Integrated into `integration/ledger9/zkir-3.2.1` | Forwards one request-owned V3 context through key initialization and proving, with exact ZK and Ledger API pins. | Legacy `prove` and tagged formats remain unchanged. A mapped key needs serialized bytes; an initialized heap key can be reused for heap or coset-only spill. |
+| [Ledger #38](https://github.com/betsudo/midnight-ledger/pull/38) | Integrated into `integration/ledger9/ledger-9.1.0.1` | Adds bounded HTTP ingress and queued-work admission, policy-aware parameter/key loading, cancellation, and the V3 consumer adapter. | The Cargo feature supplies native capability; CLI policy selects it per request. V2 and Wasm retain heap routes. The mapped SRS companion directory must be operator-owned and immutable while mapped. |
+| [Ledger #39](https://github.com/betsudo/midnight-ledger/pull/39) | Qualification follow-up | Adds official k=4/k=6 parameter fixtures, an independently published SDK testkit V3 key, heap/mapped/spill assertions, and Node/Wasm-to-native proof verification. | This is a small-circuit compatibility gate, not a high-`k` memory benchmark or deployed-dApp key test. |
+| [ZK #13](https://github.com/betsudo/midnight-zk/pull/13) | Upstream-plan follow-up | Maps the merged source commits into five upstream review units and records the cross-repository landing order. | This is documentation, not a port to current upstream `main`; the newer proof transcript must be reconciled before an upstream PR. |
 
 The first three PRs are the delivered optimization graph. The last two
 make its evidence and upstream proposal easier to review. Dependency pins
@@ -99,5 +99,5 @@ trait prerequisites, ZKIR V3 context adapter, then the Ledger consumer.
 [ZK #12](https://github.com/betsudo/midnight-zk/issues/12) tracks the
 proposal series; [Ledger #30](https://github.com/betsudo/midnight-ledger/issues/30)
 tracks V3 artifact/policy acceptance; [Ledger #12](https://github.com/betsudo/midnight-ledger/issues/12)
-owns high-`k` benchmark evidence. The two open follow-up PRs still need
-independent review before merge.
+owns high-`k` benchmark evidence. Check the linked PRs for current CI,
+review, and merge state.
