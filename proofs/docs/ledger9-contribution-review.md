@@ -64,8 +64,9 @@ testkit counter key (SHA-256
 `6fa13f54b055be31d4809c59dfd96b08e809641f43bc0d83951cbfb4162ac010`).
 The key and IR hashes match the published SDK manifest. Native Ledger9
 verifies proofs produced from the published key under heap, mapped SRS/key,
-and forced coset spill. A ZKIR 3.2.1 Node/Wasm proof using that key and the
-Compact TypeScript preimage also verifies in native Ledger9.
+and forced coset spill. In an opt-in local test, a ZKIR 3.2.1 Node/Wasm
+proof using that key and the Compact TypeScript preimage also verified in
+native Ledger9; ordinary hosted CI does not run that cross-runtime test.
 
 At Ledger #39 head `2b3ee462`, the focused `native-memory` V3 test ran
 seven passing cases with two intentional ignores, and the feature-enabled
