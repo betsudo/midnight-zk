@@ -91,7 +91,7 @@ requests must use separate tokens.
 
 - Preserve proof and key compatibility with released 0.8.2 artifacts, including per-`k` parameters and keys.
 - Check native default, native `native-memory`, Wasm default, Wasm `native-memory`, and Wasm all-features builds. Mapped policy on Wasm must return `Unsupported`.
-- Verify the Ledger9 V3 TypeScript/Wasm-to-native proof exchange against exact pinned commits. The local small-circuit exchange passed; released per-`k` fixtures remain a separate gate.
+- Verify the Ledger9 V3 TypeScript/Wasm-to-native proof exchange against exact pinned commits. Local k=4/k=6 checks now use official per-`k` parameters and an independently published SDK testkit key; exact-head CI, deployed dApp key coverage, and high-`k` capacity remain separate gates.
 - Measure high-`k` peak memory and latency in separate processes on intended native and mobile targets. A forced spill below `k=18` is a functional stress case, not evidence of memory savings.
 
 Record source heads, target/device, policy, peak RSS, elapsed time, and disk
