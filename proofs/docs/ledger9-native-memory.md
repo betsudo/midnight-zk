@@ -147,3 +147,18 @@ artifact compatibility; deployed dApp key coverage and repeatable high-k
 resident-memory evidence remain open. The executable acceptance gates
 and proposal ownership are in [ZK #12](https://github.com/betsudo/midnight-zk/issues/12)
 and [Ledger #30](https://github.com/betsudo/midnight-ledger/issues/30).
+
+The proposed upstream PR targets, checked on 2026-11-16, are
+`midnightntwrk/midnight-zk:main` (`3cff06af`) for the proofs library,
+`midnightntwrk/midnight-ledger:ledger-9` (`b8f5e143`) for both Ledger units,
+and `midnightntwrk/midnight-zkir:main` (`405b162f`) for the V3 adapter. The
+published proofs 0.8.2 source remains the artifact baseline, not the target
+branch for a new upstream PR. Before submission, refresh each upstream head,
+port the slices to its APIs, and run the release-artifact and failure-path
+gates on the rebased result. In particular, current ZK `main` has a newer
+transcript boundary; a green build there cannot substitute for the Ledger9
+0.8.2 proof/key compatibility result. If that compatibility cannot be
+preserved on `main`, agree on an upstream maintenance target with its owners
+before opening the proofs PR. Do not present the dependent Ledger or ZKIR
+patches as standalone buildable PRs until their prerequisite APIs are
+available on their target branches.
