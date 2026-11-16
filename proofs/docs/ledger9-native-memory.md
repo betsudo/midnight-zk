@@ -91,7 +91,7 @@ requests must use separate tokens.
 
 - Preserve proof and key compatibility with released 0.8.2 artifacts, including per-`k` parameters and keys.
 - Check native default, native `native-memory`, Wasm default, Wasm `native-memory`, and Wasm all-features builds. Mapped policy on Wasm must return `Unsupported`.
-- Verify the Ledger9 V3 TypeScript/Wasm-to-native proof exchange against exact pinned commits. The local small-circuit exchange passed; released per-`k` fixtures remain a separate gate.
+- Verify the Ledger9 V3 TypeScript/Wasm-to-native proof exchange against exact pinned commits. Local k=4/k=6 checks use official per-`k` parameters and an independently published SDK testkit key. The Node/Wasm-to-native proof exchange passed as an opt-in local test; the fork's exact-head native V3 tests and feature-enabled Wasm compile passed in CI. Deployed dApp key coverage, high-`k` capacity, and CI on future upstream-target ports remain separate gates.
 - Measure high-`k` peak memory and latency in separate processes on intended native and mobile targets. A forced spill below `k=18` is a functional stress case, not evidence of memory savings.
 
 Record source heads, target/device, policy, peak RSS, elapsed time, and disk
@@ -100,3 +100,69 @@ published-source alignment, storage primitives and unsafe boundary,
 context-aware API, then consumer integration. Tracking:
 [ZK #5](https://github.com/betsudo/midnight-zk/issues/5) and
 [Ledger #14](https://github.com/betsudo/midnight-ledger/issues/14).
+
+For a cross-repository summary of the optimization PRs, qualification
+evidence, and remaining gates, see the
+[Ledger9 contribution review map](ledger9-contribution-review.md).
+
+## Upstream contribution slices
+
+The merged fork head is `fb558e2e`; Ledger9 pins its source commit
+`505156ec`. These are working integration references. The proofs 0.8.2
+source base is the published crate's recorded commit `f5e6e16d`.
+An upstream proposal needs its own reviewable series, with each row checked
+against its stated parent. The hashes below map existing fork commits to
+responsibilities; they are not a claim that every intermediate parent has
+already passed upstream CI.
+
+| Proposed review unit | Existing source commits | Contract to preserve |
+| --- | --- | --- |
+| SRS loading and mapping | `57a9671b`, `aa8934cc` | Keep the released SRS encoding; validate the companion before mapping and document the immutable trusted-file obligation. |
+| Polynomial views and mapped key storage | `45ae4616`, `09ccbe7a`, `fa454600`, `18335330` | Use one owned/mapped serializer, preserve tagged key bytes, and avoid building cosets while merely loading a key. |
+| Streamed cosets and bounded MSM | `15c8a545`, `bfa9383b`, `4368fc9c` | Spill only by explicit native policy, fail a required spill instead of falling back, and keep x86 and aarch64 MSM gates separately verified. |
+| Request policy and stdlib API | `698f3130`, `737df6f1`, `a63bd8b5` | Preserve the heap entry point, use a request-local cancellation token, and reject native-only policy on Wasm. |
+| Mapped storage error provenance | `cdbbce71` | Distinguish backing-store failure from malformed client key bytes without changing the proof or key format. |
+
+Keep the published circuits 7.3.0 and stdlib 2.4.0 alignment
+(`4952bea5`, `81cbfe23`, `505156ec`) in a separate release-integration
+unit. It fixes the fork workspace's mixed circuit traits and copies the
+official stdlib verifier fixtures; it is not a prover memory algorithm.
+The fork CI formatter pin and local dependency revisions also stay outside
+the upstream library proposal. This separation lets a reviewer assess
+the unsafe mapping and memory policy without interpreting unrelated
+release-source changes as new behavior.
+
+The published 0.8.3 source (`98d1e964`) and the current upstream `main`
+have a different proof/key transcript boundary. Rebase a proposed slice
+onto the chosen upstream target only after its 0.8.2 Ledger9 artifact gate
+is recorded; then rerun exact-head native, Wasm, serialization, proof,
+and failure-path checks on that target. A passing 0.8.3 build alone does not
+establish 0.8.2 key compatibility. An SRS-only 0.8.3 port would be an
+incomplete proposal without the key, coset, context, and consumer gates.
+
+The cross-repository landing order is proofs storage/context API, Ledger
+provider and trait prerequisites, ZKIR V3 context adapter, then the final
+Ledger consumer. The official k=4 parameter and locally generated
+published-source V3 key smoke is under [Ledger PR #39](https://github.com/betsudo/midnight-ledger/pull/39).
+The same PR exercises an independently published [Midnight JS testkit](https://github.com/midnightntwrk/midnight-js/tree/66096e0e35d46709ae3227349d71a7652e06422e/testkit-js/testkit-js-e2e/src/contract/compiled/counter)
+Compact 0.36.1 counter key against the official k=6 parameter, including
+Node/Wasm-to-native proof verification. These small circuits establish
+artifact compatibility; deployed dApp key coverage and repeatable high-k
+resident-memory evidence remain open. The executable acceptance gates
+and proposal ownership are in [ZK #12](https://github.com/betsudo/midnight-zk/issues/12)
+and [Ledger #30](https://github.com/betsudo/midnight-ledger/issues/30).
+
+The proposed upstream PR targets, checked on 2026-11-16, are
+`midnightntwrk/midnight-zk:main` (`3cff06af`) for the proofs library,
+`midnightntwrk/midnight-ledger:ledger-9` (`b8f5e143`) for both Ledger units,
+and `midnightntwrk/midnight-zkir:main` (`405b162f`) for the V3 adapter. The
+published proofs 0.8.2 source remains the artifact baseline, not the target
+branch for a new upstream PR. Before submission, refresh each upstream head,
+port the slices to its APIs, and run the release-artifact and failure-path
+gates on the rebased result. In particular, current ZK `main` has a newer
+transcript boundary; a green build there cannot substitute for the Ledger9
+0.8.2 proof/key compatibility result. If that compatibility cannot be
+preserved on `main`, agree on an upstream maintenance target with its owners
+before opening the proofs PR. Do not present the dependent Ledger or ZKIR
+patches as standalone buildable PRs until their prerequisite APIs are
+available on their target branches.

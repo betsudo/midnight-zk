@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 * Share polynomial encoding across owned and mapped storage, stream derived cosets under the native policy, and bound the native Pippenger fallback to avoid proof-size-dependent scratch growth.
+* Document the release-base commits, upstream review units, and cross-repository PR evidence for a Ledger9 native memory proposal.
 
 ### Removed
 

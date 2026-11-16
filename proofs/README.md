@@ -1,6 +1,6 @@
 # Midnight Proofs
 
-See [Ledger9 native proving storage](docs/ledger9-native-memory.md) for the opt-in feature, request policy, Wasm boundary, and qualification gates.
+See [Ledger9 native proving storage](docs/ledger9-native-memory.md) for the opt-in feature, request policy, Wasm boundary, and qualification gates. The [Ledger9 contribution review map](docs/ledger9-contribution-review.md) summarizes the cross-repository PRs, evidence, and remaining upstream work.
 
 [![Crates.io Version](https://img.shields.io/crates/v/midnight-proofs?label=midnight-proofs)](https://crates.io/crates/midnight-proofs)
 
