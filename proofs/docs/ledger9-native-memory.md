@@ -138,9 +138,12 @@ incomplete proposal without the key, coset, context, and consumer gates.
 
 The cross-repository landing order is proofs storage/context API, Ledger
 provider and trait prerequisites, ZKIR V3 context adapter, then the final
-Ledger consumer. The official k=4 parameter and published-source V3 key
-smoke is under [Ledger PR #39](https://github.com/betsudo/midnight-ledger/pull/39).
-That key was generated locally; a network-distributed V3 key and a repeatable
-high-k resident-memory result remain open. The executable acceptance gates
+Ledger consumer. The official k=4 parameter and locally generated
+published-source V3 key smoke is under [Ledger PR #39](https://github.com/betsudo/midnight-ledger/pull/39).
+The same PR exercises an independently published [Midnight JS testkit](https://github.com/midnightntwrk/midnight-js/tree/66096e0e35d46709ae3227349d71a7652e06422e/testkit-js/testkit-js-e2e/src/contract/compiled/counter)
+Compact 0.36.1 counter key against the official k=6 parameter, including
+Node/Wasm-to-native proof verification. These small circuits establish
+artifact compatibility; deployed dApp key coverage and repeatable high-k
+resident-memory evidence remain open. The executable acceptance gates
 and proposal ownership are in [ZK #12](https://github.com/betsudo/midnight-zk/issues/12)
 and [Ledger #30](https://github.com/betsudo/midnight-ledger/issues/30).
