@@ -13,6 +13,8 @@ PACKAGES = {
     "midnight-circuits": "7.3.0",
     "midnight-curves": "0.3.1",
     "midnight-proofs": "0.8.2",
+    "blake2b_halo2": "0.2.0",
+    "sha3-circuit": "0.2.0",
 }
 
 
@@ -28,20 +30,17 @@ def main() -> None:
         consumer = pathlib.Path(directory)
         (consumer / "src").mkdir()
         (consumer / "src" / "lib.rs").write_text("// source-graph canary\n")
-        (consumer / "Cargo.toml").write_text(
+        manifest = (
             "[package]\n"
             'name = "midnight-zk-external-consumer"\n'
             'version = "0.0.0"\n'
             'edition = "2021"\n\n'
             "[dependencies]\n"
             f'midnight-zk-stdlib = {{ git = "{repository}", rev = "{revision}" }}\n'
-            "\n# Cargo ignores patches declared by dependencies. These root patches also\n"
-            "# redirect the published SHA3 and Blake2b helpers onto this ZK graph.\n"
-            "[patch.crates-io]\n"
-            f'midnight-circuits = {{ git = "{repository}", rev = "{revision}" }}\n'
-            f'midnight-curves = {{ git = "{repository}", rev = "{revision}" }}\n'
-            f'midnight-proofs = {{ git = "{repository}", rev = "{revision}" }}\n'
         )
+        if "[patch" in manifest:
+            raise SystemExit("external consumer manifest must not contain a patch table")
+        (consumer / "Cargo.toml").write_text(manifest)
         metadata = json.loads(
             run(
                 "cargo",
@@ -52,6 +51,14 @@ def main() -> None:
                 str(consumer / "Cargo.toml"),
                 cwd=consumer,
             )
+        )
+        run(
+            "cargo",
+            "check",
+            "--locked",
+            "--manifest-path",
+            str(consumer / "Cargo.toml"),
+            cwd=consumer,
         )
 
     selected_packages = [
@@ -80,7 +87,10 @@ def main() -> None:
     if len(sources) != 1:
         raise SystemExit(f"Midnight ZK packages split across sources: {sorted(sources)}")
 
-    print(f"external Git consumer resolved {len(PACKAGES)} Midnight ZK packages at {revision}")
+    print(
+        f"patch-free external Git consumer compiled {len(PACKAGES)} "
+        f"Midnight ZK packages at {revision}"
+    )
 
 
 if __name__ == "__main__":
