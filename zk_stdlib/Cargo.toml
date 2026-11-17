@@ -18,8 +18,8 @@ midnight-proofs = { version = "0.8.2", path = "../proofs", default-features = fa
     "committed-instances",
 ] }
 
-keccak_sha3 = { package = "sha3-circuit", version = "0.2.0" }
-blake2b = { package = "blake2b_halo2", version = "0.2.0" }
+keccak_sha3 = { package = "sha3-circuit", version = "0.2.0", path = "../third_party/sha3-circuit" }
+blake2b = { package = "blake2b_halo2", version = "0.2.0", path = "../third_party/blake2b_halo2" }
 
 serde = { workspace = true, optional = true }
 sha2 = { workspace = true }

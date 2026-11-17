@@ -2,6 +2,7 @@
 resolver = "2"
 
 members = ["proofs", "curves", "circuits", "aggregation", "zk_stdlib"]
+exclude = ["third_party/blake2b_halo2", "third_party/sha3-circuit"]
 
 package = { license-file = "LICENSE" }
 
@@ -22,20 +23,6 @@ num-bigint = { version = "0.4" }
 sha2 = "0.10.9"
 sha3 = "0.11.0"
 ripemd = "0.2.0"
-
-# Avoids type unification errors when third-party repos are integrated to midnight-circuits. Since
-# both such repos and midnight-circuits import midnight-proofs, they end up with an isomorphic
-# (but different) copy of their midnight-proofs dependency. The below version enforces that they
-# both get use the local crate.
-[patch.crates-io]
-midnight-proofs = { path = "proofs" }
-midnight-curves = { path = "curves" }
-midnight-circuits = { path = "circuits" }
-
-# blake2b_halo2 depends on midnight-proofs via git; this redirects that git source
-# to the local workspace so both resolve to the same crate instance.
-[patch."https://github.com/midnightntwrk/midnight-zk"]
-midnight-proofs = { path = "proofs" }
 
 ## Benchmarks
 

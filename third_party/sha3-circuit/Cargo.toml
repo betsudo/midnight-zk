@@ -1,0 +1,27 @@
+[package]
+name = "sha3-circuit"
+authors = ["Alexandros Zacharakis"]
+version = "0.2.0"
+edition = "2021"
+description = "Lookup based midnight-proofs implementation of SHA3-256 and Keccak-256 gadgets"
+readme = "README.md"
+license = "Apache-2.0"
+categories = ["cryptography"]
+keywords = ["proofs", "zkp", "zkSNARKs", "sha3", "keccak"]
+publish = false
+
+[dependencies]
+midnight-curves = { version = "0.3.1", path = "../../curves" }
+midnight-proofs = { version = "0.8.2", path = "../../proofs", default-features = false, features = [
+  "circuit-params",
+  "committed-instances",
+] }
+num-bigint = "0.4"
+rand = "0.8"
+blake2b_simd = "1.0.3"
+ff = "0.13"
+
+[dev-dependencies]
+criterion = "0.3"
+rand_chacha = "0.3.1"
+sha3 = "0.10.0"

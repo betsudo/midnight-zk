@@ -10,3 +10,5 @@ wrap_comments = true
 group_imports = "StdExternalCrate"
 # Allows for larger chains
 chain_width = 80
+# The bounded third-party source copies are checksum-verified byte for byte.
+ignore = ["third_party"]
