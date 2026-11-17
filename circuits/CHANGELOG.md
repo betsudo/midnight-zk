@@ -10,6 +10,7 @@ We use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 ### Changed
+* Keep workspace-internal dependencies usable by downstream Git consumers while preserving local path development.
 
 ### Removed
 

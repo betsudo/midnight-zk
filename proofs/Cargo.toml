@@ -31,7 +31,7 @@ harness = false
 [dependencies]
 ff = { workspace = true }
 group = { workspace = true }
-midnight-curves = "0.3.1"
+midnight-curves = { version = "0.3.1", path = "../curves" }
 # Memory-mapped SRS support: `read_mmap_arc` constructs a
 # `ParamsKZG` whose `g`/`g_lagrange` are slice views over a file
 # mapping instead of heap Vecs. Saves the ~300 MiB heap
@@ -71,7 +71,7 @@ libc = { version = "0.2", optional = true }
 getrandom = { version = "0.2", features = ["js"] }
 
 [target.'cfg(ci_build)'.dependencies]
-midnight-curves = { version = "0.3.0", features = [
+midnight-curves = { version = "0.3.0", path = "../curves", features = [
   "portable",
 ] }
 
