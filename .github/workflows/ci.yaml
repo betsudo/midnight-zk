@@ -8,6 +8,16 @@ on:
       - next
 
 jobs:
+  external-git-consumer:
+    name: External Git consumer source graph
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+      - name: Verify self-contained Midnight ZK dependencies
+        run: python3 scripts/check-external-git-consumer.py
+
   download-srs:
     runs-on: ubuntu-latest
     outputs:
